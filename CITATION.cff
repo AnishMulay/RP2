@@ -1,14 +1,11 @@
-# This CITATION.cff file was generated with cffinit.
-# Visit https://bit.ly/cffinit to generate yours today!
-
 cff-version: 1.2.0
-title: RP2 - Research Codebase
-message: >-
-  If you refer to this research code, please cite it as
-  below.
+message: "If you refer to this research code, please cite it as below."
 type: software
 authors:
-  - family-names: Anish
-    given-names: Mulay
-url: 'https://github.com/AnishMulay/RP2'
-date-released: '2026-01-04'
+  - family-names: "Mulay"
+    given-names: "Anish"
+    orcid: "https://orcid.org/0009-0004-4817-4322"
+title: "RP2 - Research Codebase"
+version: "0.0.1"
+date-released: "2026-01-04"
+url: "https://github.com/AnishMulay/RP2"
