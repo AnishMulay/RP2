@@ -1,10 +1,9 @@
 cff-version: 1.2.0
 message: "If you refer to this research code, please cite it as below."
 authors:
-- family-names: "[Your Last Name]"
-  given-names: "[Your First Name]"
-  orcid: "[Your ORCID ID if you have one]"
-title: "[Your Project Name] - Research Codebase"
+- family-names: "Anish"
+  given-names: "Mulay"
+title: "RP2 - Research Codebase"
 date-released: 2026-01-04
-url: "https://github.com/[YourUsername]/[YourRepoName]"
+url: "https://github.com/AnishMulay/RP2"
 type: software
