@@ -151,6 +151,7 @@ class ParallelWpClusteringAlgo:
             cond_dist_mask,
             cond_dist_mask & cond_voronoi_mask.unsqueeze(-1)
         )
+        del d_xq, cond_dist_mask, cond_voronoi_mask, is_landmark_q
 
         # --- Collecting results ("Atomic Add to C") ---
         # Pseudocode lines 26-27 imply adding non-empty clusters to a collection.
@@ -177,7 +178,9 @@ class ParallelWpClusteringAlgo:
                  if member_mask_x.any():
                      # Get indices of members (line 27 implementation)
                      member_indices = torch.nonzero(member_mask_x).squeeze(1)
-                     clusters.append(member_indices)
+                     clusters.append(member_indices.cpu())
+                     del member_indices
+                 del member_mask_x
 
         return clusters
 
@@ -190,26 +193,27 @@ class ParallelWpClusteringAlgo:
         Returns:
             A list of tensors, where each tensor contains indices of points belonging to a cluster.
         """
-        n_points = P.shape[0]
-        device = P.device
-        
-        # Ensure data is floating point for distance calculations
-        if not P.is_floating_point():
-             P = P.to(torch.float32)
+        with torch.no_grad():
+            n_points = P.shape[0]
+            device = P.device
+            
+            # Ensure data is floating point for distance calculations
+            if not P.is_floating_point():
+                 P = P.to(torch.float32)
 
-        # Step 1: Parallel Initialization and Sampling
-        P1_indices, mask_P1 = self._step1_parallel_sampling(n_points, device)
-        
-        # Step 2: Precompute Nearest Landmark Distances
-        D_y = self._step2_precompute_landmark_distances(P, P1_indices)
-        
-        # Step 3: Define Radii Scales
-        radii = self._step3_define_radii_scales(P, device)
-        
-        # Step 4: Parallel Cluster Construction
-        clusters = self._step4_parallel_cluster_construction(P, mask_P1, D_y, radii)
-        
-        return clusters
+            # Step 1: Parallel Initialization and Sampling
+            P1_indices, mask_P1 = self._step1_parallel_sampling(n_points, device)
+            
+            # Step 2: Precompute Nearest Landmark Distances
+            D_y = self._step2_precompute_landmark_distances(P, P1_indices)
+            
+            # Step 3: Define Radii Scales
+            radii = self._step3_define_radii_scales(P, device)
+            
+            # Step 4: Parallel Cluster Construction
+            clusters = self._step4_parallel_cluster_construction(P, mask_P1, D_y, radii)
+            
+            return clusters
 
 
 # ==========================================

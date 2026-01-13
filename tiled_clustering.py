@@ -262,6 +262,7 @@ class ParallelWpClusteringAlgo:
                 # We need to find which columns (centers) have any members.
                 # Optimization: Check if ANY point matches first.
                 if not membership_mask.any():
+                    del membership_mask, cond_dist
                     continue
 
                 # We iterate the batch dimension to extract specific clusters
@@ -276,7 +277,12 @@ class ParallelWpClusteringAlgo:
                     # Get the members for this specific center
                     members = membership_mask[:, local_idx]
                     member_indices = torch.nonzero(members).squeeze(1)
-                    clusters.append(member_indices)
+                    clusters.append(member_indices.cpu())
+                    del member_indices, members
+                del has_members, valid_centers_local, membership_mask
+                del cond_dist
+
+            del d_xq_sq, cond_voronoi, is_landmark_batch, q_indices
 
         return clusters
 
@@ -284,26 +290,27 @@ class ParallelWpClusteringAlgo:
         """
         Main execution entry point.
         """
-        # Ensure float32 for performance/memory balance
-        if not P.is_floating_point():
-             P = P.to(torch.float32)
+        with torch.no_grad():
+            # Ensure float32 for performance/memory balance
+            if not P.is_floating_point():
+                 P = P.to(torch.float32)
 
-        # Prepare workspace (precomputed norms for kernels)
-        workspace = self.kernel.prepare_workspace(P)
+            # Prepare workspace (precomputed norms for kernels)
+            workspace = self.kernel.prepare_workspace(P)
 
-        # Step 1: Sampling
-        P1_indices, mask_P1 = self._step1_parallel_sampling(P)
-        
-        # Step 2: Landmark Distances (Squared)
-        D_y_sq = self._step2_precompute_landmark_distances(P, P1_indices, workspace)
-        
-        # Step 3: Radii Scales
-        radii = self._step3_define_radii_scales(P, workspace)
-        
-        # Step 4: Cluster Construction (Streaming)
-        clusters = self._step4_tiled_cluster_construction(P, mask_P1, D_y_sq, radii, workspace)
-        
-        return clusters
+            # Step 1: Sampling
+            P1_indices, mask_P1 = self._step1_parallel_sampling(P)
+            
+            # Step 2: Landmark Distances (Squared)
+            D_y_sq = self._step2_precompute_landmark_distances(P, P1_indices, workspace)
+            
+            # Step 3: Radii Scales
+            radii = self._step3_define_radii_scales(P, workspace)
+            
+            # Step 4: Cluster Construction (Streaming)
+            clusters = self._step4_tiled_cluster_construction(P, mask_P1, D_y_sq, radii, workspace)
+            
+            return clusters
 
 
 # ==========================================
