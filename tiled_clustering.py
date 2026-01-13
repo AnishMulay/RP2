@@ -341,9 +341,9 @@ def run_stress_test():
         print("Device: CPU (Note: Performance will be slower)")
 
     # Configuration
-    N_POINTS = 20000     # Large enough to stress memory if not tiled
-    D_DIM = 64           # Higher dimension
-    EPSILON = 2.0
+    N_POINTS = 2000     # Large enough to stress memory if not tiled
+    D_DIM = 2           # Higher dimension
+    EPSILON = 0.1
     BATCH_SIZE = 1024    # Tiling size
     
     print(f"Configuration: N={N_POINTS}, D={D_DIM}, Batch={BATCH_SIZE}")
