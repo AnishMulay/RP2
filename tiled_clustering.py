@@ -240,11 +240,15 @@ class ParallelWpClusteringAlgo:
             # 3. Iterate over Radii
             # Since T is small (usually < 20), we loop sequentially over radii.
             # This is safer than broadcasting T which triples memory usage.
+            prev_r_sq = -1.0
             for r_idx, r_sq in enumerate(radii_sq):
                 
                 # Condition A: Distance Threshold d(x, q) <= r_i
                 # Shape: (N_x, Batch_q)
-                cond_dist = d_xq_sq <= r_sq
+                if prev_r_sq < 0:
+                    cond_dist = d_xq_sq <= r_sq
+                else:
+                    cond_dist = (d_xq_sq > prev_r_sq) & (d_xq_sq <= r_sq)
                 
                 # Combine Conditions
                 if cond_voronoi is not None:
@@ -263,6 +267,7 @@ class ParallelWpClusteringAlgo:
                 # Optimization: Check if ANY point matches first.
                 if not membership_mask.any():
                     del membership_mask, cond_dist
+                    prev_r_sq = r_sq
                     continue
 
                 # We iterate the batch dimension to extract specific clusters
@@ -277,10 +282,11 @@ class ParallelWpClusteringAlgo:
                     # Get the members for this specific center
                     members = membership_mask[:, local_idx]
                     member_indices = torch.nonzero(members).squeeze(1)
-                    clusters.append(member_indices.cpu())
+                    clusters.append(member_indices)
                     del member_indices, members
                 del has_members, valid_centers_local, membership_mask
                 del cond_dist
+                prev_r_sq = r_sq
 
             del d_xq_sq, cond_voronoi, is_landmark_batch, q_indices
 
