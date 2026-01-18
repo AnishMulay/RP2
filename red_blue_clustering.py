@@ -139,8 +139,8 @@ class RedBlueClusteringAlgo:
         if Delta <= 1e-9:
              return torch.tensor([0.0], device=device)
 
-        base = 1.0 + self.epsilon / 4.0
-        t = int(math.ceil(math.log(Delta) / math.log(base)))
+        base = 1.0 + self.epsilon
+        t = int(math.ceil(1.0 / self.epsilon))
         
         indices = torch.arange(1, t + 1, device=device, dtype=P_all.dtype)
         radii = torch.pow(base, indices)
