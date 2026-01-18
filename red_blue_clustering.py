@@ -68,9 +68,10 @@ class RedBlueClusteringAlgo:
     Both covers cluster the entire dataset (Union of Red and Blue).
     """
 
-    def __init__(self, epsilon: float, batch_size: int = 1024):
+    def __init__(self, epsilon: float, batch_size: int = 1024, micro_batch_size: int = 32):
         self.epsilon = epsilon
         self.batch_size = batch_size
+        self.micro_batch_size = micro_batch_size
         self.kernel = TiledEuclideanKernel(chunk_size=batch_size)
 
     def _sample_landmarks(self, n_points: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -164,7 +165,7 @@ class RedBlueClusteringAlgo:
         radii_sq = radii ** 2
         
         clusters = []
-        micro_batch_size = 32
+        micro_batch_size = self.micro_batch_size
         r_broad = radii_sq.view(1, n_radii, 1)
         
         # Iterate over CENTERS in batches
@@ -309,7 +310,7 @@ class RedBlueClusteringAlgo:
 # Experiment Runner (Main)
 # ==========================================
 
-def run_experiment(n_red, n_blue, dimensions):
+def run_experiment(n_red, n_blue, dimensions, delta_param=1.0, micro_batch_size=32):
     print(f"\n--- Running Experiment: Red={n_red}, Blue={n_blue}, Dim={dimensions} ---")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -327,7 +328,11 @@ def run_experiment(n_red, n_blue, dimensions):
     # Initialize Algo
     # epsilon=1.0 is standard approximation factor
     # batch_size=512 is safe for most GPUs
-    algo = RedBlueClusteringAlgo(epsilon=1.0, batch_size=512)
+    algo = RedBlueClusteringAlgo(
+        epsilon=delta_param,
+        batch_size=512,
+        micro_batch_size=micro_batch_size
+    )
     
     # Run Timing
     if device.type == 'cuda':
@@ -364,11 +369,19 @@ if __name__ == "__main__":
     # ==========================================
     # USER PARAMETERS - CHANGE THESE
     # ==========================================
+    DELTA = 0.01
+    MICRO_BATCH = 32
     N_RED = 2000
     N_BLUE = 2000
     DIMENSIONS = 2  # Set to 64 for high-dim, 2 for vis
     
     # Run
-    output_pipes = run_experiment(N_RED, N_BLUE, DIMENSIONS)
+    output_pipes = run_experiment(
+        N_RED,
+        N_BLUE,
+        DIMENSIONS,
+        delta_param=DELTA,
+        micro_batch_size=MICRO_BATCH
+    )
     
     # 'output_pipes' now contains your tensors ready for the push-reliable alg
