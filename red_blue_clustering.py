@@ -156,64 +156,84 @@ class RedBlueClusteringAlgo:
                      radii: torch.Tensor) -> list[torch.Tensor]:
         """
         Generic function to build clusters (Red or Blue).
-        Returns a list of PyTorch tensors (indices relative to P_all).
+        OPTIMIZED: Vectorized over radii to remove Python loop latency.
         """
         n_centers = centers_source.shape[0]
+        n_targets = targets_workspace["P"].shape[0]
+        n_radii = radii.shape[0]
         radii_sq = radii ** 2
+        
         clusters = []
         
         # Iterate over CENTERS in batches
         for start_q in range(0, n_centers, self.batch_size):
             end_q = min(start_q + self.batch_size, n_centers)
-            
-            # 1. Get Batch of Centers
             q_batch = centers_source[start_q:end_q]
+            current_batch_size = q_batch.shape[0]
             
             # 2. Compute Distances: (N_all, Batch_Size)
-            d_xq_sq = self.kernel.compute_squared_dist_tile(q_batch, targets_workspace)
+            # Transpose to (Batch_Size, N_all) for easier broadcasting below
+            d_xq_sq = self.kernel.compute_squared_dist_tile(q_batch, targets_workspace).t()
             
-            # 3. Setup Conditions
-            # Is the center a landmark? Shape (1, Batch_Size)
-            is_landmark = center_mask_P1[start_q:end_q].unsqueeze(0)
+            # 2. Vectorize: Prepare for (Batch, Radii, Points) broadcasting
+            # Distances: (Batch, 1, Points)
+            d_broad = d_xq_sq.unsqueeze(1)
+            # Radii: (1, Radii, 1)
+            r_broad = radii_sq.view(1, n_radii, 1)
             
-            # Voronoi Condition: d(x, q) < D(x)
-            # Only checked if q is NOT a landmark.
-            if not is_landmark.all():
-                cond_voronoi = d_xq_sq < D_voronoi_sq.unsqueeze(1)
-            else:
-                cond_voronoi = None
+            # 3. Distance Condition (Broadcasted): (Batch, Radii, Points)
+            mask = d_broad <= r_broad
+            
+            # 4. Voronoi Condition
+            # Is the center a landmark? (Batch,) -> (Batch, 1, 1)
+            is_landmark_batch = center_mask_P1[start_q:end_q].view(current_batch_size, 1, 1)
+            
+            if not is_landmark_batch.all():
+                # D_voronoi: (Points,) -> (1, 1, Points)
+                dv_broad = D_voronoi_sq.view(1, 1, n_targets)
+                # Check: d < D[x]
+                voronoi_mask = d_broad < dv_broad
+                
+                # Logic: Landmark ? Distance : (Distance & Voronoi)
+                mask = torch.where(is_landmark_batch, mask, mask & voronoi_mask)
+            
+            # 5. Bulk Extraction
+            # We want to get all indices (b, r, n) where mask is True.
+            # nonzero() returns tensor of shape (M, 3) -> [batch_idx, radius_idx, point_idx]
+            if not mask.any():
+                continue
+                
+            all_indices = torch.nonzero(mask)
+            
+            # Move to CPU ONCE per batch (Critical Optimization)
+            all_indices_cpu = all_indices.cpu()
+            
+            # 6. Fast Splitting on CPU
+            # We need to separate this massive list into individual clusters.
+            # We group by (batch_idx, radius_idx).
+            # Create a unique flat ID for every (batch, radius) pair.
+            b_idx = all_indices_cpu[:, 0]
+            r_idx = all_indices_cpu[:, 1]
+            point_idx = all_indices_cpu[:, 2]
+            
+            flat_group_ids = b_idx * n_radii + r_idx
+            
+            # Calculate size of every group using bincount
+            # minlength ensures we account for all potential groups in this batch
+            total_groups = current_batch_size * n_radii
+            counts = torch.bincount(flat_group_ids, minlength=total_groups)
+            
+            # Split the values (point indices) into a tuple of tensors
+            grouped_clusters = torch.split(point_idx, counts.tolist())
+            
+            # Append non-empty clusters to the main list
+            # (Matches original behavior: we only stored clusters that had members)
+            for c in grouped_clusters:
+                if c.numel() > 0:
+                    clusters.append(c)
 
-            # 4. Iterate Radii (Full Bucketing - logic preserves cumulative sets)
-            for r_sq in radii_sq:
-                # Distance Condition: d(x, q) <= r
-                cond_dist = d_xq_sq <= r_sq
-                
-                # Combine
-                if cond_voronoi is not None:
-                    mask = torch.where(is_landmark, cond_dist, cond_dist & cond_voronoi)
-                else:
-                    mask = cond_dist
-                
-                # 5. Extract and Offload
-                if not mask.any():
-                    continue
-                
-                has_members = mask.any(dim=0) # (Batch_Size,)
-                valid_local_indices = torch.nonzero(has_members).squeeze(1)
-                
-                for local_idx in valid_local_indices:
-                    members = mask[:, local_idx]
-                    indices = torch.nonzero(members).squeeze(1)
-                    
-                    # NOTE: We return PyTorch tensors. 
-                    # We move to CPU here to prevent GPU OOM during list accumulation.
-                    # If your next step needs them on GPU, just call .to(device) on the specific cluster you are processing.
-                    clusters.append(indices.cpu())
-                    
-                del mask
-                
-            del d_xq_sq
-            if cond_voronoi is not None: del cond_voronoi
+            # Cleanup GPU memory
+            del mask, d_xq_sq, d_broad, all_indices
 
         return clusters
 
