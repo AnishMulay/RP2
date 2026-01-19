@@ -346,36 +346,6 @@ class GPUClusteredSolver:
             
             slacks = self.cluster_costs[active_c_ids] - self.yB[active_b_ids] - cluster_max_yA[active_c_ids]
             
-            if iteration == 1 or iteration % 100 == 0:
-                if slacks.numel() > 0:
-                    slack_min = slacks.min().item()
-                    slack_max = slacks.max().item()
-                    slack_mean = slacks.mean().item()
-                else:
-                    slack_min = float("nan")
-                    slack_max = float("nan")
-                    slack_mean = float("nan")
-                print(f"    [Debug] Slack stats min={slack_min:.6f} max={slack_max:.6f} mean={slack_mean:.6f}")
-                
-                strict_zero = (torch.abs(slacks) < 1e-5).sum().item()
-                one_step = (torch.abs(slacks) < self.epsilon).sum().item()
-                print(f"    [Debug] Candidate counts |slack|<1e-5: {strict_zero} |slack|<eps: {one_step}")
-                
-                k = min(5, active_c_ids.numel())
-                if k > 0:
-                    c_ids = active_c_ids[:k]
-                    b_ids = active_b_ids[:k]
-                    costs = self.cluster_costs[c_ids]
-                    duals = self.yB[b_ids] + cluster_max_yA[c_ids]
-                    gaps = costs - duals
-                    print("    [Debug] First active edges (cost, yB+max_yA, slack):")
-                    for i in range(k):
-                        print(
-                            f"      c={c_ids[i].item()} b={b_ids[i].item()} "
-                            f"cost={costs[i].item():.6f} sum={duals[i].item():.6f} "
-                            f"slack={gaps[i].item():.6f}"
-                        )
-
             candidates = torch.abs(slacks) < 1e-5
             
             if not candidates.any():
