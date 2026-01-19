@@ -209,8 +209,8 @@ class GPUClusteredSolver:
         free_r = torch.nonzero(self.MA == -1).squeeze(1)
         count = min(free_b.numel(), free_r.numel())
         if count > 0:
-            self.MB[free_b[:count]] = free_r[:count]
-            self.MA[free_r[:count]] = free_b[:count]
+            self.MB[free_b[:count]] = free_r[:count].to(self.MB.dtype)
+            self.MA[free_r[:count]] = free_b[:count].to(self.MA.dtype)
         print(f"[Cleanup] Arbitrarily matched {count} remaining pairs.")
 
     def calculate_final_stats(self):
@@ -456,8 +456,8 @@ class GPUClusteredSolver:
                         b_match = b_final[valid]
                         r_match = r_final[valid]
                         if b_match.numel() != 0:
-                            self.MB[b_match] = r_match
-                            self.MA[r_match] = b_match
+                            self.MB[b_match] = r_match.to(self.MB.dtype)
+                            self.MA[r_match] = b_match.to(self.MA.dtype)
                 if use_cuda:
                     torch.cuda.synchronize()
                 t_resolve += time.time() - t0
