@@ -389,78 +389,68 @@ class GPUClusteredSolver:
                 win_b = active_b_ids[candidates]
                 win_c = active_c_ids[candidates]
                 win_l_b = active_b_levels[candidates]
-                
-                # Proposals: Store Center ID + Level for the chosen edge
-                proposals = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
-                proposals.scatter_(0, win_b, win_c)
 
-                prop_l_b = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
-                prop_l_b.scatter_(0, win_b, win_l_b)
+                free_red_mask = self.MA[self.red_indices] == -1
+                red_ids = self.red_indices[free_red_mask]
+                red_levels = self.red_levels[free_red_mask]
+                red_c_ids = self.red_expand_center_ids[free_red_mask]
 
-                prop_b_active = torch.nonzero(proposals != -1).squeeze(1)
-                prop_c_active = proposals[prop_b_active]
-                prop_l_b = prop_l_b[prop_b_active]
+                if win_b.numel() != 0 and red_ids.numel() != 0:
+                    max_level = torch.maximum(win_l_b.max(), red_levels.max())
+                    key_scale = max_level + 1
 
-                perm = torch.argsort(prop_c_active)
-                b_sorted = prop_b_active[perm]
-                c_sorted = prop_c_active[perm]
-                l_b_sorted = prop_l_b[perm]
+                    b_sort_key = win_c * key_scale + win_l_b
+                    b_perm = torch.argsort(b_sort_key)
+                    b_sorted = win_b[b_perm]
+                    c_sorted = win_c[b_perm]
+                    l_b_sorted = win_l_b[b_perm]
 
-                red_center_ids = self.red_expand_center_ids
-                mask_best = (self.MA[self.red_indices] == -1) & (
-                    self.yA[self.red_indices] == center_max_yA[red_center_ids]
-                )
-                best_reds = self.red_indices[mask_best]
-                best_red_levels = self.red_levels[mask_best]
-                # red_indices are center-sorted from CSR construction, so these remain grouped by center.
-                best_red_centers = red_center_ids[mask_best]
+                    r_sort_key = red_c_ids * key_scale + red_levels
+                    r_perm = torch.argsort(r_sort_key)
+                    r_sorted = red_ids[r_perm]
+                    c_r_sorted = red_c_ids[r_perm]
+                    l_r_sorted = red_levels[r_perm]
 
-                num_centers = center_max_yA.numel()
-                b_counts = torch.zeros(num_centers, device=self.device, dtype=torch.long)
-                r_counts = torch.zeros(num_centers, device=self.device, dtype=torch.long)
-                if c_sorted.numel() > 0:
-                    b_counts.scatter_add_(0, c_sorted, torch.ones_like(c_sorted))
-                if best_red_centers.numel() > 0:
-                    r_counts.scatter_add_(0, best_red_centers, torch.ones_like(best_red_centers))
-                min_counts = torch.minimum(b_counts, r_counts)
+                    num_centers = self.red_offsets.numel() - 1
+                    b_counts = torch.bincount(c_sorted, minlength=num_centers)
+                    r_counts = torch.bincount(c_r_sorted, minlength=num_centers)
+                    limits = torch.minimum(b_counts, r_counts)
 
-                b_offsets = torch.cat(
-                    [torch.zeros(1, device=self.device, dtype=torch.long), b_counts.cumsum(0)]
-                )
-                b_intra = torch.arange(b_sorted.numel(), device=self.device) - b_offsets[c_sorted]
-                b_keep = b_intra < min_counts[c_sorted]
+                    b_offsets = torch.zeros(num_centers + 1, device=self.device, dtype=torch.long)
+                    b_offsets[1:] = torch.cumsum(b_counts, 0)
+                    r_offsets = torch.zeros(num_centers + 1, device=self.device, dtype=torch.long)
+                    r_offsets[1:] = torch.cumsum(r_counts, 0)
 
-                r_offsets = torch.cat(
-                    [torch.zeros(1, device=self.device, dtype=torch.long), r_counts.cumsum(0)]
-                )
-                r_intra = torch.arange(best_reds.numel(), device=self.device) - r_offsets[best_red_centers]
-                r_keep = r_intra < min_counts[best_red_centers]
+                    b_rank = torch.arange(c_sorted.numel(), device=self.device) - b_offsets[c_sorted]
+                    r_rank = torch.arange(c_r_sorted.numel(), device=self.device) - r_offsets[c_r_sorted]
 
-                b_aligned = b_sorted[b_keep]
-                l_b_aligned = l_b_sorted[b_keep]
-                r_aligned = best_reds[r_keep]
-                l_a_aligned = best_red_levels[r_keep]
+                    b_keep = b_rank < limits[c_sorted]
+                    r_keep = r_rank < limits[c_r_sorted]
 
-                if b_aligned.numel() > 0:
-                    yB_aligned = self.yB[b_aligned]
-                    yA_aligned = self.yA[r_aligned]
-                    slacks = 2 * torch.maximum(l_b_aligned, l_a_aligned) - yB_aligned - yA_aligned
-                    valid = slacks == 0
-                    b_match = b_aligned[valid]
-                    r_match = r_aligned[valid]
+                    b_final = b_sorted[b_keep]
+                    l_b_final = l_b_sorted[b_keep]
+                    r_final = r_sorted[r_keep]
+                    l_r_final = l_r_sorted[r_keep]
 
-                    if b_match.numel() > 0:
-                        idx = torch.arange(b_match.numel(), device=self.device)
-                        first_idx = torch.full(
-                            (self.N,), b_match.numel(), device=self.device, dtype=torch.long
-                        )
-                        first_idx.scatter_reduce_(0, r_match, idx, reduce="amin", include_self=True)
-                        keep = idx == first_idx[r_match]
-                        b_match = b_match[keep]
-                        r_match = r_match[keep]
+                    pair_count = min(b_final.numel(), r_final.numel())
+                    if pair_count != 0:
+                        if b_final.numel() != pair_count:
+                            b_final = b_final[:pair_count]
+                            l_b_final = l_b_final[:pair_count]
+                        if r_final.numel() != pair_count:
+                            r_final = r_final[:pair_count]
+                            l_r_final = l_r_final[:pair_count]
 
-                        self.MB[b_match] = r_match
-                        self.MA[r_match] = b_match
+                        y_b = self.yB[b_final]
+                        y_a = self.yA[r_final]
+                        slack = 2 * torch.maximum(l_b_final, l_r_final) - y_b - y_a
+                        valid = slack == 0
+
+                        b_match = b_final[valid]
+                        r_match = r_final[valid]
+                        if b_match.numel() != 0:
+                            self.MB[b_match] = r_match
+                            self.MA[r_match] = b_match
                 if use_cuda:
                     torch.cuda.synchronize()
                 t_resolve += time.time() - t0
