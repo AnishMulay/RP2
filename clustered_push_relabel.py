@@ -210,62 +210,69 @@ class GPUClusteredSolver:
         b_c, b_l, b_p = blue_coo
         r_c, r_l, r_p = red_coo
         N = self.N
-        
-        # 1. Identify Valid Centers (Intersection)
-        # We only need centers that contain both Red and Blue points
-        u_b_centers = torch.unique(b_c)
-        u_r_centers = torch.unique(r_c)
-        valid_centers = u_b_centers[torch.isin(u_b_centers, u_r_centers)]
-        
+
+        # 1. Unify center IDs and merge all triplets on CPU
+        b_c_shifted = b_c + N
+        all_centers = torch.cat([b_c_shifted, r_c])
+        all_levels = torch.cat([b_l, r_l])
+        all_points = torch.cat([b_p, r_p])
+
+        # 2. Identify valid centers (contain at least one Red and one Blue point)
+        is_red_point = all_points < N
+        centers_with_red = torch.unique(all_centers[is_red_point])
+        centers_with_blue = torch.unique(all_centers[~is_red_point])
+        if centers_with_red.numel() == 0 or centers_with_blue.numel() == 0:
+            raise ValueError("No valid clusters found (Intersection Empty).")
+
+        valid_centers = centers_with_red[torch.isin(centers_with_red, centers_with_blue)]
         if valid_centers.numel() == 0:
             raise ValueError("No valid clusters found (Intersection Empty).")
-            
+
         print(f"         Active Centers: {valid_centers.numel()}")
-        
-        # 2. Filter Data
-        # Blue
-        mask_b = torch.isin(b_c, valid_centers)
-        b_c = b_c[mask_b]
-        b_l = b_l[mask_b]
-        b_p = b_p[mask_b] - N # Rebase Blue IDs to 0..N-1
-        
-        # Red
-        mask_r = torch.isin(r_c, valid_centers)
-        r_c = r_c[mask_r]
-        r_l = r_l[mask_r]
-        r_p = r_p[mask_r]
-        
-        # Map Centers to Dense IDs 0..K-1
-        # This allows efficient offset arrays
-        center_map = torch.searchsorted(valid_centers, b_c) # Re-use b_c tensor for mapped IDs
-        r_center_map = torch.searchsorted(valid_centers, r_c)
-        
-        # 3. Build Red CSR (Grouped by Center)
-        # Sort by Center
-        perm_r = torch.argsort(r_center_map)
-        self.red_indices = r_p[perm_r].to(self.device)
-        self.red_levels = r_l[perm_r].to(self.device) # Store Levels!
-        sorted_r_centers = r_center_map[perm_r]
-        
-        r_counts = torch.bincount(sorted_r_centers, minlength=len(valid_centers))
+
+        # 3. Filter to valid centers only
+        mask_valid = torch.isin(all_centers, valid_centers)
+        all_centers = all_centers[mask_valid]
+        all_levels = all_levels[mask_valid]
+        all_points = all_points[mask_valid]
+        is_red_point = is_red_point[mask_valid]
+
+        # Map centers to dense IDs 0..K-1 for efficient offsets
+        center_map = torch.searchsorted(valid_centers, all_centers)
+
+        # 4. Build Red CSR (Grouped by Center)
+        red_mask = is_red_point
+        red_centers = center_map[red_mask]
+        red_points = all_points[red_mask]
+        red_levels = all_levels[red_mask]
+
+        perm_r = torch.argsort(red_centers)
+        self.red_indices = red_points[perm_r].to(self.device)
+        self.red_levels = red_levels[perm_r].to(self.device)
+        sorted_r_centers = red_centers[perm_r]
+
+        r_counts = torch.bincount(sorted_r_centers, minlength=valid_centers.numel())
         self.red_offsets = torch.cat([torch.tensor([0]), torch.cumsum(r_counts, 0)]).to(self.device)
-        
+
         # Expand Center IDs for scatter ops
         self.red_expand_center_ids = torch.repeat_interleave(
-            torch.arange(len(valid_centers), device=self.device), r_counts.to(self.device)
+            torch.arange(valid_centers.numel(), device=self.device), r_counts.to(self.device)
         )
 
-        # 4. Build Blue CSR (Inverted: Blue -> [Centers])
-        # We need to look up which centers a Blue point belongs to.
-        # Sort by Blue Point ID
-        perm_b = torch.argsort(b_p)
-        self.blue_center_indices = center_map[perm_b].to(self.device) # Points to dense center ID
-        self.blue_levels = b_l[perm_b].to(self.device)
-        sorted_b_pts = b_p[perm_b]
-        
+        # 5. Build Blue CSR (Inverted: Blue -> [Centers])
+        blue_mask = ~is_red_point
+        blue_centers = center_map[blue_mask]
+        blue_points = all_points[blue_mask] - N  # Rebase Blue IDs to 0..N-1
+        blue_levels = all_levels[blue_mask]
+
+        perm_b = torch.argsort(blue_points)
+        self.blue_center_indices = blue_centers[perm_b].to(self.device)
+        self.blue_levels = blue_levels[perm_b].to(self.device)
+        sorted_b_pts = blue_points[perm_b]
+
         b_counts = torch.bincount(sorted_b_pts, minlength=N)
         self.blue_offsets = torch.cat([torch.tensor([0]), torch.cumsum(b_counts, 0)]).to(self.device)
-        
+
         print(f"         Red Entries: {self.red_indices.numel()} (GPU)")
         print(f"         Blue Entries: {self.blue_center_indices.numel()} (GPU)")
         print(f"         Avg Degree: {(self.blue_center_indices.numel() + self.red_indices.numel())/N:.2f}")
