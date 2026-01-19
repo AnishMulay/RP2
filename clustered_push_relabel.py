@@ -299,6 +299,11 @@ class GPUClusteredSolver:
         print(f"\n[Step 3] Starting Push-Relabel Loop...")
         start_solve = time.time()
         iteration = 0
+        use_cuda = self.device.type == "cuda"
+        t_maint = 0.0
+        t_push = 0.0
+        t_resolve = 0.0
+        t_relabel = 0.0
         
         while True:
             B_free = torch.nonzero(self.MB == -1).squeeze(1)
@@ -310,8 +315,15 @@ class GPUClusteredSolver:
             iteration += 1
             if iteration % 10 == 0:
                 print(f"    [Iter {iteration}] Free: {num_free}")
+                print(
+                    f"    [Time Profile] Maint: {t_maint:.4f}s | Push: {t_push:.4f}s | "
+                    f"Resolve: {t_resolve:.4f}s | Relabel: {t_relabel:.4f}s"
+                )
 
             # A. Maintenance: Max yA per Center
+            if use_cuda:
+                torch.cuda.synchronize()
+            t0 = time.time()
             yA_expanded = self.yA[self.red_indices]
             center_max_yA = torch.zeros(
                 len(self.red_offsets)-1, device=self.device, dtype=torch.long
@@ -321,15 +333,24 @@ class GPUClusteredSolver:
             center_max_yA.scatter_reduce_(
                 0, self.red_expand_center_ids, yA_expanded, reduce="amax", include_self=False
             )
+            if use_cuda:
+                torch.cuda.synchronize()
+            t_maint += time.time() - t0
             
             # B. Push (Ragged Gather)
+            if use_cuda:
+                torch.cuda.synchronize()
+            t0 = time.time()
             starts = self.blue_offsets[B_free]
             ends = self.blue_offsets[B_free + 1]
             
             ranges = [torch.arange(s.item(), e.item(), device=self.device) for s, e in zip(starts, ends)]
             if not ranges:
-                 self.yB[B_free] += 1
-                 continue
+                if use_cuda:
+                    torch.cuda.synchronize()
+                t_push += time.time() - t0
+                self.yB[B_free] += 1
+                continue
             
             active_edge_indices = torch.cat(ranges)
             
@@ -353,11 +374,17 @@ class GPUClusteredSolver:
             )
             
             candidates = slacks_est <= 0
+            if use_cuda:
+                torch.cuda.synchronize()
+            t_push += time.time() - t0
             
             if not candidates.any():
                 pass
             else:
                 # C. Resolve
+                if use_cuda:
+                    torch.cuda.synchronize()
+                t0 = time.time()
                 # We have (Blue, Center) pairs that MIGHT have a match.
                 win_b = active_b_ids[candidates]
                 win_c = active_c_ids[candidates]
@@ -467,13 +494,22 @@ class GPUClusteredSolver:
                             # (Inefficient slice update, but robust)
                             # Better: keep mask
                             cand_yA[r_local_idx] = -99999 # Invalidate slack
+                if use_cuda:
+                    torch.cuda.synchronize()
+                t_resolve += time.time() - t0
 
             # D. Relabel
+            if use_cuda:
+                torch.cuda.synchronize()
+            t0 = time.time()
             still_free = torch.nonzero(self.MB == -1).squeeze(1)
             self.yB[still_free] += 1
             
             matched_r = torch.nonzero(self.MA != -1).squeeze(1)
             self.yA[matched_r] -= 1
+            if use_cuda:
+                torch.cuda.synchronize()
+            t_relabel += time.time() - t0
             
             if iteration > 50000:
                 print("Max Iterations Reached.")
