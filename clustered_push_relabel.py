@@ -39,15 +39,15 @@ class TiledEuclideanKernel:
         return torch.clamp(dists_sq, min=0.0)
 
 # ==========================================
-# PART 2: GPU-NATIVE CLUSTERING (With Micro-Batch)
+# PART 2: HYBRID CLUSTERING (Compute GPU -> Store CPU)
 # ==========================================
 
 class FastGPUClustering:
     """
-    Optimized Clustering that outputs raw GPU tensors (COO format).
-    Includes MICRO-BATCHING to prevent OOM and maximize throughput.
+    Optimized Clustering that computes on GPU but accumulates results on CPU.
+    This prevents VRAM OOM when the intermediate cluster cover is large.
     """
-    def __init__(self, epsilon, batch_size=2048, micro_batch_size=32):
+    def __init__(self, epsilon, batch_size=1024, micro_batch_size=8):
         self.epsilon = epsilon
         self.batch_size = batch_size
         self.micro_batch_size = micro_batch_size
@@ -60,11 +60,11 @@ class FastGPUClustering:
         return torch.nonzero(mask).squeeze(1), mask
 
     def _compute_voronoi_bounds(self, targets, landmarks, workspace):
-        # D[x] = min d(x, s) for s in landmarks
         n_targets = targets.shape[0]
         n_landmarks = landmarks.shape[0]
         D_y_sq = torch.full((n_targets,), float('inf'), device=targets.device)
         
+        # Process in chunks to save memory
         for i in range(0, n_landmarks, self.batch_size):
             end = min(i + self.batch_size, n_landmarks)
             batch = landmarks[i:end]
@@ -77,7 +77,6 @@ class FastGPUClustering:
         n = P_all.shape[0]
         max_dist_sq = 0.0
         
-        # Scan for max distance
         for i in range(0, n, self.batch_size):
             end = min(i + self.batch_size, n)
             batch = P_all[i:end]
@@ -88,7 +87,6 @@ class FastGPUClustering:
         Delta = math.sqrt(max_dist_sq)
         if Delta <= 1e-9: return torch.tensor([0.0], device=P_all.device)
         
-        # Powers of (1+eps)
         base = 1.0 + self.epsilon
         t = int(math.ceil(math.log(Delta * 100) / math.log(base))) + 2
         indices = torch.arange(1, t + 1, device=P_all.device, dtype=P_all.dtype)
@@ -97,39 +95,36 @@ class FastGPUClustering:
 
     def _build_cover_bulk(self, centers, center_mask_P1, targets_ws, D_voronoi, radii):
         """
-        Generates membership in bulk using MICRO-BATCHING.
-        Returns: (center_ids, radius_ids, point_ids) tensors.
+        Generates membership. 
+        CRITICAL CHANGE: Moves indices to CPU immediately to save GPU memory.
         """
         n_centers = centers.shape[0]
         n_targets = targets_ws["P"].shape[0]
         n_radii = radii.shape[0]
         radii_sq = radii ** 2
         
+        # Accumulators on CPU
         chunk_center_ids = []
         chunk_radius_ids = []
         chunk_point_ids = []
         
-        r_broad = radii_sq.view(1, n_radii, 1) # (1, R, 1)
+        r_broad = radii_sq.view(1, n_radii, 1)
 
-        # 1. Outer Loop: Batches of Centers
         for start_q in range(0, n_centers, self.batch_size):
             end_q = min(start_q + self.batch_size, n_centers)
             q_batch = centers[start_q:end_q]
             curr_bs = q_batch.shape[0]
             
-            # 2. Inner Loop: Micro-batches (Crucial for Speed/Memory)
             for start_mb in range(0, curr_bs, self.micro_batch_size):
                 end_mb = min(start_mb + self.micro_batch_size, curr_bs)
                 q_micro = q_batch[start_mb:end_mb]
                 
-                # Distances: (Micro, N_targets) -> (Micro, 1, N_targets)
+                # Compute on GPU
                 d_xq_sq = self.kernel.compute_squared_dist_tile(q_micro, targets_ws).t()
                 d_broad = d_xq_sq.unsqueeze(1) 
                 
-                # Mask: Distance Condition
                 mask = d_broad <= r_broad
                 
-                # Mask: Voronoi Condition
                 global_q_idx_start = start_q + start_mb
                 global_q_idx_end = start_q + end_mb
                 is_landmark = center_mask_P1[global_q_idx_start:global_q_idx_end].view(-1, 1, 1)
@@ -138,29 +133,38 @@ class FastGPUClustering:
                     dv_broad = D_voronoi.view(1, 1, n_targets)
                     mask = torch.where(is_landmark, mask, mask & (d_broad < dv_broad))
                 
-                if not mask.any(): continue
+                if not mask.any(): 
+                    del d_xq_sq, d_broad, mask
+                    continue
                 
-                # Extract Triplets (local_center_idx, radius_idx, point_idx)
+                # Extract Indices on GPU
                 indices = torch.nonzero(mask) 
                 
-                # Convert local center index to global center index
-                local_c = indices[:, 0]
+                # MOVE TO CPU IMMEDIATELY
+                indices_cpu = indices.cpu()
+                
+                local_c = indices_cpu[:, 0]
                 global_c = local_c + global_q_idx_start
                 
                 chunk_center_ids.append(global_c)
-                chunk_radius_ids.append(indices[:, 1])
-                chunk_point_ids.append(indices[:, 2])
+                chunk_radius_ids.append(indices_cpu[:, 1])
+                chunk_point_ids.append(indices_cpu[:, 2])
+                
+                # Cleanup GPU
+                del d_xq_sq, d_broad, mask, indices
         
         if not chunk_center_ids:
-            return (torch.empty(0, device=centers.device, dtype=torch.long), 
-                    torch.empty(0, device=centers.device, dtype=torch.long),
-                    torch.empty(0, device=centers.device, dtype=torch.long))
+            return (torch.empty(0, dtype=torch.long), 
+                    torch.empty(0, dtype=torch.long),
+                    torch.empty(0, dtype=torch.long))
 
+        # Cat on CPU
         return (torch.cat(chunk_center_ids), 
                 torch.cat(chunk_radius_ids), 
                 torch.cat(chunk_point_ids))
 
     def run(self, P_red, P_blue):
+        # All inputs on GPU
         P_all = torch.cat([P_red, P_blue], dim=0)
         workspace = self.kernel.prepare_workspace(P_all)
         
@@ -172,14 +176,14 @@ class FastGPUClustering:
         
         radii = self._compute_global_radii(P_all, workspace)
         
-        # Build raw COO tensors
+        # Returns CPU Tensors
         b_c, b_r, b_p = self._build_cover_bulk(P_blue, blue_mask, workspace, D_blue, radii)
         r_c, r_r, r_p = self._build_cover_bulk(P_red, red_mask, workspace, D_red, radii)
         
         return radii, (b_c, b_r, b_p), (r_c, r_r, r_p)
 
 # ==========================================
-# PART 3: GPU CLUSTERED SOLVER (Optimized Indexing)
+# PART 3: GPU CLUSTERED SOLVER (CPU Staging)
 # ==========================================
 
 class GPUClusteredSolver:
@@ -191,20 +195,21 @@ class GPUClusteredSolver:
         print("="*60)
         print(f"[Init] Configuration: N={self.N}, Eps={epsilon}, Device={self.device}")
         
-        # 1. GPU Clustering (With Micro-Batch)
-        print("[Step 1] Running FastGPUClustering...")
+        # 1. Clustering (Hybrid)
+        print("[Step 1] Running FastGPUClustering (Hybrid Mode)...")
         t0 = time.time()
-        # Ensure micro_batch_size is passed here
-        cluster_engine = FastGPUClustering(epsilon, batch_size=2048, micro_batch_size=64)
+        # micro_batch_size=8 ensures GPU safety during compute
+        cluster_engine = FastGPUClustering(epsilon, batch_size=1024, micro_batch_size=8)
         self.radii, blue_coo, red_coo = cluster_engine.run(P_red, P_blue)
         torch.cuda.synchronize()
         print(f"         Clustering done in {time.time()-t0:.2f}s")
+        print(f"         Raw Blue Entries: {blue_coo[0].numel()}")
+        print(f"         Raw Red Entries:  {red_coo[0].numel()}")
         
-        # 2. Index Construction (Vectorized Intersection)
-        print("[Step 2] Building CSR Index on GPU (Vectorized)...")
+        # 2. Index Construction (CPU Staging)
+        print("[Step 2] Building CSR Index (CPU Staging)...")
         t0 = time.time()
-        self._build_csr_from_coo(blue_coo, red_coo)
-        torch.cuda.synchronize()
+        self._build_csr_from_coo_cpu(blue_coo, red_coo)
         print(f"         Indexing done in {time.time()-t0:.2f}s")
         
         # Cleanup
@@ -218,85 +223,85 @@ class GPUClusteredSolver:
         self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
         self.MB = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
 
-    def _build_csr_from_coo(self, blue_coo, red_coo):
+    def _build_csr_from_coo_cpu(self, blue_coo, red_coo):
         """
-        Converts raw (Center, Radius, Point) triplets into optimized CSR structures.
-        Uses fast GPU sorting and set intersection.
+        Builds the Index on CPU to avoid VRAM OOM, then moves compact results to GPU.
         """
+        # Unpack CPU tensors
         b_c, b_r, b_p = blue_coo
         r_c, r_r, r_p = red_coo
         N = self.N
         n_radii = self.radii.shape[0]
         
-        # 1. Generate Global Cluster Keys
-        # Blue Keys: (CenterID + N) * MaxRadii + RadiusID
+        # 1. Global Keys (CPU)
+        # Blue: (Center + N) * MaxRadii + Radius
         b_global_keys = (b_c + N) * n_radii + b_r
-        # Red Keys: CenterID * MaxRadii + RadiusID
+        # Red: Center * MaxRadii + Radius
         r_global_keys = r_c * n_radii + r_r
         
-        # 2. Flatten Everything
+        # 2. Concat on CPU (Safe)
         all_keys = torch.cat([b_global_keys, r_global_keys])
         all_points = torch.cat([b_p, r_p])
         
-        # 3. Identify Valid Clusters (Contain BOTH Red and Blue)
+        # 3. Intersection Logic (CPU)
         is_red_point = all_points < N
         is_blue_point = all_points >= N
         
         red_member_keys = torch.unique(all_keys[is_red_point])
         blue_member_keys = torch.unique(all_keys[is_blue_point])
         
-        # Intersection
-        # For large arrays, 'isin' or sort-merge is fast.
+        # Valid = Intersection
+        # isin is fast on CPU for 1D sorted/unsorted
         valid_keys = red_member_keys[torch.isin(red_member_keys, blue_member_keys)]
         
         if valid_keys.numel() == 0:
-            raise ValueError("No valid clusters found. Check Epsilon.")
+            raise ValueError("No valid clusters found.")
             
-        print(f"         Found {valid_keys.numel()} valid clusters.")
+        print(f"         Valid Clusters: {valid_keys.numel()}")
         
-        # 4. Filter and Map to Dense IDs
-        # Keep only entries belonging to valid clusters
+        # 4. Filter and Dense Map (CPU)
         is_valid_entry = torch.isin(all_keys, valid_keys)
         final_keys = all_keys[is_valid_entry]
         final_points = all_points[is_valid_entry]
         
-        # Map sparse keys to 0..K-1
+        # Searchsorted for dense IDs
         final_dense_ids = torch.searchsorted(valid_keys, final_keys)
         
-        # 5. Extract Costs
+        # 5. Extract Costs (Move to GPU)
         valid_radii_idx = valid_keys % n_radii
-        self.cluster_costs = 2.0 * self.radii[valid_radii_idx]
+        self.cluster_costs = (2.0 * self.radii[valid_radii_idx]).to(self.device)
         
-        # 6. Build Red CSR (Forward Index)
+        # 6. Build Red CSR (CPU -> GPU)
         mask_red = final_points < N
         red_dense_ids = final_dense_ids[mask_red]
         red_pt_ids = final_points[mask_red]
         
         perm_r = torch.argsort(red_dense_ids)
-        self.red_indices = red_pt_ids[perm_r]
+        self.red_indices = red_pt_ids[perm_r].to(self.device)
         sorted_red_ids = red_dense_ids[perm_r]
         
         r_counts = torch.bincount(sorted_red_ids, minlength=len(valid_keys))
-        self.red_offsets = torch.cat([torch.tensor([0], device=self.device), torch.cumsum(r_counts, 0)])
+        self.red_offsets = torch.cat([torch.tensor([0]), torch.cumsum(r_counts, 0)]).to(self.device)
         
         self.red_expand_cluster_ids = torch.repeat_interleave(
-            torch.arange(len(valid_keys), device=self.device), r_counts
+            torch.arange(len(valid_keys), device=self.device), r_counts.to(self.device)
         )
         
-        # 7. Build Blue Inverted Index
+        # 7. Build Blue CSR (CPU -> GPU)
         mask_blue = final_points >= N
         blue_dense_ids = final_dense_ids[mask_blue]
-        blue_pt_ids = final_points[mask_blue] - N # Rebase to 0..N-1
+        blue_pt_ids = final_points[mask_blue] - N 
         
         perm_b = torch.argsort(blue_pt_ids)
-        self.blue_cluster_indices = blue_dense_ids[perm_b]
+        self.blue_cluster_indices = blue_dense_ids[perm_b].to(self.device)
         sorted_blue_pts = blue_pt_ids[perm_b]
         
         b_counts = torch.bincount(sorted_blue_pts, minlength=N)
-        self.blue_offsets = torch.cat([torch.tensor([0], device=self.device), torch.cumsum(b_counts, 0)])
+        self.blue_offsets = torch.cat([torch.tensor([0]), torch.cumsum(b_counts, 0)]).to(self.device)
         
-        print(f"         Red CSR: {self.red_indices.numel()} entries")
-        print(f"         Blue CSR: {self.blue_cluster_indices.numel()} entries")
+        print(f"         Red CSR Size: {self.red_indices.numel()} (GPU)")
+        print(f"         Blue CSR Size: {self.blue_cluster_indices.numel()} (GPU)")
+
 
     def solve(self):
         print(f"\n[Step 3] Starting Push-Relabel Loop...")
@@ -325,7 +330,7 @@ class GPUClusteredSolver:
             ends = self.blue_offsets[B_free + 1]
             counts = ends - starts
             
-            if counts.sum() == 0: # Stuck
+            if counts.sum() == 0: 
                  self.yB[B_free] += self.epsilon
                  continue
             
@@ -351,7 +356,7 @@ class GPUClusteredSolver:
                 win_c = active_c_ids[candidates]
                 
                 proposals = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
-                proposals[win_b] = win_c # Winner takes all (last write wins)
+                proposals[win_b] = win_c 
                 
                 prop_b_active = torch.nonzero(proposals != -1).squeeze(1)
                 prop_c_active = proposals[prop_b_active]
@@ -363,7 +368,7 @@ class GPUClusteredSolver:
                 u_clusters, b_counts = torch.unique_consecutive(c_sorted, return_counts=True)
                 b_offsets = torch.cat([torch.tensor([0], device=self.device), b_counts.cumsum(0)])
                 
-                # Resolve Loop (Usually small enough for Python, can be kernelized if needed)
+                # Resolve Loop
                 for i, cid in enumerate(u_clusters):
                     cid_val = cid.item()
                     req_blues = b_sorted[b_offsets[i]:b_offsets[i+1]]
@@ -373,7 +378,6 @@ class GPUClusteredSolver:
                     reds = self.red_indices[r_start:r_end]
                     
                     max_val = cluster_max_yA[cid_val]
-                    # Filter: Max Dual AND Free
                     best_reds = reds[(torch.abs(self.yA[reds] - max_val) < 1e-5) & (self.MA[reds] == -1)]
                     
                     k = min(req_blues.numel(), best_reds.numel())
@@ -403,7 +407,7 @@ class GPUClusteredSolver:
 if __name__ == "__main__":
     N = 5000
     DIM = 2
-    EPS = 0.01
+    EPS = 0.1
     
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {dev}")
