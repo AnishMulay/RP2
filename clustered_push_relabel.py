@@ -332,21 +332,18 @@ class GPUClusteredSolver:
             # B. Push (Search)
             starts = self.blue_offsets[B_free]
             ends = self.blue_offsets[B_free + 1]
-            counts = ends - starts
-            
-            if counts.sum() == 0: 
+            # NEW LOGIC: Ragged Gather
+            # 1. Generate gather indices on CPU to avoid massive GPU mask allocation
+            # This is O(Free_Edges) instead of O(Total_Edges)
+            ranges = [torch.arange(s.item(), e.item(), device=self.device) for s, e in zip(starts, ends)]
+            if not ranges: # All free blues are trapped (no edges)
                  self.yB[B_free] += 1
                  continue
-            
-            # Mask for ALL Blue CSR (Vectorized Gather)
-            all_b_owners = torch.repeat_interleave(
-                 torch.arange(self.N, device=self.device), 
-                 self.blue_offsets[1:] - self.blue_offsets[:-1]
-            )
-            mask_free_csr = torch.isin(all_b_owners, B_free)
-            
-            active_c_ids = self.blue_cluster_indices[mask_free_csr]
-            active_b_ids = all_b_owners[mask_free_csr]
+            active_edge_indices = torch.cat(ranges)
+            # 2. Reconstruct owners for these specific edges
+            lengths = ends - starts
+            active_b_ids = torch.repeat_interleave(B_free, lengths)
+            active_c_ids = self.blue_cluster_indices[active_edge_indices]
             
             slacks = (
                 self.cluster_costs[active_c_ids]
