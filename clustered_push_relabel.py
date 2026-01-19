@@ -214,12 +214,11 @@ class GPUClusteredSolver:
         print(f"[Cleanup] Arbitrarily matched {count} remaining pairs.")
 
     def calculate_final_stats(self):
-        diff = self.P_blue - self.P_red[self.MB]
-        dists_sq = (diff ** 2).sum(dim=1)
-        total_cost = dists_sq.sum()
+        dists = torch.norm(self.P_blue - self.P_red[self.MB], p=2, dim=1)
+        total_cost = dists.sum()
         avg_cost = total_cost / self.N
-        print(f"[Final Cost] Total Squared Euclidean Cost: {total_cost.item():.6f}")
-        print(f"[Final Cost] Average Cost per Point: {avg_cost.item():.6f}")
+        print(f"Total Euclidean Cost: {total_cost.item():.4f}")
+        print(f"Avg Euclidean Cost: {avg_cost.item():.4f}")
 
     def _build_csr_from_coo_cpu(self, blue_coo, red_coo):
         """
