@@ -351,19 +351,25 @@ class GPUClusteredSolver:
             t0 = time.time()
             starts = self.blue_offsets[B_free]
             ends = self.blue_offsets[B_free + 1]
-            
-            ranges = [torch.arange(s.item(), e.item(), device=self.device) for s, e in zip(starts, ends)]
-            if not ranges:
+
+            lengths = ends - starts
+            total_edges = int(lengths.sum().item())
+            if total_edges == 0:
                 if use_cuda:
                     torch.cuda.synchronize()
                 t_push += time.time() - t0
                 self.yB[B_free] += 1
                 continue
-            
-            active_edge_indices = torch.cat(ranges)
-            
+
+            repeat_starts = torch.repeat_interleave(starts, lengths)
+            cum_len = torch.cumsum(lengths, 0)
+            segment_starts_packed = cum_len - lengths
+            global_range = torch.arange(total_edges, device=self.device)
+            repeat_packed_starts = torch.repeat_interleave(segment_starts_packed, lengths)
+            offsets = global_range - repeat_packed_starts
+            active_edge_indices = repeat_starts + offsets
+
             # Reconstruct attributes
-            lengths = ends - starts
             active_b_ids = torch.repeat_interleave(B_free, lengths)
             
             active_c_ids = self.blue_center_indices[active_edge_indices]
