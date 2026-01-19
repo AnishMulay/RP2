@@ -4,26 +4,6 @@ import time
 import sys
 import gc
 
-def _format_bytes(num_bytes):
-    if num_bytes >= 1024 ** 3:
-        return f"{num_bytes / (1024 ** 3):.2f} GB"
-    return f"{num_bytes / (1024 ** 2):.2f} MB"
-
-def print_gpu_stats(label: str):
-    if not torch.cuda.is_available():
-        print(f"[GPU Stats] {label} | CUDA not available")
-        return
-    allocated = torch.cuda.memory_allocated()
-    reserved = torch.cuda.memory_reserved()
-    peak = torch.cuda.max_memory_allocated()
-    print(
-        f"[GPU Stats] {label} | "
-        f"Allocated: {_format_bytes(allocated)}, "
-        f"Reserved: {_format_bytes(reserved)}, "
-        f"Peak: {_format_bytes(peak)}"
-    )
-    torch.cuda.reset_peak_memory_stats()
-
 # ==========================================
 # PART 1: LOW-LEVEL KERNELS (GPU)
 # ==========================================
@@ -37,7 +17,6 @@ class TiledEuclideanKernel:
         self.chunk_size = chunk_size
 
     def prepare_workspace(self, P):
-        # Precompute norms for the 'Target' set P
         return {
             "P": P,
             "P_T": P.t(),
@@ -45,46 +24,41 @@ class TiledEuclideanKernel:
         }
 
     def compute_squared_dist_tile(self, query_points, workspace):
-        # query_points: (Batch, D)
-        # workspace['P']: (N, D)
         P = workspace["P"]
         P_norms_sq = workspace["P_norms_sq"]
-        
-        Q_norms_sq = (query_points ** 2).sum(dim=1, keepdim=True).t() # (1, Batch)
-        
-        # dist = P_norm + Q_norm - 2 P @ Q.T
+        Q_norms_sq = (query_points ** 2).sum(dim=1, keepdim=True).t()
         dists_sq = P_norms_sq + Q_norms_sq
         dists_sq.addmm_(P, query_points.t(), beta=1.0, alpha=-2.0)
-        
         return torch.clamp(dists_sq, min=0.0)
 
 # ==========================================
-# PART 2: HYBRID CLUSTERING (Compute GPU -> Store CPU)
+# PART 2: GEOMETRIC CLUSTERING (Voronoi + Shells)
 # ==========================================
 
 class FastGPUClustering:
     """
-    Optimized Clustering that computes on GPU but accumulates results on CPU.
-    This prevents VRAM OOM when the intermediate cluster cover is large.
+    Optimized Clustering using Voronoi constraints and minimal shells.
+    Generates a sparse O(N^1.5) cover instead of a dense one.
     """
-    def __init__(self, epsilon, batch_size=1024, micro_batch_size=8):
+    def __init__(self, epsilon, batch_size=1024, micro_batch_size=32):
         self.epsilon = epsilon
         self.batch_size = batch_size
         self.micro_batch_size = micro_batch_size
         self.kernel = TiledEuclideanKernel(chunk_size=batch_size)
 
     def _sample_landmarks(self, n, device):
+        # Sample ~sqrt(N) landmarks
         prob = n ** (-0.5)
         mask = torch.rand(n, device=device) < prob
         if not mask.any(): mask[torch.randint(0, n, (1,), device=device)] = True
         return torch.nonzero(mask).squeeze(1), mask
 
     def _compute_voronoi_bounds(self, targets, landmarks, workspace):
+        # D[x] = min d(x, s) for s in landmarks
         n_targets = targets.shape[0]
         n_landmarks = landmarks.shape[0]
         D_y_sq = torch.full((n_targets,), float('inf'), device=targets.device)
         
-        # Process in chunks to save memory
         for i in range(0, n_landmarks, self.batch_size):
             end = min(i + self.batch_size, n_landmarks)
             batch = landmarks[i:end]
@@ -93,98 +67,87 @@ class FastGPUClustering:
             D_y_sq = torch.min(D_y_sq, batch_min)
         return D_y_sq
 
-    def _compute_global_radii(self, P_all, workspace):
-        n = P_all.shape[0]
-        max_dist_sq = 0.0
-        
-        for i in range(0, n, self.batch_size):
-            end = min(i + self.batch_size, n)
-            batch = P_all[i:end]
-            dists = self.kernel.compute_squared_dist_tile(batch, workspace)
-            current_max = dists.max().item()
-            max_dist_sq = max(max_dist_sq, current_max)
-            
-        Delta = math.sqrt(max_dist_sq)
-        if Delta <= 1e-9: return torch.tensor([0.0], device=P_all.device)
-        
-        base = 1.0 + self.epsilon
-        t = int(math.ceil(math.log(Delta * 100) / math.log(base))) + 2
-        indices = torch.arange(1, t + 1, device=P_all.device, dtype=P_all.dtype)
-        radii = torch.pow(base, indices)
-        return torch.cat([torch.tensor([0.0], device=P_all.device), radii])
-
-    def _build_cover_bulk(self, centers, center_mask_P1, targets_ws, D_voronoi, radii):
+    def _build_cover_bulk(self, centers, center_mask_P1, targets_ws, D_voronoi):
         """
-        Generates membership. 
-        CRITICAL CHANGE: Moves indices to CPU immediately to save GPU memory.
+        Builds the cluster cover using the Sampled/Non-Sampled split.
+        Returns (Center, Level, Point) triplets on CPU.
         """
         n_centers = centers.shape[0]
         n_targets = targets_ws["P"].shape[0]
-        n_radii = radii.shape[0]
-        radii_sq = radii ** 2
         
-        # Accumulators on CPU
         chunk_center_ids = []
-        chunk_radius_ids = []
+        chunk_level_ids = []
         chunk_point_ids = []
-        
-        r_broad = radii_sq.view(1, n_radii, 1)
 
+        # We process centers in batches
         for start_q in range(0, n_centers, self.batch_size):
             end_q = min(start_q + self.batch_size, n_centers)
             q_batch = centers[start_q:end_q]
             curr_bs = q_batch.shape[0]
             
+            # Identify which centers in this batch are landmarks
+            is_landmark_batch = center_mask_P1[start_q:end_q].view(curr_bs, 1)
+
             for start_mb in range(0, curr_bs, self.micro_batch_size):
                 end_mb = min(start_mb + self.micro_batch_size, curr_bs)
                 q_micro = q_batch[start_mb:end_mb]
+                micro_is_landmark = is_landmark_batch[start_mb:end_mb]
                 
-                # Compute on GPU
-                d_xq_sq = self.kernel.compute_squared_dist_tile(q_micro, targets_ws).t()
-                d_broad = d_xq_sq.unsqueeze(1) 
+                # 1. Compute Distances (Micro x Targets)
+                dists_sq = self.kernel.compute_squared_dist_tile(q_micro, targets_ws).t() # (Micro, Targets)
                 
-                mask = d_broad <= r_broad
+                # 2. Apply Voronoi Constraint
+                # If Landmark: Connect to everything (up to some reasonable bound, effectively inf here)
+                # If Non-Landmark: Connect only if dist < D_voronoi[point]
                 
-                global_q_idx_start = start_q + start_mb
-                global_q_idx_end = start_q + end_mb
-                is_landmark = center_mask_P1[global_q_idx_start:global_q_idx_end].view(-1, 1, 1)
+                # Prepare Voronoi bounds for broadcast: (1, Targets)
+                dv_row = D_voronoi.view(1, n_targets)
                 
-                if not is_landmark.all():
-                    dv_broad = D_voronoi.view(1, 1, n_targets)
-                    mask = torch.where(is_landmark, mask, mask & (d_broad < dv_broad))
+                # Mask Logic:
+                # Landmark: True
+                # Non-Landmark: dists_sq < dv_row
+                
+                # Note: d_sq and dv_row are squared distances
+                mask = dists_sq < dv_row
+                mask = torch.where(micro_is_landmark, torch.tensor(True, device=mask.device), mask)
                 
                 if not mask.any(): 
-                    del d_xq_sq, d_broad, mask
                     continue
                 
-                # Extract Indices on GPU
-                indices = torch.nonzero(mask) 
+                # 3. Compute Levels for valid edges
+                # Level = ceil(sqrt(dist_sq) / epsilon)
+                # We only compute this for the valid mask indices to save ops
+                valid_indices = torch.nonzero(mask)
                 
-                # MOVE TO CPU IMMEDIATELY
-                indices_cpu = indices.cpu()
+                # Extract distances for these pairs
+                valid_dists_sq = dists_sq[valid_indices[:, 0], valid_indices[:, 1]]
+                valid_dists = torch.sqrt(valid_dists_sq)
+                levels = torch.ceil(valid_dists / self.epsilon).to(torch.long)
+                
+                # Filter out Level 0 (self-loops with 0 cost can be tricky, set to 1 or keep 0)
+                # Usually cost >= 0 is fine.
+                
+                # Move to CPU
+                indices_cpu = valid_indices.cpu()
+                levels_cpu = levels.cpu()
                 
                 local_c = indices_cpu[:, 0]
-                global_c = local_c + global_q_idx_start
+                global_c = local_c + (start_q + start_mb)
                 
                 chunk_center_ids.append(global_c)
-                chunk_radius_ids.append(indices_cpu[:, 1])
-                chunk_point_ids.append(indices_cpu[:, 2])
-                
-                # Cleanup GPU
-                del d_xq_sq, d_broad, mask, indices
-        
+                chunk_level_ids.append(levels_cpu)
+                chunk_point_ids.append(indices_cpu[:, 1])
+
         if not chunk_center_ids:
             return (torch.empty(0, dtype=torch.long), 
-                    torch.empty(0, dtype=torch.long),
+                    torch.empty(0, dtype=torch.long), 
                     torch.empty(0, dtype=torch.long))
 
-        # Cat on CPU
         return (torch.cat(chunk_center_ids), 
-                torch.cat(chunk_radius_ids), 
+                torch.cat(chunk_level_ids), 
                 torch.cat(chunk_point_ids))
 
     def run(self, P_red, P_blue):
-        # All inputs on GPU
         P_all = torch.cat([P_red, P_blue], dim=0)
         workspace = self.kernel.prepare_workspace(P_all)
         
@@ -194,16 +157,14 @@ class FastGPUClustering:
         D_red = self._compute_voronoi_bounds(P_all, P_red[red_idx], workspace)
         D_blue = self._compute_voronoi_bounds(P_all, P_blue[blue_idx], workspace)
         
-        radii = self._compute_global_radii(P_all, workspace)
+        # Build Shell Covers
+        b_c, b_l, b_p = self._build_cover_bulk(P_blue, blue_mask, workspace, D_blue)
+        r_c, r_l, r_p = self._build_cover_bulk(P_red, red_mask, workspace, D_red)
         
-        # Returns CPU Tensors
-        b_c, b_r, b_p = self._build_cover_bulk(P_blue, blue_mask, workspace, D_blue, radii)
-        r_c, r_r, r_p = self._build_cover_bulk(P_red, red_mask, workspace, D_red, radii)
-        
-        return radii, (b_c, b_r, b_p), (r_c, r_r, r_p)
+        return (b_c, b_l, b_p), (r_c, r_l, r_p)
 
 # ==========================================
-# PART 3: GPU CLUSTERED SOLVER (CPU Staging)
+# PART 3: CLUSTERED SOLVER (Dynamic Costs)
 # ==========================================
 
 class GPUClusteredSolver:
@@ -215,31 +176,27 @@ class GPUClusteredSolver:
         print("="*60)
         print(f"[Init] Configuration: N={self.N}, Eps={epsilon}, Device={self.device}")
         
-        # 1. Clustering (Hybrid)
-        print("[Step 1] Running FastGPUClustering (Hybrid Mode)...")
+        # 1. Clustering
+        print("[Step 1] Running Geometric Clustering...")
         t0 = time.time()
-        # micro_batch_size=8 ensures GPU safety during compute
-        cluster_engine = FastGPUClustering(epsilon, batch_size=1024, micro_batch_size=8)
-        self.radii, blue_coo, red_coo = cluster_engine.run(P_red, P_blue)
+        cluster_engine = FastGPUClustering(epsilon, batch_size=1024, micro_batch_size=32)
+        blue_coo, red_coo = cluster_engine.run(P_red, P_blue)
         torch.cuda.synchronize()
         print(f"         Clustering done in {time.time()-t0:.2f}s")
-        print(f"         Raw Blue Entries: {blue_coo[0].numel()}")
-        print(f"         Raw Red Entries:  {red_coo[0].numel()}")
-        print_gpu_stats("After Clustering (Step 1)")
+        print(f"         Raw Blue Shells: {blue_coo[0].numel()}")
+        print(f"         Raw Red Shells:  {red_coo[0].numel()}")
         
-        # 2. Index Construction (CPU Staging)
-        print("[Step 2] Building CSR Index (CPU Staging)...")
+        # 2. Indexing
+        print("[Step 2] Building CSR Index (Group by Center)...")
         t0 = time.time()
         self._build_csr_from_coo_cpu(blue_coo, red_coo)
         print(f"         Indexing done in {time.time()-t0:.2f}s")
-        print_gpu_stats("After Indexing (Step 2)")
         
-        # Cleanup
         del blue_coo, red_coo, cluster_engine
         gc.collect()
         torch.cuda.empty_cache()
         
-        # 3. State Init
+        # 3. State Init (Integer Scaling)
         self.yA = torch.zeros(self.N, device=self.device, dtype=torch.long)
         self.yB = torch.full((self.N,), 1, device=self.device, dtype=torch.long)
         self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
@@ -247,148 +204,147 @@ class GPUClusteredSolver:
 
     def _build_csr_from_coo_cpu(self, blue_coo, red_coo):
         """
-        Builds the Index on CPU to avoid VRAM OOM, then moves compact results to GPU.
+        Builds CSR structures grouped by CENTER ID.
+        Stores Levels as attributes.
         """
-        # Unpack CPU tensors
-        b_c, b_r, b_p = blue_coo
-        r_c, r_r, r_p = red_coo
+        b_c, b_l, b_p = blue_coo
+        r_c, r_l, r_p = red_coo
         N = self.N
-        n_radii = self.radii.shape[0]
         
-        # 1. Global Keys (CPU)
-        # Blue: (Center + N) * MaxRadii + Radius
-        b_global_keys = (b_c + N) * n_radii + b_r
-        # Red: Center * MaxRadii + Radius
-        r_global_keys = r_c * n_radii + r_r
+        # 1. Identify Valid Centers (Intersection)
+        # We only need centers that contain both Red and Blue points
+        u_b_centers = torch.unique(b_c)
+        u_r_centers = torch.unique(r_c)
+        valid_centers = u_b_centers[torch.isin(u_b_centers, u_r_centers)]
         
-        # 2. Concat on CPU (Safe)
-        all_keys = torch.cat([b_global_keys, r_global_keys])
-        all_points = torch.cat([b_p, r_p])
-        
-        # 3. Intersection Logic (CPU)
-        is_red_point = all_points < N
-        is_blue_point = all_points >= N
-        
-        red_member_keys = torch.unique(all_keys[is_red_point])
-        blue_member_keys = torch.unique(all_keys[is_blue_point])
-        
-        # Valid = Intersection
-        # isin is fast on CPU for 1D sorted/unsorted
-        valid_keys = red_member_keys[torch.isin(red_member_keys, blue_member_keys)]
-        
-        if valid_keys.numel() == 0:
-            raise ValueError("No valid clusters found.")
+        if valid_centers.numel() == 0:
+            raise ValueError("No valid clusters found (Intersection Empty).")
             
-        print(f"         Valid Clusters: {valid_keys.numel()}")
+        print(f"         Active Centers: {valid_centers.numel()}")
         
-        # 4. Filter and Dense Map (CPU)
-        is_valid_entry = torch.isin(all_keys, valid_keys)
-        final_keys = all_keys[is_valid_entry]
-        final_points = all_points[is_valid_entry]
+        # 2. Filter Data
+        # Blue
+        mask_b = torch.isin(b_c, valid_centers)
+        b_c = b_c[mask_b]
+        b_l = b_l[mask_b]
+        b_p = b_p[mask_b] - N # Rebase Blue IDs to 0..N-1
         
-        # Searchsorted for dense IDs
-        final_dense_ids = torch.searchsorted(valid_keys, final_keys)
+        # Red
+        mask_r = torch.isin(r_c, valid_centers)
+        r_c = r_c[mask_r]
+        r_l = r_l[mask_r]
+        r_p = r_p[mask_r]
         
-        # 5. Extract Costs (Move to GPU)
-        valid_radii_idx = valid_keys % n_radii
-        raw_costs = 2.0 * self.radii[valid_radii_idx]
-        scaled_costs = torch.ceil(raw_costs / self.epsilon).to(torch.long)
-        self.cluster_costs = scaled_costs.to(self.device)
+        # Map Centers to Dense IDs 0..K-1
+        # This allows efficient offset arrays
+        center_map = torch.searchsorted(valid_centers, b_c) # Re-use b_c tensor for mapped IDs
+        r_center_map = torch.searchsorted(valid_centers, r_c)
         
-        # 6. Build Red CSR (CPU -> GPU)
-        mask_red = final_points < N
-        red_dense_ids = final_dense_ids[mask_red]
-        red_pt_ids = final_points[mask_red]
+        # 3. Build Red CSR (Grouped by Center)
+        # Sort by Center
+        perm_r = torch.argsort(r_center_map)
+        self.red_indices = r_p[perm_r].to(self.device)
+        self.red_levels = r_l[perm_r].to(self.device) # Store Levels!
+        sorted_r_centers = r_center_map[perm_r]
         
-        perm_r = torch.argsort(red_dense_ids)
-        self.red_indices = red_pt_ids[perm_r].to(self.device)
-        sorted_red_ids = red_dense_ids[perm_r]
-        
-        r_counts = torch.bincount(sorted_red_ids, minlength=len(valid_keys))
+        r_counts = torch.bincount(sorted_r_centers, minlength=len(valid_centers))
         self.red_offsets = torch.cat([torch.tensor([0]), torch.cumsum(r_counts, 0)]).to(self.device)
         
-        self.red_expand_cluster_ids = torch.repeat_interleave(
-            torch.arange(len(valid_keys), device=self.device), r_counts.to(self.device)
+        # Expand Center IDs for scatter ops
+        self.red_expand_center_ids = torch.repeat_interleave(
+            torch.arange(len(valid_centers), device=self.device), r_counts.to(self.device)
         )
+
+        # 4. Build Blue CSR (Inverted: Blue -> [Centers])
+        # We need to look up which centers a Blue point belongs to.
+        # Sort by Blue Point ID
+        perm_b = torch.argsort(b_p)
+        self.blue_center_indices = center_map[perm_b].to(self.device) # Points to dense center ID
+        self.blue_levels = b_l[perm_b].to(self.device)
+        sorted_b_pts = b_p[perm_b]
         
-        # 7. Build Blue CSR (CPU -> GPU)
-        mask_blue = final_points >= N
-        blue_dense_ids = final_dense_ids[mask_blue]
-        blue_pt_ids = final_points[mask_blue] - N 
-        
-        perm_b = torch.argsort(blue_pt_ids)
-        self.blue_cluster_indices = blue_dense_ids[perm_b].to(self.device)
-        sorted_blue_pts = blue_pt_ids[perm_b]
-        
-        b_counts = torch.bincount(sorted_blue_pts, minlength=N)
+        b_counts = torch.bincount(sorted_b_pts, minlength=N)
         self.blue_offsets = torch.cat([torch.tensor([0]), torch.cumsum(b_counts, 0)]).to(self.device)
         
-        print(f"         Red CSR Size: {self.red_indices.numel()} (GPU)")
-        print(f"         Blue CSR Size: {self.blue_cluster_indices.numel()} (GPU)")
-        total_edges = self.red_indices.numel() + self.blue_cluster_indices.numel()
-        avg_degree = total_edges / N
-        print(f"         Avg Degree: {avg_degree:.2f}")
-
+        print(f"         Red Entries: {self.red_indices.numel()} (GPU)")
+        print(f"         Blue Entries: {self.blue_center_indices.numel()} (GPU)")
+        print(f"         Avg Degree: {(self.blue_center_indices.numel() + self.red_indices.numel())/N:.2f}")
 
     def solve(self):
         print(f"\n[Step 3] Starting Push-Relabel Loop...")
         start_solve = time.time()
-        print_gpu_stats("Before Loop (Step 3)")
-        
         iteration = 0
+        
         while True:
-            print_gpu_stats("Loop Start (Step 3)")
-            # Check Free Supply
             B_free = torch.nonzero(self.MB == -1).squeeze(1)
-            if B_free.numel() == 0:
+            num_free = B_free.numel()
+            
+            if num_free == 0:
                 break
             
             iteration += 1
             if iteration % 10 == 0:
-                print(f"    [Iter {iteration}] Free: {B_free.numel()}")
+                print(f"    [Iter {iteration}] Free: {num_free}")
 
-            # A. Maintenance
+            # A. Maintenance: Max yA per Center
             yA_expanded = self.yA[self.red_indices]
-            cluster_max_yA = torch.zeros(
-                len(self.cluster_costs), device=self.device, dtype=torch.long
+            center_max_yA = torch.zeros(
+                len(self.red_offsets)-1, device=self.device, dtype=torch.long
             )
-            cluster_max_yA.scatter_reduce_(
-                0, self.red_expand_cluster_ids, yA_expanded, reduce="amax", include_self=False
+            # We want to check: Slack_Est = 2*L_b - yB - Max_yA
+            # So we need max(yA) in the center.
+            center_max_yA.scatter_reduce_(
+                0, self.red_expand_center_ids, yA_expanded, reduce="amax", include_self=False
             )
             
-            # B. Push (Search)
+            # B. Push (Ragged Gather)
             starts = self.blue_offsets[B_free]
             ends = self.blue_offsets[B_free + 1]
-            # NEW LOGIC: Ragged Gather
-            # 1. Generate gather indices on CPU to avoid massive GPU mask allocation
-            # This is O(Free_Edges) instead of O(Total_Edges)
+            
             ranges = [torch.arange(s.item(), e.item(), device=self.device) for s, e in zip(starts, ends)]
-            if not ranges: # All free blues are trapped (no edges)
+            if not ranges:
                  self.yB[B_free] += 1
                  continue
+            
             active_edge_indices = torch.cat(ranges)
-            # 2. Reconstruct owners for these specific edges
+            
+            # Reconstruct attributes
             lengths = ends - starts
             active_b_ids = torch.repeat_interleave(B_free, lengths)
-            active_c_ids = self.blue_cluster_indices[active_edge_indices]
             
-            slacks = (
-                self.cluster_costs[active_c_ids]
-                - self.yB[active_b_ids]
-                - cluster_max_yA[active_c_ids]
+            active_c_ids = self.blue_center_indices[active_edge_indices]
+            active_b_levels = self.blue_levels[active_edge_indices]
+            
+            # Slack Estimation (Lower Bound)
+            # Slack = 2 * max(L_b, L_a) - yB - yA
+            # Lower Bound = 2 * L_b - yB - Max_yA
+            # If Lower Bound > 0, then Real Slack is definitely > 0 (since L_a >= 0, yA <= Max_yA)
+            # So we only check where Lower Bound <= 0
+            
+            slacks_est = (
+                2 * active_b_levels 
+                - self.yB[active_b_ids] 
+                - center_max_yA[active_c_ids]
             )
             
-            candidates = slacks == 0
+            candidates = slacks_est <= 0
             
             if not candidates.any():
                 pass
             else:
                 # C. Resolve
+                # We have (Blue, Center) pairs that MIGHT have a match.
                 win_b = active_b_ids[candidates]
                 win_c = active_c_ids[candidates]
+                win_l_b = active_b_levels[candidates]
                 
+                # Proposals: Store Center ID
                 proposals = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
-                proposals[win_b] = win_c 
+                proposals[win_b] = win_c
+                
+                # Also need to store Level_B for the winner to verify in loop?
+                # Actually, we can look it up or just re-gather.
+                # Let's re-gather in the loop for simplicity (or pass it).
                 
                 prop_b_active = torch.nonzero(proposals != -1).squeeze(1)
                 prop_c_active = proposals[prop_b_active]
@@ -397,27 +353,95 @@ class GPUClusteredSolver:
                 b_sorted = prop_b_active[perm]
                 c_sorted = prop_c_active[perm]
                 
-                u_clusters, b_counts = torch.unique_consecutive(c_sorted, return_counts=True)
+                u_centers, b_counts = torch.unique_consecutive(c_sorted, return_counts=True)
                 b_offsets = torch.cat([torch.tensor([0], device=self.device), b_counts.cumsum(0)])
                 
-                # Resolve Loop
-                for i, cid in enumerate(u_clusters):
+                for i, cid in enumerate(u_centers):
                     cid_val = cid.item()
                     req_blues = b_sorted[b_offsets[i]:b_offsets[i+1]]
                     
+                    # We need the L_b for these blues. 
+                    # Optimization: Since we don't have L_b map handy here efficiently,
+                    # we can iterate Reds and check against global yB.
+                    # Real Condition: 2 * max(L_b, L_a) - yB - yA == 0.
+                    # This depends on L_b.
+                    
+                    # Recover L_b:
+                    # We know Blue->Center connectivity.
+                    # We can use the blue_offsets to find the specific edge index again? Slow.
+                    # Fast way: We passed the check `2*L_b - yB - Max_yA <= 0`.
+                    # Since yB is uniform for the blue point, L_b must be the one satisfying this.
+                    # But we updated proposals blindly.
+                    
+                    # Let's brute force valid Reds first:
                     r_start = self.red_offsets[cid_val]
                     r_end = self.red_offsets[cid_val+1]
                     reds = self.red_indices[r_start:r_end]
+                    red_levels = self.red_levels[r_start:r_end]
                     
-                    max_val = cluster_max_yA[cid_val]
-                    best_reds = reds[(self.yA[reds] == max_val) & (self.MA[reds] == -1)]
+                    free_red_mask = (self.MA[reds] == -1)
+                    if not free_red_mask.any(): continue
                     
-                    k = min(req_blues.numel(), best_reds.numel())
-                    if k > 0:
-                        mb = req_blues[:k]
-                        mr = best_reds[:k]
-                        self.MB[mb] = mr
-                        self.MA[mr] = mb
+                    cand_reds = reds[free_red_mask]
+                    cand_red_levels = red_levels[free_red_mask]
+                    cand_yA = self.yA[cand_reds]
+                    
+                    # Now match against requesting blues
+                    # For each blue, we need a red such that Slack == 0.
+                    # This requires L_b.
+                    # Since we are inside Python loop, let's fetch L_b for these blues.
+                    # This is the expensive part if not careful.
+                    # But req_blues is small batch.
+                    
+                    # Hack: The Blue MUST be connected to cid_val.
+                    # We can find the edge index in Blue CSR.
+                    # Since Blue CSR is sorted by Blue ID (inverted)? No, it's sorted by Blue ID.
+                    # blue_offsets gives range.
+                    # We search for cid_val in that range.
+                    # Since ranges are small (~70), linear scan is OK or simple gather.
+                    
+                    # Let's assume we match blindly if 2*L_b - yB - Max_yA <= 0 was strong enough?
+                    # No, we need exact zero.
+                    
+                    # Correct matching loop:
+                    for b_idx in req_blues:
+                        # Find L_b for (b_idx, cid_val)
+                        start = self.blue_offsets[b_idx]
+                        end = self.blue_offsets[b_idx+1]
+                        
+                        # Indices in blue arrays
+                        range_indices = torch.arange(start, end, device=self.device)
+                        centers_in_range = self.blue_center_indices[range_indices]
+                        
+                        # Find match
+                        match_idx = (centers_in_range == cid_val).nonzero()
+                        if match_idx.numel() == 0: continue # Should not happen
+                        
+                        l_b = self.blue_levels[range_indices[match_idx[0]]]
+                        y_b = self.yB[b_idx]
+                        
+                        # Find a compatible Red
+                        # Condition: 2 * max(l_b, l_a) - y_b - y_a == 0
+                        
+                        # Vectorized check against cand_reds
+                        # Cost = 2 * torch.maximum(l_b, cand_red_levels)
+                        costs = 2 * torch.maximum(l_b, cand_red_levels)
+                        slacks = costs - y_b - cand_yA
+                        
+                        valid_r = (slacks == 0).nonzero()
+                        if valid_r.numel() > 0:
+                            # Pick first one
+                            r_local_idx = valid_r[0].item()
+                            r_final = cand_reds[r_local_idx]
+                            
+                            # Execute Match
+                            self.MB[b_idx] = r_final
+                            self.MA[r_final] = b_idx
+                            
+                            # Remove this red from candidates to prevent double matching
+                            # (Inefficient slice update, but robust)
+                            # Better: keep mask
+                            cand_yA[r_local_idx] = -99999 # Invalidate slack
 
             # D. Relabel
             still_free = torch.nonzero(self.MB == -1).squeeze(1)
