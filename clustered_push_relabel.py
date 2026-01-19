@@ -390,110 +390,77 @@ class GPUClusteredSolver:
                 win_c = active_c_ids[candidates]
                 win_l_b = active_b_levels[candidates]
                 
-                # Proposals: Store Center ID
+                # Proposals: Store Center ID + Level for the chosen edge
                 proposals = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
-                proposals[win_b] = win_c
-                
-                # Also need to store Level_B for the winner to verify in loop?
-                # Actually, we can look it up or just re-gather.
-                # Let's re-gather in the loop for simplicity (or pass it).
-                
+                proposals.scatter_(0, win_b, win_c)
+
+                prop_l_b = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
+                prop_l_b.scatter_(0, win_b, win_l_b)
+
                 prop_b_active = torch.nonzero(proposals != -1).squeeze(1)
                 prop_c_active = proposals[prop_b_active]
-                
+                prop_l_b = prop_l_b[prop_b_active]
+
                 perm = torch.argsort(prop_c_active)
                 b_sorted = prop_b_active[perm]
                 c_sorted = prop_c_active[perm]
-                
-                u_centers, b_counts = torch.unique_consecutive(c_sorted, return_counts=True)
-                b_offsets = torch.cat([torch.tensor([0], device=self.device), b_counts.cumsum(0)])
-                
-                for i, cid in enumerate(u_centers):
-                    cid_val = cid.item()
-                    req_blues = b_sorted[b_offsets[i]:b_offsets[i+1]]
-                    
-                    # We need the L_b for these blues. 
-                    # Optimization: Since we don't have L_b map handy here efficiently,
-                    # we can iterate Reds and check against global yB.
-                    # Real Condition: 2 * max(L_b, L_a) - yB - yA == 0.
-                    # This depends on L_b.
-                    
-                    # Recover L_b:
-                    # We know Blue->Center connectivity.
-                    # We can use the blue_offsets to find the specific edge index again? Slow.
-                    # Fast way: We passed the check `2*L_b - yB - Max_yA <= 0`.
-                    # Since yB is uniform for the blue point, L_b must be the one satisfying this.
-                    # But we updated proposals blindly.
-                    
-                    # Let's brute force valid Reds first:
-                    r_start = self.red_offsets[cid_val]
-                    r_end = self.red_offsets[cid_val+1]
-                    reds = self.red_indices[r_start:r_end]
-                    red_levels = self.red_levels[r_start:r_end]
-                    
-                    free_red_mask = (self.MA[reds] == -1)
-                    if not free_red_mask.any(): continue
-                    
-                    cand_reds = reds[free_red_mask]
-                    cand_red_levels = red_levels[free_red_mask]
-                    cand_yA = self.yA[cand_reds]
-                    
-                    # Now match against requesting blues
-                    # For each blue, we need a red such that Slack == 0.
-                    # This requires L_b.
-                    # Since we are inside Python loop, let's fetch L_b for these blues.
-                    # This is the expensive part if not careful.
-                    # But req_blues is small batch.
-                    
-                    # Hack: The Blue MUST be connected to cid_val.
-                    # We can find the edge index in Blue CSR.
-                    # Since Blue CSR is sorted by Blue ID (inverted)? No, it's sorted by Blue ID.
-                    # blue_offsets gives range.
-                    # We search for cid_val in that range.
-                    # Since ranges are small (~70), linear scan is OK or simple gather.
-                    
-                    # Let's assume we match blindly if 2*L_b - yB - Max_yA <= 0 was strong enough?
-                    # No, we need exact zero.
-                    
-                    # Correct matching loop:
-                    for b_idx in req_blues:
-                        # Find L_b for (b_idx, cid_val)
-                        start = self.blue_offsets[b_idx]
-                        end = self.blue_offsets[b_idx+1]
-                        
-                        # Indices in blue arrays
-                        range_indices = torch.arange(start, end, device=self.device)
-                        centers_in_range = self.blue_center_indices[range_indices]
-                        
-                        # Find match
-                        match_idx = (centers_in_range == cid_val).nonzero()
-                        if match_idx.numel() == 0: continue # Should not happen
-                        
-                        l_b = self.blue_levels[range_indices[match_idx[0]]]
-                        y_b = self.yB[b_idx]
-                        
-                        # Find a compatible Red
-                        # Condition: 2 * max(l_b, l_a) - y_b - y_a == 0
-                        
-                        # Vectorized check against cand_reds
-                        # Cost = 2 * torch.maximum(l_b, cand_red_levels)
-                        costs = 2 * torch.maximum(l_b, cand_red_levels)
-                        slacks = costs - y_b - cand_yA
-                        
-                        valid_r = (slacks == 0).nonzero()
-                        if valid_r.numel() > 0:
-                            # Pick first one
-                            r_local_idx = valid_r[0].item()
-                            r_final = cand_reds[r_local_idx]
-                            
-                            # Execute Match
-                            self.MB[b_idx] = r_final
-                            self.MA[r_final] = b_idx
-                            
-                            # Remove this red from candidates to prevent double matching
-                            # (Inefficient slice update, but robust)
-                            # Better: keep mask
-                            cand_yA[r_local_idx] = -99999 # Invalidate slack
+                l_b_sorted = prop_l_b[perm]
+
+                red_center_ids = self.red_expand_center_ids
+                mask_best = (self.MA[self.red_indices] == -1) & (
+                    self.yA[self.red_indices] == center_max_yA[red_center_ids]
+                )
+                best_reds = self.red_indices[mask_best]
+                best_red_levels = self.red_levels[mask_best]
+                # red_indices are center-sorted from CSR construction, so these remain grouped by center.
+                best_red_centers = red_center_ids[mask_best]
+
+                num_centers = center_max_yA.numel()
+                b_counts = torch.zeros(num_centers, device=self.device, dtype=torch.long)
+                r_counts = torch.zeros(num_centers, device=self.device, dtype=torch.long)
+                if c_sorted.numel() > 0:
+                    b_counts.scatter_add_(0, c_sorted, torch.ones_like(c_sorted))
+                if best_red_centers.numel() > 0:
+                    r_counts.scatter_add_(0, best_red_centers, torch.ones_like(best_red_centers))
+                min_counts = torch.minimum(b_counts, r_counts)
+
+                b_offsets = torch.cat(
+                    [torch.zeros(1, device=self.device, dtype=torch.long), b_counts.cumsum(0)]
+                )
+                b_intra = torch.arange(b_sorted.numel(), device=self.device) - b_offsets[c_sorted]
+                b_keep = b_intra < min_counts[c_sorted]
+
+                r_offsets = torch.cat(
+                    [torch.zeros(1, device=self.device, dtype=torch.long), r_counts.cumsum(0)]
+                )
+                r_intra = torch.arange(best_reds.numel(), device=self.device) - r_offsets[best_red_centers]
+                r_keep = r_intra < min_counts[best_red_centers]
+
+                b_aligned = b_sorted[b_keep]
+                l_b_aligned = l_b_sorted[b_keep]
+                r_aligned = best_reds[r_keep]
+                l_a_aligned = best_red_levels[r_keep]
+
+                if b_aligned.numel() > 0:
+                    yB_aligned = self.yB[b_aligned]
+                    yA_aligned = self.yA[r_aligned]
+                    slacks = 2 * torch.maximum(l_b_aligned, l_a_aligned) - yB_aligned - yA_aligned
+                    valid = slacks == 0
+                    b_match = b_aligned[valid]
+                    r_match = r_aligned[valid]
+
+                    if b_match.numel() > 0:
+                        idx = torch.arange(b_match.numel(), device=self.device)
+                        first_idx = torch.full(
+                            (self.N,), b_match.numel(), device=self.device, dtype=torch.long
+                        )
+                        first_idx.scatter_reduce_(0, r_match, idx, reduce="amin", include_self=True)
+                        keep = idx == first_idx[r_match]
+                        b_match = b_match[keep]
+                        r_match = r_match[keep]
+
+                        self.MB[b_match] = r_match
+                        self.MA[r_match] = b_match
                 if use_cuda:
                     torch.cuda.synchronize()
                 t_resolve += time.time() - t0
