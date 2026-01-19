@@ -218,8 +218,8 @@ class GPUClusteredSolver:
         torch.cuda.empty_cache()
         
         # 3. State Init
-        self.yA = torch.zeros(self.N, device=self.device, dtype=torch.float32)
-        self.yB = torch.full((self.N,), epsilon, device=self.device, dtype=torch.float32)
+        self.yA = torch.zeros(self.N, device=self.device, dtype=torch.long)
+        self.yB = torch.full((self.N,), 1, device=self.device, dtype=torch.long)
         self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
         self.MB = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
 
@@ -269,7 +269,9 @@ class GPUClusteredSolver:
         
         # 5. Extract Costs (Move to GPU)
         valid_radii_idx = valid_keys % n_radii
-        self.cluster_costs = (2.0 * self.radii[valid_radii_idx]).to(self.device)
+        raw_costs = 2.0 * self.radii[valid_radii_idx]
+        scaled_costs = torch.ceil(raw_costs / self.epsilon).to(torch.long)
+        self.cluster_costs = scaled_costs.to(self.device)
         
         # 6. Build Red CSR (CPU -> GPU)
         mask_red = final_points < N
@@ -320,7 +322,9 @@ class GPUClusteredSolver:
 
             # A. Maintenance
             yA_expanded = self.yA[self.red_indices]
-            cluster_max_yA = torch.zeros(len(self.cluster_costs), device=self.device)
+            cluster_max_yA = torch.zeros(
+                len(self.cluster_costs), device=self.device, dtype=torch.long
+            )
             cluster_max_yA.scatter_reduce_(
                 0, self.red_expand_cluster_ids, yA_expanded, reduce="amax", include_self=False
             )
@@ -331,7 +335,7 @@ class GPUClusteredSolver:
             counts = ends - starts
             
             if counts.sum() == 0: 
-                 self.yB[B_free] += self.epsilon
+                 self.yB[B_free] += 1
                  continue
             
             # Mask for ALL Blue CSR (Vectorized Gather)
@@ -344,9 +348,13 @@ class GPUClusteredSolver:
             active_c_ids = self.blue_cluster_indices[mask_free_csr]
             active_b_ids = all_b_owners[mask_free_csr]
             
-            slacks = self.cluster_costs[active_c_ids] - self.yB[active_b_ids] - cluster_max_yA[active_c_ids]
+            slacks = (
+                self.cluster_costs[active_c_ids]
+                - self.yB[active_b_ids]
+                - cluster_max_yA[active_c_ids]
+            )
             
-            candidates = torch.abs(slacks) < 1e-5
+            candidates = slacks == 0
             
             if not candidates.any():
                 pass
@@ -378,7 +386,7 @@ class GPUClusteredSolver:
                     reds = self.red_indices[r_start:r_end]
                     
                     max_val = cluster_max_yA[cid_val]
-                    best_reds = reds[(torch.abs(self.yA[reds] - max_val) < 1e-5) & (self.MA[reds] == -1)]
+                    best_reds = reds[(self.yA[reds] == max_val) & (self.MA[reds] == -1)]
                     
                     k = min(req_blues.numel(), best_reds.numel())
                     if k > 0:
@@ -389,10 +397,10 @@ class GPUClusteredSolver:
 
             # D. Relabel
             still_free = torch.nonzero(self.MB == -1).squeeze(1)
-            self.yB[still_free] += self.epsilon
+            self.yB[still_free] += 1
             
             matched_r = torch.nonzero(self.MA != -1).squeeze(1)
-            self.yA[matched_r] -= self.epsilon
+            self.yA[matched_r] -= 1
             
             if iteration > 50000:
                 print("Max Iterations Reached.")
