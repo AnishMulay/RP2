@@ -199,10 +199,10 @@ class GPUClusteredSolver:
         torch.cuda.empty_cache()
         
         # 3. State Init (Integer Scaling)
-        self.yA = torch.zeros(self.N, device=self.device, dtype=torch.long)
-        self.yB = torch.full((self.N,), 1, device=self.device, dtype=torch.long)
-        self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
-        self.MB = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
+        self.yA = torch.zeros(self.N, device=self.device, dtype=torch.int32)
+        self.yB = torch.full((self.N,), 1, device=self.device, dtype=torch.int32)
+        self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
+        self.MB = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
 
     def cleanup_remaining_points(self):
         free_b = torch.nonzero(self.MB == -1).squeeze(1)
@@ -264,17 +264,22 @@ class GPUClusteredSolver:
         red_points = all_points[red_mask]
         red_levels = all_levels[red_mask]
 
-        perm_r = torch.argsort(red_centers)
-        self.red_indices = red_points[perm_r].to(self.device)
-        self.red_levels = red_levels[perm_r].to(self.device)
+        max_red_level = red_levels.max().to(torch.long)
+        r_sort_key = red_centers.to(torch.long) * (max_red_level + 1) + red_levels.to(torch.long)
+        perm_r = torch.argsort(r_sort_key)
+        self.red_indices = red_points[perm_r].to(device=self.device, dtype=torch.int32)
+        self.red_levels = red_levels[perm_r].to(device=self.device, dtype=torch.int32)
         sorted_r_centers = red_centers[perm_r]
 
         r_counts = torch.bincount(sorted_r_centers, minlength=valid_centers.numel())
-        self.red_offsets = torch.cat([torch.tensor([0]), torch.cumsum(r_counts, 0)]).to(self.device)
+        r_counts_i32 = r_counts.to(device=self.device, dtype=torch.int32)
+        self.red_offsets = torch.cat(
+            [torch.zeros(1, device=self.device, dtype=torch.int32), torch.cumsum(r_counts_i32, 0)]
+        )
 
         # Expand Center IDs for scatter ops
         self.red_expand_center_ids = torch.repeat_interleave(
-            torch.arange(valid_centers.numel(), device=self.device), r_counts.to(self.device)
+            torch.arange(valid_centers.numel(), device=self.device, dtype=torch.int32), r_counts_i32
         )
 
         # 5. Build Blue CSR (Inverted: Blue -> [Centers])
@@ -284,12 +289,15 @@ class GPUClusteredSolver:
         blue_levels = all_levels[blue_mask]
 
         perm_b = torch.argsort(blue_points)
-        self.blue_center_indices = blue_centers[perm_b].to(self.device)
-        self.blue_levels = blue_levels[perm_b].to(self.device)
+        self.blue_center_indices = blue_centers[perm_b].to(device=self.device, dtype=torch.int32)
+        self.blue_levels = blue_levels[perm_b].to(device=self.device, dtype=torch.int32)
         sorted_b_pts = blue_points[perm_b]
 
         b_counts = torch.bincount(sorted_b_pts, minlength=N)
-        self.blue_offsets = torch.cat([torch.tensor([0]), torch.cumsum(b_counts, 0)]).to(self.device)
+        b_counts_i32 = b_counts.to(device=self.device, dtype=torch.int32)
+        self.blue_offsets = torch.cat(
+            [torch.zeros(1, device=self.device, dtype=torch.int32), torch.cumsum(b_counts_i32, 0)]
+        )
 
         print(f"         Red Entries: {self.red_indices.numel()} (GPU)")
         print(f"         Blue Entries: {self.blue_center_indices.numel()} (GPU)")
@@ -326,7 +334,7 @@ class GPUClusteredSolver:
             t0 = time.time()
             yA_expanded = self.yA[self.red_indices]
             center_max_yA = torch.zeros(
-                len(self.red_offsets)-1, device=self.device, dtype=torch.long
+                len(self.red_offsets)-1, device=self.device, dtype=torch.int32
             )
             # We want to check: Slack_Est = 2*L_b - yB - Max_yA
             # So we need max(yA) in the center.
@@ -391,25 +399,24 @@ class GPUClusteredSolver:
                 win_l_b = active_b_levels[candidates]
 
                 free_red_mask = self.MA[self.red_indices] == -1
+                # Reds are already sorted by Center then Level.
                 red_ids = self.red_indices[free_red_mask]
                 red_levels = self.red_levels[free_red_mask]
                 red_c_ids = self.red_expand_center_ids[free_red_mask]
 
                 if win_b.numel() != 0 and red_ids.numel() != 0:
-                    max_level = torch.maximum(win_l_b.max(), red_levels.max())
+                    max_level = torch.maximum(win_l_b.max(), red_levels.max()).to(torch.long)
                     key_scale = max_level + 1
 
-                    b_sort_key = win_c * key_scale + win_l_b
+                    b_sort_key = win_c.to(torch.long) * key_scale + win_l_b.to(torch.long)
                     b_perm = torch.argsort(b_sort_key)
                     b_sorted = win_b[b_perm]
                     c_sorted = win_c[b_perm]
                     l_b_sorted = win_l_b[b_perm]
 
-                    r_sort_key = red_c_ids * key_scale + red_levels
-                    r_perm = torch.argsort(r_sort_key)
-                    r_sorted = red_ids[r_perm]
-                    c_r_sorted = red_c_ids[r_perm]
-                    l_r_sorted = red_levels[r_perm]
+                    r_sorted = red_ids
+                    c_r_sorted = red_c_ids
+                    l_r_sorted = red_levels
 
                     num_centers = self.red_offsets.numel() - 1
                     b_counts = torch.bincount(c_sorted, minlength=num_centers)
