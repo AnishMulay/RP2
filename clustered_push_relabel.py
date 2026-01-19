@@ -4,6 +4,26 @@ import time
 import sys
 import gc
 
+def _format_bytes(num_bytes):
+    if num_bytes >= 1024 ** 3:
+        return f"{num_bytes / (1024 ** 3):.2f} GB"
+    return f"{num_bytes / (1024 ** 2):.2f} MB"
+
+def print_gpu_stats(label: str):
+    if not torch.cuda.is_available():
+        print(f"[GPU Stats] {label} | CUDA not available")
+        return
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    peak = torch.cuda.max_memory_allocated()
+    print(
+        f"[GPU Stats] {label} | "
+        f"Allocated: {_format_bytes(allocated)}, "
+        f"Reserved: {_format_bytes(reserved)}, "
+        f"Peak: {_format_bytes(peak)}"
+    )
+    torch.cuda.reset_peak_memory_stats()
+
 # ==========================================
 # PART 1: LOW-LEVEL KERNELS (GPU)
 # ==========================================
@@ -205,12 +225,14 @@ class GPUClusteredSolver:
         print(f"         Clustering done in {time.time()-t0:.2f}s")
         print(f"         Raw Blue Entries: {blue_coo[0].numel()}")
         print(f"         Raw Red Entries:  {red_coo[0].numel()}")
+        print_gpu_stats("After Clustering (Step 1)")
         
         # 2. Index Construction (CPU Staging)
         print("[Step 2] Building CSR Index (CPU Staging)...")
         t0 = time.time()
         self._build_csr_from_coo_cpu(blue_coo, red_coo)
         print(f"         Indexing done in {time.time()-t0:.2f}s")
+        print_gpu_stats("After Indexing (Step 2)")
         
         # Cleanup
         del blue_coo, red_coo, cluster_engine
@@ -303,14 +325,19 @@ class GPUClusteredSolver:
         
         print(f"         Red CSR Size: {self.red_indices.numel()} (GPU)")
         print(f"         Blue CSR Size: {self.blue_cluster_indices.numel()} (GPU)")
+        total_edges = self.red_indices.numel() + self.blue_cluster_indices.numel()
+        avg_degree = total_edges / N
+        print(f"         Avg Degree: {avg_degree:.2f}")
 
 
     def solve(self):
         print(f"\n[Step 3] Starting Push-Relabel Loop...")
         start_solve = time.time()
+        print_gpu_stats("Before Loop (Step 3)")
         
         iteration = 0
         while True:
+            print_gpu_stats("Loop Start (Step 3)")
             # Check Free Supply
             B_free = torch.nonzero(self.MB == -1).squeeze(1)
             if B_free.numel() == 0:
