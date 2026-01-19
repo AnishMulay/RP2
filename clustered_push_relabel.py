@@ -172,6 +172,8 @@ class GPUClusteredSolver:
         self.device = P_red.device
         self.N = P_red.shape[0]
         self.epsilon = epsilon
+        self.P_red = P_red
+        self.P_blue = P_blue
         
         print("="*60)
         print(f"[Init] Configuration: N={self.N}, Eps={epsilon}, Device={self.device}")
@@ -201,6 +203,23 @@ class GPUClusteredSolver:
         self.yB = torch.full((self.N,), 1, device=self.device, dtype=torch.long)
         self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
         self.MB = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
+
+    def cleanup_remaining_points(self):
+        free_b = torch.nonzero(self.MB == -1).squeeze(1)
+        free_r = torch.nonzero(self.MA == -1).squeeze(1)
+        count = min(free_b.numel(), free_r.numel())
+        if count > 0:
+            self.MB[free_b[:count]] = free_r[:count]
+            self.MA[free_r[:count]] = free_b[:count]
+        print(f"[Cleanup] Arbitrarily matched {count} remaining pairs.")
+
+    def calculate_final_stats(self):
+        diff = self.P_blue - self.P_red[self.MB]
+        dists_sq = (diff ** 2).sum(dim=1)
+        total_cost = dists_sq.sum()
+        avg_cost = total_cost / self.N
+        print(f"[Final Cost] Total Squared Euclidean Cost: {total_cost.item():.6f}")
+        print(f"[Final Cost] Average Cost per Point: {avg_cost.item():.6f}")
 
     def _build_csr_from_coo_cpu(self, blue_coo, red_coo):
         """
@@ -285,8 +304,8 @@ class GPUClusteredSolver:
         while True:
             B_free = torch.nonzero(self.MB == -1).squeeze(1)
             num_free = B_free.numel()
-            
-            if num_free == 0:
+            if num_free <= self.epsilon * self.N:
+                print("[Converged] Free points <= Threshold. Stopping.")
                 break
             
             iteration += 1
@@ -460,9 +479,11 @@ class GPUClusteredSolver:
             if iteration > 50000:
                 print("Max Iterations Reached.")
                 break
-                
+
+        self.cleanup_remaining_points()
         print(f"Algorithm Done. Total Time: {time.time()-start_solve:.2f}s")
         print(f"Matched: {(self.MB != -1).sum().item()}/{self.N}")
+        self.calculate_final_stats()
 
 # ==========================================
 # PART 4: MAIN ENTRY
