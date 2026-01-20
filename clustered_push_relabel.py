@@ -500,6 +500,7 @@ class GPUClusteredSolver:
                 win_b = torch.cat(all_win_b)
                 win_c = torch.cat(all_win_c)
                 win_l_b = torch.cat(all_win_l_b)
+            del all_win_b, all_win_c, all_win_l_b
 
             if win_b.numel() != 0:
                 # C. Resolve
@@ -568,6 +569,30 @@ class GPUClusteredSolver:
                         if b_match.numel() != 0:
                             self.MB[b_match] = r_match.to(self.MB.dtype)
                             self.MA[r_match] = b_match.to(self.MA.dtype)
+                    del (
+                        b_sort_key,
+                        b_perm,
+                        b_sorted,
+                        c_sorted,
+                        l_b_sorted,
+                        r_sorted,
+                        c_r_sorted,
+                        l_r_sorted,
+                        b_counts,
+                        r_counts,
+                        limits,
+                        b_offsets,
+                        r_offsets,
+                        b_rank,
+                        r_rank,
+                        b_keep,
+                        r_keep,
+                        b_final,
+                        r_final,
+                        l_b_final,
+                        l_r_final,
+                    )
+                del red_ids, red_levels, red_c_ids, free_red_mask, win_b, win_c, win_l_b
                 if use_cuda:
                     torch.cuda.synchronize()
             log_mem("After Resolve")
@@ -583,6 +608,8 @@ class GPUClusteredSolver:
             if use_cuda:
                 torch.cuda.synchronize()
             log_mem("After Relabel")
+            if use_cuda:
+                torch.cuda.empty_cache()
             
             if iteration > 50000:
                 print("Max Iterations Reached.")
