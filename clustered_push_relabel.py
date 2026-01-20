@@ -414,59 +414,98 @@ class GPUClusteredSolver:
             # B. Push (Ragged Gather)
             if use_cuda:
                 torch.cuda.synchronize()
-            starts = self.blue_offsets[B_free]
-            ends = self.blue_offsets[B_free + 1]
+            push_batch_size = 5000
+            all_win_b = []
+            all_win_c = []
+            all_win_l_b = []
 
-            lengths = ends - starts
-            total_edges = int(lengths.sum().item())
+            starts_all = self.blue_offsets[B_free]
+            ends_all = self.blue_offsets[B_free + 1]
+            lengths_all = ends_all - starts_all
+            total_edges = int(lengths_all.sum().item())
             if total_edges == 0:
                 if use_cuda:
                     torch.cuda.synchronize()
                 self.yB[B_free] += 1
                 continue
 
-            repeat_starts = torch.repeat_interleave(starts, lengths)
-            cum_len = torch.cumsum(lengths, 0)
-            segment_starts_packed = cum_len - lengths
-            global_range = torch.arange(total_edges, device=self.device)
-            repeat_packed_starts = torch.repeat_interleave(segment_starts_packed, lengths)
-            offsets = global_range - repeat_packed_starts
-            active_edge_indices = repeat_starts + offsets
-            log_mem("Mid-Push (Indices)")
+            for i in range(0, num_free, push_batch_size):
+                chunk = B_free[i : i + push_batch_size]
+                starts = self.blue_offsets[chunk]
+                ends = self.blue_offsets[chunk + 1]
+                lengths = ends - starts
+                total_edges = int(lengths.sum().item())
+                if total_edges == 0:
+                    continue
 
-            # Reconstruct attributes
-            active_b_ids = torch.repeat_interleave(B_free, lengths)
-            
-            active_c_ids = self.blue_center_indices[active_edge_indices]
-            active_b_levels = self.blue_levels[active_edge_indices]
-            
-            # Slack Estimation (Lower Bound)
-            # Slack = 2 * max(L_b, L_a) - yB - yA
-            # Lower Bound = 2 * L_b - yB - Max_yA
-            # If Lower Bound > 0, then Real Slack is definitely > 0 (since L_a >= 0, yA <= Max_yA)
-            # So we only check where Lower Bound <= 0
-            
-            slacks_est = (
-                2 * active_b_levels 
-                - self.yB[active_b_ids] 
-                - center_max_yA[active_c_ids]
-            )
-            
-            candidates = slacks_est <= 0
-            if use_cuda:
-                torch.cuda.synchronize()
-            log_mem("After Push")
-            
-            if not candidates.any():
-                pass
+                repeat_starts = torch.repeat_interleave(starts, lengths)
+                cum_len = torch.cumsum(lengths, 0)
+                segment_starts_packed = cum_len - lengths
+                global_range = torch.arange(total_edges, device=self.device)
+                repeat_packed_starts = torch.repeat_interleave(segment_starts_packed, lengths)
+                offsets = global_range - repeat_packed_starts
+                active_edge_indices = repeat_starts + offsets
+                log_mem("Mid-Push (Indices)")
+
+                # Reconstruct attributes
+                active_b_ids = torch.repeat_interleave(chunk, lengths)
+                active_c_ids = self.blue_center_indices[active_edge_indices]
+                active_b_levels = self.blue_levels[active_edge_indices]
+
+                # Slack Estimation (Lower Bound)
+                # Slack = 2 * max(L_b, L_a) - yB - yA
+                # Lower Bound = 2 * L_b - yB - Max_yA
+                # If Lower Bound > 0, then Real Slack is definitely > 0 (since L_a >= 0, yA <= Max_yA)
+                # So we only check where Lower Bound <= 0
+                slacks_est = (
+                    2 * active_b_levels 
+                    - self.yB[active_b_ids] 
+                    - center_max_yA[active_c_ids]
+                )
+
+                candidates = slacks_est <= 0
+                if use_cuda:
+                    torch.cuda.synchronize()
+                log_mem("After Push")
+
+                if candidates.any():
+                    all_win_b.append(active_b_ids[candidates])
+                    all_win_c.append(active_c_ids[candidates])
+                    all_win_l_b.append(active_b_levels[candidates])
+
+                del (
+                    repeat_starts,
+                    cum_len,
+                    segment_starts_packed,
+                    global_range,
+                    repeat_packed_starts,
+                    offsets,
+                    active_edge_indices,
+                    active_b_ids,
+                    active_c_ids,
+                    active_b_levels,
+                    slacks_est,
+                    candidates,
+                    starts,
+                    ends,
+                    lengths,
+                    chunk,
+                )
+
+            if not all_win_b:
+                win_b = torch.empty(0, device=self.device, dtype=B_free.dtype)
+                win_c = torch.empty(0, device=self.device, dtype=self.blue_center_indices.dtype)
+                win_l_b = torch.empty(0, device=self.device, dtype=self.blue_levels.dtype)
             else:
+                win_b = torch.cat(all_win_b)
+                win_c = torch.cat(all_win_c)
+                win_l_b = torch.cat(all_win_l_b)
+
+            if win_b.numel() != 0:
                 # C. Resolve
                 if use_cuda:
                     torch.cuda.synchronize()
                 # We have (Blue, Center) pairs that MIGHT have a match.
-                win_b = active_b_ids[candidates]
-                win_c = active_c_ids[candidates]
-                win_l_b = active_b_levels[candidates]
 
                 free_red_mask = self.MA[self.red_indices] == -1
                 # Reds are already sorted by Center then Level.
