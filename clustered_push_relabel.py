@@ -533,8 +533,8 @@ if __name__ == "__main__":
     print(f"Device: {dev}")
     
     torch.manual_seed(42)
-    P_red = torch.randn(N, DIM, device=dev) + 2.0
-    P_blue = torch.randn(N, DIM, device=dev) - 2.0
+    P_red = torch.randn(N, DIM, device=dev)
+    P_blue = torch.randn(N, DIM, device=dev)
     
     solver = GPUClusteredSolver(P_red, P_blue, EPS)
     solver.solve()
