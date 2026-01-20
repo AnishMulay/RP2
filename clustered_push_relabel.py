@@ -161,7 +161,7 @@ class FastGPUClustering:
         b_c, b_l, b_p = self._build_cover_bulk(P_blue, blue_mask, workspace, D_blue)
         r_c, r_l, r_p = self._build_cover_bulk(P_red, red_mask, workspace, D_red)
         
-        return (b_c, b_l, b_p), (r_c, r_l, r_p)
+        return (b_c, b_l, b_p), (r_c, r_l, r_p), red_mask.cpu(), blue_mask.cpu()
 
 # ==========================================
 # PART 3: CLUSTERED SOLVER (Dynamic Costs)
@@ -182,7 +182,7 @@ class GPUClusteredSolver:
         print("[Step 1] Running Geometric Clustering...")
         t0 = time.time()
         cluster_engine = FastGPUClustering(epsilon, batch_size=1024, micro_batch_size=32)
-        blue_coo, red_coo = cluster_engine.run(P_red, P_blue)
+        blue_coo, red_coo, r_mask, b_mask = cluster_engine.run(P_red, P_blue)
         torch.cuda.synchronize()
         print(f"         Clustering done in {time.time()-t0:.2f}s")
         print(f"         Raw Blue Shells: {blue_coo[0].numel()}")
@@ -191,7 +191,7 @@ class GPUClusteredSolver:
         # 2. Indexing
         print("[Step 2] Building CSR Index (Group by Center)...")
         t0 = time.time()
-        self._build_csr_from_coo_cpu(blue_coo, red_coo)
+        self._build_csr_from_coo_cpu(blue_coo, red_coo, r_mask, b_mask)
         print(f"         Indexing done in {time.time()-t0:.2f}s")
         
         del blue_coo, red_coo, cluster_engine
@@ -220,7 +220,7 @@ class GPUClusteredSolver:
         print(f"Total Euclidean Cost: {total_cost.item():.4f}")
         print(f"Avg Euclidean Cost: {avg_cost.item():.4f}")
 
-    def _build_csr_from_coo_cpu(self, blue_coo, red_coo):
+    def _build_csr_from_coo_cpu(self, blue_coo, red_coo, red_mask, blue_mask):
         """
         Builds CSR structures grouped by CENTER ID.
         Stores Levels as attributes.
@@ -228,6 +228,72 @@ class GPUClusteredSolver:
         b_c, b_l, b_p = blue_coo
         r_c, r_l, r_p = red_coo
         N = self.N
+
+        # Topology + memory analysis before filtering (use raw COO triplets)
+        if red_mask.device != r_c.device:
+            red_mask = red_mask.cpu()
+        if blue_mask.device != b_c.device:
+            blue_mask = blue_mask.cpu()
+
+        r_sampled = red_mask[r_c] if r_c.numel() > 0 else torch.empty(0, dtype=torch.bool)
+        b_sampled = blue_mask[b_c] if b_c.numel() > 0 else torch.empty(0, dtype=torch.bool)
+
+        def _category_stats(centers, levels):
+            edges = int(centers.numel())
+            if edges == 0:
+                return {
+                    "edges": 0,
+                    "clusters": 0,
+                    "buckets": 0,
+                    "avg_cluster": 0.0,
+                    "mem_mb": 0.0,
+                }
+            clusters = int(torch.unique(centers).numel())
+            max_level = levels.max().to(torch.long)
+            bucket_keys = centers.to(torch.long) * (max_level + 1) + levels.to(torch.long)
+            buckets = int(torch.unique(bucket_keys).numel())
+            avg_cluster = edges / max(clusters, 1)
+            mem_mb = edges * 3 * 4 / (1024 ** 2)
+            return {
+                "edges": edges,
+                "clusters": clusters,
+                "buckets": buckets,
+                "avg_cluster": avg_cluster,
+                "mem_mb": mem_mb,
+            }
+
+        red_sampled_stats = _category_stats(r_c[r_sampled], r_l[r_sampled])
+        red_local_stats = _category_stats(r_c[~r_sampled], r_l[~r_sampled])
+        blue_sampled_stats = _category_stats(b_c[b_sampled], b_l[b_sampled])
+        blue_local_stats = _category_stats(b_c[~b_sampled], b_l[~b_sampled])
+
+        if r_c.numel() == 0 and b_c.numel() == 0:
+            total_stats = {
+                "edges": 0,
+                "clusters": 0,
+                "buckets": 0,
+                "avg_cluster": 0.0,
+                "mem_mb": 0.0,
+            }
+        else:
+            total_centers = torch.cat([r_c, b_c + N])
+            total_levels = torch.cat([r_l, b_l])
+            total_stats = _category_stats(total_centers, total_levels)
+
+        print("    [Cluster Analysis]")
+        print("    Category       | Clusters | Buckets  | Edges        | Avg Clust | Mem (MB)")
+        print("    ------------------------------------------------------------------------")
+        def _print_row(label, stats):
+            print(
+                f"    {label:<14} | {stats['clusters']:>8} | {stats['buckets']:>7} | "
+                f"{stats['edges']:>12,} | {stats['avg_cluster']:>9.1f} | {stats['mem_mb']:>7.1f}"
+            )
+        _print_row("RED (Sampled)", red_sampled_stats)
+        _print_row("RED (Local)", red_local_stats)
+        _print_row("BLUE (Sampled)", blue_sampled_stats)
+        _print_row("BLUE (Local)", blue_local_stats)
+        print("    ------------------------------------------------------------------------")
+        _print_row("TOTAL", total_stats)
 
         # 1. Unify center IDs and merge all triplets on CPU
         b_c_shifted = b_c + N
