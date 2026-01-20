@@ -235,6 +235,37 @@ class GPUClusteredSolver:
         all_levels = torch.cat([b_l, r_l])
         all_points = torch.cat([b_p, r_p])
 
+        # Topology stats before filtering
+        total_edges = all_centers.numel()
+        unique_centers, center_counts = torch.unique(all_centers, return_counts=True)
+        total_clusters = unique_centers.numel()
+        if total_edges > 0:
+            max_level = all_levels.max().to(torch.long)
+            bucket_keys = all_centers.to(torch.long) * (max_level + 1) + all_levels.to(torch.long)
+            total_buckets = torch.unique(bucket_keys).numel()
+        else:
+            total_buckets = 0
+        total_unique_points = torch.unique(all_points).numel()
+        max_cluster_size = int(center_counts.max().item()) if center_counts.numel() > 0 else 0
+        median_cluster_size = (
+            float(center_counts.float().median().item()) if center_counts.numel() > 0 else 0.0
+        )
+        avg_bucket_size = total_edges / max(total_buckets, 1)
+        avg_cluster_size = total_edges / max(total_clusters, 1)
+        avg_point_degree_2n = total_edges / max(2 * N, 1)
+        avg_point_degree_unique = total_edges / max(total_unique_points, 1)
+
+        print("    [Topology Stats] Raw COO")
+        print(f"         Total Edges: {total_edges}")
+        print(f"         Total Clusters: {total_clusters}")
+        print(f"         Total Buckets: {total_buckets}")
+        print(f"         Avg Bucket Size: {avg_bucket_size:.2f}")
+        print(f"         Avg Cluster Size: {avg_cluster_size:.2f}")
+        print(f"         Avg Point Degree (2N): {avg_point_degree_2n:.2f}")
+        print(f"         Avg Point Degree (Unique Points): {avg_point_degree_unique:.2f}")
+        print(f"         Max Cluster Size: {max_cluster_size}")
+        print(f"         Median Cluster Size: {median_cluster_size:.2f}")
+
         # 2. Identify valid centers (contain at least one Red and one Blue point)
         is_red_point = all_points < N
         centers_with_red = torch.unique(all_centers[is_red_point])
