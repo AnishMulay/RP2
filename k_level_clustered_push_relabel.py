@@ -183,7 +183,7 @@ class FastGPUMultiLevelClustering:
     def run(self, P_red, P_blue):
         """
         Main execution pipeline.
-        Returns COO tensors for Red and Blue edges.
+        Returns COO tensors for Red and Blue edges, plus hierarchy levels.
         """
         P_all = torch.cat([P_red, P_blue], dim=0)
         n = P_all.shape[0]
@@ -238,7 +238,7 @@ class FastGPUMultiLevelClustering:
         # Build Blue Cover (Blue Centers covering All Points)
         blue_coo = build_cover(P_blue, levels_blue)
         
-        return blue_coo, red_coo
+        return blue_coo, red_coo, levels_red, levels_blue
 
 # ==========================================
 # PART 3: CLUSTERED SOLVER (MULTI-LEVEL ADAPTER)
@@ -249,6 +249,7 @@ class GPUClusteredSolver:
         self.device = P_red.device
         self.N = P_red.shape[0]
         self.epsilon = epsilon
+        self.k = k
         self.P_red = P_red
         self.P_blue = P_blue
         
@@ -259,7 +260,7 @@ class GPUClusteredSolver:
         print("[Step 1] Running Multi-Level Hierarchical Clustering...")
         t0 = time.time()
         cluster_engine = FastGPUMultiLevelClustering(epsilon, k=k, batch_size=2048)
-        blue_coo, red_coo = cluster_engine.run(P_red, P_blue)
+        blue_coo, red_coo, levels_red, levels_blue = cluster_engine.run(P_red, P_blue)
         torch.cuda.synchronize()
         print(f"         Clustering done in {time.time()-t0:.2f}s")
         print(f"         Red Edges:  {red_coo[0].numel()}")
@@ -268,11 +269,11 @@ class GPUClusteredSolver:
         # 2. Indexing
         print("[Step 2] Building CSR Index (Unified Center Space)...")
         t0 = time.time()
-        self._build_csr_from_coo_cpu(blue_coo, red_coo)
+        self._build_csr_from_coo_cpu(blue_coo, red_coo, levels_red, levels_blue)
         print(f"         Indexing done in {time.time()-t0:.2f}s")
         
         # Cleanup
-        del blue_coo, red_coo, cluster_engine
+        del blue_coo, red_coo, levels_red, levels_blue, cluster_engine
         gc.collect()
         torch.cuda.empty_cache()
         
@@ -282,7 +283,7 @@ class GPUClusteredSolver:
         self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
         self.MB = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
 
-    def _build_csr_from_coo_cpu(self, blue_coo, red_coo):
+    def _build_csr_from_coo_cpu(self, blue_coo, red_coo, levels_red, levels_blue):
         """
         Builds CSR structures.
         Crucial Change: Centers are now disjoint sets from the hierarchy.
@@ -297,6 +298,62 @@ class GPUClusteredSolver:
         b_c, b_l, b_p = blue_coo
         r_c, r_l, r_p = red_coo
         N = self.N
+        levels_red = levels_red.cpu()
+        levels_blue = levels_blue.cpu()
+
+        def _category_stats(centers, levels):
+            edges = int(centers.numel())
+            if edges == 0:
+                return {
+                    "edges": 0,
+                    "clusters": 0,
+                    "buckets": 0,
+                    "avg_cluster": 0.0,
+                    "mem_mb": 0.0,
+                }
+            clusters = int(torch.unique(centers).numel())
+            max_level = levels.max().to(torch.long)
+            bucket_keys = centers.to(torch.long) * (max_level + 1) + levels.to(torch.long)
+            buckets = int(torch.unique(bucket_keys).numel())
+            avg_cluster = edges / max(clusters, 1)
+            mem_mb = edges * 12 / (1024 ** 2)
+            return {
+                "edges": edges,
+                "clusters": clusters,
+                "buckets": buckets,
+                "avg_cluster": avg_cluster,
+                "mem_mb": mem_mb,
+            }
+
+        total_stats = {
+            "edges": 0,
+            "clusters": 0,
+            "buckets": 0,
+            "avg_cluster": 0.0,
+            "mem_mb": 0.0,
+        }
+        if r_c.numel() != 0 or b_c.numel() != 0:
+            total_centers = torch.cat([r_c, b_c + N])
+            total_levels = torch.cat([r_l, b_l])
+            total_stats = _category_stats(total_centers, total_levels)
+
+        print("    [Cluster Analysis]")
+        print("    Category       | Clusters | Buckets  | Edges        | Avg Clust | Mem (MB)")
+        print("    ------------------------------------------------------------------------")
+        def _print_row(label, stats):
+            print(
+                f"    {label:<14} | {stats['clusters']:>8} | {stats['buckets']:>7} | "
+                f"{stats['edges']:>12,} | {stats['avg_cluster']:>9.1f} | {stats['mem_mb']:>7.1f}"
+            )
+        for i in range(self.k - 1, -1, -1):
+            red_mask = levels_red[r_c] == i
+            blue_mask = levels_blue[b_c] == i
+            red_stats = _category_stats(r_c[red_mask], r_l[red_mask])
+            blue_stats = _category_stats(b_c[blue_mask], b_l[blue_mask])
+            _print_row(f"RED (Lvl {i})", red_stats)
+            _print_row(f"BLUE (Lvl {i})", blue_stats)
+        print("    ------------------------------------------------------------------------")
+        _print_row("TOTAL", total_stats)
 
         # Shift Blue Center IDs to avoid collision with Red Center IDs
         b_c_shifted = b_c + N
