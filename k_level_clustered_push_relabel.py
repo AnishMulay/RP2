@@ -130,7 +130,7 @@ class FastGPUMultiLevelClustering:
             # This is the memory bottleneck, handled by tiling inside kernel or here
             # Since kernel does tiling for us, we get the result. 
             # Note: We used batch_size for kernel init, so it tiles internally if needed.
-            dists_sq = self.kernel.compute_squared_dist_tile(batch_centers, workspace)
+            dists_sq = self.kernel.compute_squared_dist_tile(batch_centers, workspace).t()
             
             # 2. Update Global Bounds (Reduction)
             # We need the min dist from ANY center in this batch to each point
