@@ -468,7 +468,7 @@ class GPUClusteredSolver:
         print(f"Avg Euclidean Cost: {avg_cost.item():.4f}")
 
     def solve(self):
-        print(f"\n[Step 3] Starting Push-Relabel Loop...")
+        # print(f"\n[Step 3] Starting Push-Relabel Loop...")
         iteration = 0
         use_cuda = self.device.type == "cuda"
         
@@ -477,12 +477,13 @@ class GPUClusteredSolver:
             B_free = torch.nonzero(self.MB == -1).squeeze(1)
             num_free = B_free.numel()
             if num_free <= self.epsilon * self.N:
-                print("[Converged] Free points <= Threshold. Stopping.")
+                # print("[Converged] Free points <= Threshold. Stopping.")
                 break
             
             iteration += 1
             if iteration % 10 == 0:
-                print(f"    [Iter {iteration}] Free: {num_free}")
+                # print(f"    [Iter {iteration}] Free: {num_free}")
+                pass
 
             # ---------------------------------------------------------
             # A. Price Refinement (Global Update)
@@ -654,7 +655,7 @@ class GPUClusteredSolver:
             self.yA[matched_r] -= 1
             
             if iteration > 50000:
-                print("Max Iterations Reached.")
+                # print("Max Iterations Reached.")
                 break
 
         self.cleanup_remaining_points()

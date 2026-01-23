@@ -370,7 +370,7 @@ class GPUClusteredSolver:
         print(f"         Avg Degree: {(self.blue_center_indices.numel() + self.red_indices.numel())/N:.2f}")
 
     def solve(self):
-        print(f"\n[Step 3] Starting Push-Relabel Loop...")
+        # print(f"\n[Step 3] Starting Push-Relabel Loop...")
         iteration = 0
         use_cuda = self.device.type == "cuda"
 
@@ -386,14 +386,15 @@ class GPUClusteredSolver:
             B_free = torch.nonzero(self.MB == -1).squeeze(1)
             num_free = B_free.numel()
             if num_free <= self.epsilon * self.N:
-                print("[Converged] Free points <= Threshold. Stopping.")
+                # print("[Converged] Free points <= Threshold. Stopping.")
                 break
             
             iteration += 1
-            log_mem("Start Iter")
+            # log_mem("Start Iter")
 
             if iteration % 10 == 0:
-                print(f"    [Iter {iteration}] Free: {num_free}")
+                # print(f"    [Iter {iteration}] Free: {num_free}")
+                pass
 
             # A. Maintenance: Max yA per Center
             if use_cuda:
@@ -409,7 +410,7 @@ class GPUClusteredSolver:
             )
             if use_cuda:
                 torch.cuda.synchronize()
-            log_mem("After Maint")
+            # log_mem("After Maint")
             
             # B. Push (Ragged Gather)
             if use_cuda:
@@ -445,7 +446,7 @@ class GPUClusteredSolver:
                 repeat_packed_starts = torch.repeat_interleave(segment_starts_packed, lengths)
                 offsets = global_range - repeat_packed_starts
                 active_edge_indices = repeat_starts + offsets
-                log_mem("Mid-Push (Indices)")
+                # log_mem("Mid-Push (Indices)")
 
                 # Reconstruct attributes
                 active_b_ids = torch.repeat_interleave(chunk, lengths)
@@ -466,7 +467,7 @@ class GPUClusteredSolver:
                 candidates = slacks_est <= 0
                 if use_cuda:
                     torch.cuda.synchronize()
-                log_mem("After Push")
+                # log_mem("After Push")
 
                 if candidates.any():
                     all_win_b.append(active_b_ids[candidates])
@@ -520,7 +521,7 @@ class GPUClusteredSolver:
 
                     b_sort_key = win_c.to(torch.long) * key_scale + win_l_b.to(torch.long)
                     b_perm = torch.argsort(b_sort_key)
-                    log_mem("Mid-Resolve (Sort)")
+                    # log_mem("Mid-Resolve (Sort)")
                     b_sorted = win_b[b_perm]
                     c_sorted = win_c[b_perm]
                     l_b_sorted = win_l_b[b_perm]
@@ -595,7 +596,7 @@ class GPUClusteredSolver:
                 del red_ids, red_levels, red_c_ids, free_red_mask, win_b, win_c, win_l_b
                 if use_cuda:
                     torch.cuda.synchronize()
-            log_mem("After Resolve")
+            # log_mem("After Resolve")
 
             # D. Relabel
             if use_cuda:
@@ -607,12 +608,12 @@ class GPUClusteredSolver:
             self.yA[matched_r] -= 1
             if use_cuda:
                 torch.cuda.synchronize()
-            log_mem("After Relabel")
+            # log_mem("After Relabel")
             if use_cuda:
                 torch.cuda.empty_cache()
             
             if iteration > 50000:
-                print("Max Iterations Reached.")
+                # print("Max Iterations Reached.")
                 break
 
         self.cleanup_remaining_points()
