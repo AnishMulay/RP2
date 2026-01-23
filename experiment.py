@@ -122,8 +122,8 @@ def run_ott_sinkhorn(P_red, P_blue, epsilon):
     
     # Re-calculate costs for the matches manually to be sure
     matched_y = y[matches]
-    dists_sq = jnp.sum((x - matched_y)**2, axis=1)
-    hard_cost = float(jnp.sum(dists_sq))
+    dists = jnp.sqrt(jnp.sum((x - matched_y)**2, axis=1))
+    hard_cost = float(jnp.sum(dists))
     
     return soft_cost, hard_cost
 
@@ -142,7 +142,9 @@ def run_pot_sinkhorn(P_red, P_blue, epsilon):
     
     soft_cost = torch.sum(P * C).item()
     matches = torch.argmax(P, dim=1)
-    hard_cost = C[torch.arange(N, device=device), matches].sum().item()
+    # Gather squared costs, then sqrt, then sum
+    squared_costs = C[torch.arange(N, device=device), matches]
+    hard_cost = torch.sqrt(squared_costs).sum().item()
     return soft_cost, hard_cost
 
 def run_geomloss_sinkhorn(P_red, P_blue, epsilon):
@@ -156,7 +158,9 @@ def run_geomloss_sinkhorn(P_red, P_blue, epsilon):
     
     P_log = (f.view(-1, 1) + g.view(1, -1) - C) / epsilon
     matches = torch.argmax(P_log, dim=1)
-    hard_cost = C[torch.arange(len(P_red), device=P_red.device), matches].sum().item()
+    # Gather squared costs (C is squared), then sqrt, then sum
+    squared_costs = C[torch.arange(len(P_red), device=P_red.device), matches]
+    hard_cost = torch.sqrt(squared_costs).sum().item()
     
     P = torch.exp(P_log)
     soft_cost = torch.sum(P * C).item()
