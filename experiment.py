@@ -105,6 +105,10 @@ def run_ott_sinkhorn(P_red, P_blue, epsilon):
     
     # Block until ready (JAX is asynchronous)
     out.converged.block_until_ready()
+
+    # Estimate memory: JAX float64 (8 bytes) * N * N
+    mat_size_mb = (P_red.shape[0] ** 2 * 8) / (1024**2)
+    print(f"   [OTT-JAX Debug] Theoretical Matrix Size: {mat_size_mb:.2f} MB")
     
     # 1. Soft Cost
     soft_cost = float(out.reg_ot_cost)
@@ -125,7 +129,7 @@ def run_ott_sinkhorn(P_red, P_blue, epsilon):
     dists = jnp.sqrt(jnp.sum((x - matched_y)**2, axis=1))
     hard_cost = float(jnp.sum(dists))
     
-    return soft_cost, hard_cost
+    return soft_cost, hard_cost, mat_size_mb
 
 def run_pot_sinkhorn(P_red, P_blue, epsilon):
     N = P_red.size(0)
@@ -160,7 +164,15 @@ def run_geomloss_sinkhorn(P_red, P_blue, epsilon):
     matches = torch.argmax(P_log, dim=1)
     # Gather squared costs (C is squared), then sqrt, then sum
     squared_costs = C[torch.arange(len(P_red), device=P_red.device), matches]
-    hard_cost = torch.sqrt(squared_costs).sum().item()
+    min_val = squared_costs.min().item()
+    print(f"   [GeomLoss Debug] Min Squared Cost: {min_val} (Should be >= 0)")
+    if min_val < 0:
+        print("   [GeomLoss Debug] WARNING: Negative squared costs detected! Clamping...")
+    try:
+        hard_cost = torch.sqrt(squared_costs).sum().item()
+    except Exception as e:
+        print(f"   [GeomLoss Debug] hard_cost calculation failed: {e}")
+        raise
     
     P = torch.exp(P_log)
     soft_cost = torch.sum(P * C).item()
@@ -194,7 +206,7 @@ def run_experiment(config):
         try:
             reset_memory_stats()
             t_start = time.time()
-            soft_cost, hard_cost = run_ott_sinkhorn(P_red, P_blue, config.epsilon)
+            soft_cost, hard_cost, mat_size_mb = run_ott_sinkhorn(P_red, P_blue, config.epsilon)
             # No cuda sync needed for JAX (handled in wrapper block_until_ready)
             t_end = time.time()
             
@@ -204,7 +216,7 @@ def run_experiment(config):
                 "clust_time": 0.0,
                 "avg_cost": hard_cost / config.n,
                 "soft_cost": soft_cost / config.n,
-                "mem": 0.0 # JAX memory tracking is tricky, reporting 0
+                "mem": mat_size_mb
             })
         except Exception as e:
             print(f"   [FAILED] OTT-JAX failed: {e}")
