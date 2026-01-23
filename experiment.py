@@ -88,7 +88,7 @@ def run_pot_sinkhorn(P_red, P_blue, epsilon):
     # Run Sinkhorn
     # method='sinkhorn_log' is critical for stability at low epsilon (The "Sinkhorn Wall")
     # POT returns the Transport Plan (P) matrix directly
-    P = ot.sinkhorn(a, b, C, reg=epsilon, method='sinkhorn_log')
+    P = ot.sinkhorn(a, b, C, reg=epsilon, method='sinkhorn_log', numItermax=100000)
     
     # 1. Soft Cost (The Objective Function Value)
     soft_cost = torch.sum(P * C).item()
