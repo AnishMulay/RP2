@@ -108,7 +108,6 @@ def run_ott_sinkhorn(P_red, P_blue, epsilon):
 
     # Estimate memory: JAX float64 (8 bytes) * N * N
     mat_size_mb = (P_red.shape[0] ** 2 * 8) / (1024**2)
-    print(f"   [OTT-JAX Debug] Theoretical Matrix Size: {mat_size_mb:.2f} MB")
     
     # 1. Soft Cost
     soft_cost = float(out.reg_ot_cost)
@@ -148,7 +147,7 @@ def run_pot_sinkhorn(P_red, P_blue, epsilon):
     matches = torch.argmax(P, dim=1)
     # Gather squared costs, then sqrt, then sum
     squared_costs = C[torch.arange(N, device=device), matches]
-    hard_cost = torch.sqrt(squared_costs).sum().item()
+    hard_cost = torch.sqrt(torch.clamp(squared_costs, min=0.0)).sum().item()
     return soft_cost, hard_cost
 
 def run_geomloss_sinkhorn(P_red, P_blue, epsilon):
@@ -164,15 +163,7 @@ def run_geomloss_sinkhorn(P_red, P_blue, epsilon):
     matches = torch.argmax(P_log, dim=1)
     # Gather squared costs (C is squared), then sqrt, then sum
     squared_costs = C[torch.arange(len(P_red), device=P_red.device), matches]
-    min_val = squared_costs.min().item()
-    print(f"   [GeomLoss Debug] Min Squared Cost: {min_val} (Should be >= 0)")
-    if min_val < 0:
-        print("   [GeomLoss Debug] WARNING: Negative squared costs detected! Clamping...")
-    try:
-        hard_cost = torch.sqrt(squared_costs).sum().item()
-    except Exception as e:
-        print(f"   [GeomLoss Debug] hard_cost calculation failed: {e}")
-        raise
+    hard_cost = torch.sqrt(torch.clamp(squared_costs, min=0.0)).sum().item()
     
     P = torch.exp(P_log)
     soft_cost = torch.sum(P * C).item()
