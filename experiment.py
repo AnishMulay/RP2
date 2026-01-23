@@ -154,8 +154,8 @@ def run_experiment(config):
     # Generate Data (Standard Normal / Gaussian blobs)
     # This matches the 'Synthetic' setup in the research paper
     torch.manual_seed(config.seed)
-    P_red = torch.randn(config.n, config.dim, device=device)
-    P_blue = torch.randn(config.n, config.dim, device=device)
+    P_red = torch.randn(config.n, config.dim, device=device) * math.sqrt(config.epsilon)
+    P_blue = torch.randn(config.n, config.dim, device=device) * math.sqrt(config.epsilon)
     
     results = []
     
