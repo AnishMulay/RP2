@@ -24,7 +24,7 @@ class TiledEuclideanKernel:
             "P_norms_sq": (P ** 2).sum(dim=1, keepdim=True)
         }
 
-    def compute_squared_dist_tile(self, query_points, workspace):
+    def compute_dist_tile(self, query_points, workspace):
         P = workspace["P"]
         P_norms_sq = workspace["P_norms_sq"]
         Q_norms_sq = (query_points ** 2).sum(dim=1, keepdim=True).t()
@@ -34,6 +34,24 @@ class TiledEuclideanKernel:
         dists_sq = P_norms_sq + Q_norms_sq
         dists_sq.addmm_(P, query_points.t(), beta=1.0, alpha=-2.0)
         return torch.clamp(dists_sq, min=0.0)
+
+    def compute_squared_dist_tile(self, query_points, workspace):
+        return self.compute_dist_tile(query_points, workspace)
+
+class TiledManhattanKernel:
+    """
+    Computes L1 (Manhattan) distances using torch.cdist.
+    """
+    def __init__(self, chunk_size=4096):
+        self.chunk_size = chunk_size
+
+    def prepare_workspace(self, P):
+        return {"P": P}
+
+    def compute_dist_tile(self, query_points, workspace):
+        dists = torch.cdist(query_points, workspace["P"], p=1)
+        # Match TiledEuclideanKernel's (P, query) layout.
+        return dists.t()
 
 # ==========================================
 # PART 2: MULTI-LEVEL HIERARCHICAL CLUSTERING
@@ -55,11 +73,15 @@ class FastGPUMultiLevelClustering:
     - Fused Kernel: Generates edges and updates the 'bound' (nearest higher-level center) in a single pass.
     - Micro-batching: Never materializes full N x N matrices.
     """
-    def __init__(self, epsilon, k=4, batch_size=2048):
+    def __init__(self, epsilon, k=4, batch_size=2048, metric="L2"):
         self.epsilon = epsilon
         self.k = k
         self.batch_size = batch_size
-        self.kernel = TiledEuclideanKernel(chunk_size=batch_size)
+        self.metric = metric
+        if metric == "L1":
+            self.kernel = TiledManhattanKernel(chunk_size=batch_size)
+        else:
+            self.kernel = TiledEuclideanKernel(chunk_size=batch_size)
 
     def _sample_disjoint_hierarchy(self, n, device):
         """
@@ -97,16 +119,16 @@ class FastGPUMultiLevelClustering:
             
         return levels
 
-    def _process_level(self, targets, centers, center_indices, bounds_sq, workspace):
+    def _process_level(self, targets, centers, center_indices, bounds, workspace):
         """
         Fused Operation for a single level S_i:
         1. Compute distances from 'centers' (S_i) to 'targets'.
-        2. Identify valid edges: dist_sq < bounds_sq.
-        3. Update bounds_sq: new_bound = min(bound, min_dist_to_S_i).
+        2. Identify valid edges: dist < bounds.
+        3. Update bounds: new_bound = min(bound, min_dist_to_S_i).
         
         Returns:
             - Tuple of (row_indices, col_indices, costs) for edges found in this level.
-            - Updated bounds_sq tensor.
+            - Updated bounds tensor.
         """
         n_centers = centers.shape[0]
         n_targets = targets.shape[0]
@@ -118,7 +140,7 @@ class FastGPUMultiLevelClustering:
         
         # We need to compute the min_dist to S_i to update the bounds for S_{i-1}.
         # Initialize with current bounds (because we only shrink bounds)
-        new_bounds_sq = bounds_sq.clone()
+        new_bounds = bounds.clone()
         
         # Iterate over S_i in batches
         for start in range(0, n_centers, self.batch_size):
@@ -130,18 +152,18 @@ class FastGPUMultiLevelClustering:
             # This is the memory bottleneck, handled by tiling inside kernel or here
             # Since kernel does tiling for us, we get the result. 
             # Note: We used batch_size for kernel init, so it tiles internally if needed.
-            dists_sq = self.kernel.compute_squared_dist_tile(batch_centers, workspace).t()
+            dists = self.kernel.compute_dist_tile(batch_centers, workspace).t()
             
             # 2. Update Global Bounds (Reduction)
             # We need the min dist from ANY center in this batch to each point
-            batch_min_sq, _ = dists_sq.min(dim=0)
-            new_bounds_sq = torch.minimum(new_bounds_sq, batch_min_sq)
+            batch_min, _ = dists.min(dim=0)
+            new_bounds = torch.minimum(new_bounds, batch_min)
             
             # 3. Generate Edges (Sieve)
-            # Edge exists if dist_sq < bounds_sq (The OLD bounds, passed in args)
+            # Edge exists if dist < bounds (The OLD bounds, passed in args)
             # Bounds broadcast: (1, N)
             # Mask shape: (Batch, N)
-            mask = dists_sq < bounds_sq.unsqueeze(0)
+            mask = dists < bounds.unsqueeze(0)
             
             if not mask.any():
                 continue
@@ -154,8 +176,11 @@ class FastGPUMultiLevelClustering:
                 cols = valid_indices[:, 1]
                 
                 # Get actual distances for valid pairs
-                valid_dists_sq = dists_sq[rows, cols]
-                valid_dists = torch.sqrt(valid_dists_sq)
+                valid_dists_raw = dists[rows, cols]
+                if self.metric == "L2":
+                    valid_dists = torch.sqrt(valid_dists_raw)
+                else:
+                    valid_dists = valid_dists_raw
                 
                 # Compute Bucket Level: ceil(dist / epsilon)
                 # Ensure level >= 0. For dist=0 (self loop), level=0.
@@ -170,7 +195,7 @@ class FastGPUMultiLevelClustering:
                 chunk_levels.append(levels.cpu())
                 
             # Explicitly free memory
-            del dists_sq, mask, valid_indices
+            del dists, mask, valid_indices
         
         # Consolidate edges
         if chunk_center_ids:
@@ -178,7 +203,7 @@ class FastGPUMultiLevelClustering:
         else:
             edges = (torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long))
             
-        return edges, new_bounds_sq
+        return edges, new_bounds
 
     def run(self, P_red, P_blue):
         """
@@ -205,7 +230,7 @@ class FastGPUMultiLevelClustering:
             all_c, all_l, all_p = [], [], []
             
             # Initial bounds: Infinity
-            bounds_sq = torch.full((n,), float('inf'), device=P_all.device)
+            bounds = torch.full((n,), float('inf'), device=P_all.device)
             
             # Loop from Highest Level (k-1) down to 0
             for i in range(self.k - 1, -1, -1):
@@ -220,8 +245,8 @@ class FastGPUMultiLevelClustering:
                 pts_i = centers_source[idx_i]
                 
                 # Process Level
-                (c_cpu, l_cpu, p_cpu), bounds_sq = self._process_level(
-                    P_all, pts_i, idx_i, bounds_sq, workspace
+                (c_cpu, l_cpu, p_cpu), bounds = self._process_level(
+                    P_all, pts_i, idx_i, bounds, workspace
                 )
                 
                 all_c.append(c_cpu)
@@ -245,21 +270,24 @@ class FastGPUMultiLevelClustering:
 # ==========================================
 
 class GPUClusteredSolver:
-    def __init__(self, P_red, P_blue, epsilon, k=4):
+    def __init__(self, P_red, P_blue, epsilon, k=4, metric="L2"):
         self.device = P_red.device
         self.N = P_red.shape[0]
         self.epsilon = epsilon
         self.k = k
         self.P_red = P_red
         self.P_blue = P_blue
+        self.metric = metric
         
         print("="*60)
-        print(f"[Init] Config: N={self.N}, Eps={epsilon}, Levels={k}, Device={self.device}")
+        print(f"[Init] Config: N={self.N}, Eps={epsilon}, Levels={k}, Metric={metric}, Device={self.device}")
         
         # 1. Multi-Level Clustering
         print("[Step 1] Running Multi-Level Hierarchical Clustering...")
         t0 = time.time()
-        cluster_engine = FastGPUMultiLevelClustering(epsilon, k=k, batch_size=2048)
+        cluster_engine = FastGPUMultiLevelClustering(
+            epsilon, k=k, batch_size=2048, metric=metric
+        )
         blue_coo, red_coo, levels_red, levels_blue = cluster_engine.run(P_red, P_blue)
         torch.cuda.synchronize()
         print(f"         Clustering done in {time.time()-t0:.2f}s")
@@ -461,11 +489,16 @@ class GPUClusteredSolver:
         print(f"[Cleanup] Arbitrarily matched {count} remaining pairs.")
 
     def calculate_final_stats(self):
-        dists = torch.norm(self.P_blue - self.P_red[self.MB], p=2, dim=1)
+        if self.metric == "L1":
+            dists = torch.norm(self.P_blue - self.P_red[self.MB], p=1, dim=1)
+            label = "Manhattan"
+        else:
+            dists = torch.norm(self.P_blue - self.P_red[self.MB], p=2, dim=1)
+            label = "Euclidean"
         total_cost = dists.sum()
         avg_cost = total_cost / self.N
-        print(f"Total Euclidean Cost: {total_cost.item():.4f}")
-        print(f"Avg Euclidean Cost: {avg_cost.item():.4f}")
+        print(f"Total {label} Cost: {total_cost.item():.4f}")
+        print(f"Avg {label} Cost: {avg_cost.item():.4f}")
 
     def solve(self):
         # print(f"\n[Step 3] Starting Push-Relabel Loop...")

@@ -23,13 +23,31 @@ class TiledEuclideanKernel:
             "P_norms_sq": (P ** 2).sum(dim=1, keepdim=True)
         }
 
-    def compute_squared_dist_tile(self, query_points, workspace):
+    def compute_dist_tile(self, query_points, workspace):
         P = workspace["P"]
         P_norms_sq = workspace["P_norms_sq"]
         Q_norms_sq = (query_points ** 2).sum(dim=1, keepdim=True).t()
         dists_sq = P_norms_sq + Q_norms_sq
         dists_sq.addmm_(P, query_points.t(), beta=1.0, alpha=-2.0)
         return torch.clamp(dists_sq, min=0.0)
+
+    def compute_squared_dist_tile(self, query_points, workspace):
+        return self.compute_dist_tile(query_points, workspace)
+
+class TiledManhattanKernel:
+    """
+    Computes L1 (Manhattan) distances using torch.cdist.
+    """
+    def __init__(self, chunk_size=1024):
+        self.chunk_size = chunk_size
+
+    def prepare_workspace(self, P):
+        return {"P": P}
+
+    def compute_dist_tile(self, query_points, workspace):
+        dists = torch.cdist(query_points, workspace["P"], p=1)
+        # Match TiledEuclideanKernel's (P, query) layout.
+        return dists.t()
 
 # ==========================================
 # PART 2: GEOMETRIC CLUSTERING (Voronoi + Shells)
@@ -40,11 +58,15 @@ class FastGPUClustering:
     Optimized Clustering using Voronoi constraints and minimal shells.
     Generates a sparse O(N^1.5) cover instead of a dense one.
     """
-    def __init__(self, epsilon, batch_size=1024, micro_batch_size=32):
+    def __init__(self, epsilon, batch_size=1024, micro_batch_size=32, metric="L2"):
         self.epsilon = epsilon
         self.batch_size = batch_size
         self.micro_batch_size = micro_batch_size
-        self.kernel = TiledEuclideanKernel(chunk_size=batch_size)
+        self.metric = metric
+        if metric == "L1":
+            self.kernel = TiledManhattanKernel(chunk_size=batch_size)
+        else:
+            self.kernel = TiledEuclideanKernel(chunk_size=batch_size)
 
     def _sample_landmarks(self, n, device):
         # Sample ~sqrt(N) landmarks
@@ -57,15 +79,15 @@ class FastGPUClustering:
         # D[x] = min d(x, s) for s in landmarks
         n_targets = targets.shape[0]
         n_landmarks = landmarks.shape[0]
-        D_y_sq = torch.full((n_targets,), float('inf'), device=targets.device)
+        D_y = torch.full((n_targets,), float('inf'), device=targets.device)
         
         for i in range(0, n_landmarks, self.batch_size):
             end = min(i + self.batch_size, n_landmarks)
             batch = landmarks[i:end]
-            dists = self.kernel.compute_squared_dist_tile(batch, workspace)
+            dists = self.kernel.compute_dist_tile(batch, workspace)
             batch_min, _ = dists.min(dim=1)
-            D_y_sq = torch.min(D_y_sq, batch_min)
-        return D_y_sq
+            D_y = torch.min(D_y, batch_min)
+        return D_y
 
     def _build_cover_bulk(self, centers, center_mask_P1, targets_ws, D_voronoi):
         """
@@ -94,7 +116,7 @@ class FastGPUClustering:
                 micro_is_landmark = is_landmark_batch[start_mb:end_mb]
                 
                 # 1. Compute Distances (Micro x Targets)
-                dists_sq = self.kernel.compute_squared_dist_tile(q_micro, targets_ws).t() # (Micro, Targets)
+                dists = self.kernel.compute_dist_tile(q_micro, targets_ws).t() # (Micro, Targets)
                 
                 # 2. Apply Voronoi Constraint
                 # If Landmark: Connect to everything (up to some reasonable bound, effectively inf here)
@@ -105,23 +127,26 @@ class FastGPUClustering:
                 
                 # Mask Logic:
                 # Landmark: True
-                # Non-Landmark: dists_sq < dv_row
+                # Non-Landmark: dists < dv_row
                 
-                # Note: d_sq and dv_row are squared distances
-                mask = dists_sq < dv_row
+                # Note: dists and dv_row are squared (L2) or linear (L1) distances
+                mask = dists < dv_row
                 mask = torch.where(micro_is_landmark, torch.tensor(True, device=mask.device), mask)
                 
                 if not mask.any(): 
                     continue
                 
                 # 3. Compute Levels for valid edges
-                # Level = ceil(sqrt(dist_sq) / epsilon)
+                # Level = ceil(dist / epsilon) (dist is L1 or sqrt(L2))
                 # We only compute this for the valid mask indices to save ops
                 valid_indices = torch.nonzero(mask)
                 
                 # Extract distances for these pairs
-                valid_dists_sq = dists_sq[valid_indices[:, 0], valid_indices[:, 1]]
-                valid_dists = torch.sqrt(valid_dists_sq)
+                valid_dists_raw = dists[valid_indices[:, 0], valid_indices[:, 1]]
+                if self.metric == "L2":
+                    valid_dists = torch.sqrt(valid_dists_raw)
+                else:
+                    valid_dists = valid_dists_raw
                 levels = torch.ceil(valid_dists / self.epsilon).to(torch.long)
                 
                 # Filter out Level 0 (self-loops with 0 cost can be tricky, set to 1 or keep 0)
@@ -168,20 +193,23 @@ class FastGPUClustering:
 # ==========================================
 
 class GPUClusteredSolver:
-    def __init__(self, P_red, P_blue, epsilon):
+    def __init__(self, P_red, P_blue, epsilon, metric="L2"):
         self.device = P_red.device
         self.N = P_red.shape[0]
         self.epsilon = epsilon
         self.P_red = P_red
         self.P_blue = P_blue
+        self.metric = metric
         
         print("="*60)
-        print(f"[Init] Configuration: N={self.N}, Eps={epsilon}, Device={self.device}")
+        print(f"[Init] Configuration: N={self.N}, Eps={epsilon}, Metric={metric}, Device={self.device}")
         
         # 1. Clustering
         print("[Step 1] Running Geometric Clustering...")
         t0 = time.time()
-        cluster_engine = FastGPUClustering(epsilon, batch_size=1024, micro_batch_size=32)
+        cluster_engine = FastGPUClustering(
+            epsilon, batch_size=1024, micro_batch_size=32, metric=metric
+        )
         blue_coo, red_coo, r_mask, b_mask = cluster_engine.run(P_red, P_blue)
         torch.cuda.synchronize()
         print(f"         Clustering done in {time.time()-t0:.2f}s")
@@ -214,11 +242,16 @@ class GPUClusteredSolver:
         print(f"[Cleanup] Arbitrarily matched {count} remaining pairs.")
 
     def calculate_final_stats(self):
-        dists = torch.norm(self.P_blue - self.P_red[self.MB], p=2, dim=1)
+        if self.metric == "L1":
+            dists = torch.norm(self.P_blue - self.P_red[self.MB], p=1, dim=1)
+            label = "Manhattan"
+        else:
+            dists = torch.norm(self.P_blue - self.P_red[self.MB], p=2, dim=1)
+            label = "Euclidean"
         total_cost = dists.sum()
         avg_cost = total_cost / self.N
-        print(f"Total Euclidean Cost: {total_cost.item():.4f}")
-        print(f"Avg Euclidean Cost: {avg_cost.item():.4f}")
+        print(f"Total {label} Cost: {total_cost.item():.4f}")
+        print(f"Avg {label} Cost: {avg_cost.item():.4f}")
 
     def _build_csr_from_coo_cpu(self, blue_coo, red_coo, red_mask, blue_mask):
         """
