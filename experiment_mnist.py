@@ -76,7 +76,7 @@ def load_mnist_data(n_samples, device):
         raw = f.read()
 
     # Skip 16-byte header, then read as uint8 and reshape.
-    data_np = np.frombuffer(raw, dtype=np.uint8, offset=16).reshape(-1, 784)
+    data_np = np.frombuffer(raw, dtype=np.uint8, offset=16).reshape(-1, 784).copy()
     data = torch.from_numpy(data_np).float()
     
     # 4. Normalize (Sum to 1) + Jitter
@@ -120,6 +120,8 @@ def run_ott_sinkhorn_l1(P_red, P_blue, epsilon):
     class ManhattanCost(costs.CostFn):
         def pairwise(self, x, y):
             return jnp.sum(jnp.abs(x - y))
+        def __call__(self, x, y):
+            return self.pairwise(x, y)
     
     cost_fn = ManhattanCost()
     
