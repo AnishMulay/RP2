@@ -530,7 +530,11 @@ class GPUClusteredSolver:
             )
             # Scatter max: For each cluster, find highest dual weight of connected Red points
             center_max_yA.scatter_reduce_(
-                0, self.red_expand_center_ids, yA_expanded, reduce="amax", include_self=False
+                0,
+                self.red_expand_center_ids.to(torch.long),
+                yA_expanded,
+                reduce="amax",
+                include_self=False,
             )
             
             # ---------------------------------------------------------

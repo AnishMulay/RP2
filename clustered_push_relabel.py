@@ -439,7 +439,11 @@ class GPUClusteredSolver:
             # We want to check: Slack_Est = 2*L_b - yB - Max_yA
             # So we need max(yA) in the center.
             center_max_yA.scatter_reduce_(
-                0, self.red_expand_center_ids, yA_expanded, reduce="amax", include_self=False
+                0,
+                self.red_expand_center_ids.to(torch.long),
+                yA_expanded,
+                reduce="amax",
+                include_self=False,
             )
             if use_cuda:
                 torch.cuda.synchronize()
