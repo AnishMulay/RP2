@@ -1,11 +1,11 @@
 import os
+import gzip
 # CRITICAL: Prevent JAX from hogging all GPU memory
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["JAX_ENABLE_X64"] = "True"
 
 import torch
-import torchvision
 import time
 import csv
 import fcntl
@@ -62,22 +62,22 @@ def reset_memory_stats():
 
 def load_mnist_data(n_samples, device):
     """
-    Downloads MNIST, flattens, normalizes, and samples N pairs.
+    Loads MNIST from local gzip file, flattens, normalizes, and samples N pairs.
     """
-    print(">> Loading MNIST dataset...")
-    # 1. Download
-    mnist_data = torchvision.datasets.MNIST(
-        root="./data", 
-        train=True, 
-        download=True,
-        transform=torchvision.transforms.ToTensor()
-    )
-    
-    # 2. Extract Data (N_total, 28, 28)
-    data = mnist_data.data.float()
-    
-    # 3. Flatten to (N_total, 784)
-    data = data.view(data.size(0), -1)
+    print(">> Loading MNIST dataset (manual loader)...")
+    data_path = os.path.join("data", "train-images-idx3-ubyte.gz")
+    if not os.path.isfile(data_path):
+        raise FileNotFoundError(
+            "MNIST file not found at ./data/train-images-idx3-ubyte.gz. "
+            "Please upload the data to ./data."
+        )
+
+    with gzip.open(data_path, "rb") as f:
+        raw = f.read()
+
+    # Skip 16-byte header, then read as uint8 and reshape.
+    data_np = np.frombuffer(raw, dtype=np.uint8, offset=16).reshape(-1, 784)
+    data = torch.from_numpy(data_np).float()
     
     # 4. Normalize (Sum to 1) + Jitter
     # Add epsilon to avoid zero-mass issues (standard OT practice)
