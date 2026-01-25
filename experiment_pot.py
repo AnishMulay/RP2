@@ -84,7 +84,8 @@ def run_experiment(n_values, epsilon=0.05, k_level=4, output_csv="compare_pot_em
         solver2.solve()
         torch.cuda.synchronize() if device.type == "cuda" else None
         t3 = time.time()
-        approx_cost2 = torch.norm(P_blue - P_red[solver2.MB], p=1, dim=1).sum().item()  # L1 cost of matching
+        # Divide by n to convert "Total Distance" to "Average Distance" (matching POT's output)
+        approx_cost2 = torch.norm(P_blue - P_red[solver2.MB], p=1, dim=1).sum().item() / n  # L1 cost of matching
         approx_time2 = t3 - t2
         abs_err2 = abs(approx_cost2 - exact_cost)
         rel_err2 = abs_err2 / max(abs(exact_cost), 1e-9)
@@ -96,7 +97,7 @@ def run_experiment(n_values, epsilon=0.05, k_level=4, output_csv="compare_pot_em
         solverK.solve()
         torch.cuda.synchronize() if device.type == "cuda" else None
         t5 = time.time()
-        approx_costK = torch.norm(P_blue - P_red[solverK.MB], p=1, dim=1).sum().item()
+        approx_costK = torch.norm(P_blue - P_red[solverK.MB], p=1, dim=1).sum().item() / n
         approx_timeK = t5 - t4
         abs_errK = abs(approx_costK - exact_cost)
         rel_errK = abs_errK / max(abs(exact_cost), 1e-9)
