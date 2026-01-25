@@ -6,8 +6,8 @@ import torch
 import ot
 
 # Import the GPU OT solvers (assumes these modules are in the same directory or installed)
-from clustered_push_relabel import TwoLevelSolver
-from k_level_clustered_push_relabel import KLevelSolver
+from clustered_push_relabel import GPUClusteredSolver as TwoLevelSolver
+from k_level_clustered_push_relabel import GPUClusteredSolver as KLevelSolver
 
 def load_mnist_data(n_samples, device):
     """Load MNIST images, flatten to 784-D, normalize each to sum 1 (with 1e-6 jitter), and sample two sets."""
@@ -18,7 +18,7 @@ def load_mnist_data(n_samples, device):
     with gzip.open(data_path, "rb") as f:
         raw = f.read()
     # Skip header and reshape to [num_images, 784]
-    data_np = np.frombuffer(raw, dtype=np.uint8, offset=16).reshape(-1, 784)
+    data_np = np.frombuffer(raw, dtype=np.uint8, offset=16).reshape(-1, 784).copy()
     data = torch.from_numpy(data_np).float()
     # Normalize each image to have a total sum of 1 (add small epsilon to avoid zero mass)
     data = data + 1e-6
