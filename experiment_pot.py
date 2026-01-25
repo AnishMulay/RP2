@@ -109,6 +109,39 @@ def run_experiment(n_values, epsilon=0.05, k_level=4, output_csv="compare_pot_em
         print(f"n={n}: Exact cost={exact_cost:.6f}, TwoLevel cost={approx_cost2:.6f}, kLevel cost={approx_costK:.6f}")
         # Clean up solver objects to free GPU memory
         del solver2, solverK
+    print_summary_table(output_csv)
+
+def print_summary_table(csv_filename):
+    headers = ["N", "Eps", "Algo", "Time (s)", "Cost", "Error %"]
+    rows = []
+    with open(csv_filename, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rel_error = float(row["rel_error"])
+            error_pct = rel_error * 100.0
+            rows.append([
+                str(row["n"]),
+                str(row["epsilon"]),
+                str(row["algo"]),
+                f"{float(row['time_s']):.6f}",
+                f"{float(row['cost']):.6f}",
+                f"{error_pct:.4f}",
+            ])
+
+    col_widths = [len(h) for h in headers]
+    for row in rows:
+        for i, value in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(value))
+
+    separator = "-" * 80
+    print(separator)
+    header_line = " | ".join(f"{headers[i]:<{col_widths[i]}}" for i in range(len(headers)))
+    print(header_line)
+    print(separator)
+    for row in rows:
+        line = " | ".join(f"{row[i]:<{col_widths[i]}}" for i in range(len(row)))
+        print(line)
+    print(separator)
 
 if __name__ == "__main__":
     # Define the sample sizes to test (100, 200, ..., 1000)
