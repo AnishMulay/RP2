@@ -589,7 +589,7 @@ class GPUClusteredSolver:
                     - center_max_yA[active_c_ids]
                 )
 
-                candidates = slacks_est <= 0
+                candidates = slacks_est == 0
                 
                 if candidates.any():
                     all_win_b.append(active_b_ids[candidates])

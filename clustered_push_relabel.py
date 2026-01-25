@@ -501,7 +501,7 @@ class GPUClusteredSolver:
                     - center_max_yA[active_c_ids]
                 )
 
-                candidates = slacks_est <= 0
+                candidates = slacks_est == 0
                 if use_cuda:
                     torch.cuda.synchronize()
                 # log_mem("After Push")
