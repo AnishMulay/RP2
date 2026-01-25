@@ -126,7 +126,7 @@ def run_experiment(n_values, epsilon=0.05, k_level=4, output_csv="balanced_resul
     print(f"Running on device: {device}")
     
     # CSV Header
-    headers = ["n", "epsilon", "k", "algo", "time_s", "cost", "abs_error", "rel_error", "violation_pct"]
+    headers = ["n", "epsilon", "k", "algo", "time_s", "cost", "violation_pct"]
     
     with open(output_csv, "w", newline="") as f:
         writer = csv.writer(f)
@@ -157,7 +157,7 @@ def run_experiment(n_values, epsilon=0.05, k_level=4, output_csv="balanced_resul
         
         # Write POT Result
         with open(output_csv, "a", newline="") as f:
-            csv.writer(f).writerow([n, epsilon, k_level, "POT-Exact", f"{exact_time:.6f}", f"{exact_cost:.6f}", "0.0", "0.0", f"{viol_pot:.2f}"])
+            csv.writer(f).writerow([n, epsilon, k_level, "POT-Exact", f"{exact_time:.6f}", f"{exact_cost:.6f}", f"{viol_pot:.2f}"])
 
         # 3. Two-Level Solver
         t2 = time.time()
@@ -169,12 +169,10 @@ def run_experiment(n_values, epsilon=0.05, k_level=4, output_csv="balanced_resul
         
         cost2 = torch.norm(P_blue - P_red[solver2.MB], p=1, dim=1).sum().item() / n
         time2 = t3 - t2
-        err2 = abs(cost2 - exact_cost)
-        rel2 = err2 / max(abs(exact_cost), 1e-9)
         viol2 = calc_violations_solver(solver2.MB, L_red, L_blue)
         
         with open(output_csv, "a", newline="") as f:
-            csv.writer(f).writerow([n, epsilon, k_level, "2-Level", f"{time2:.6f}", f"{cost2:.6f}", f"{err2:.6f}", f"{rel2:.6f}", f"{viol2:.2f}"])
+            csv.writer(f).writerow([n, epsilon, k_level, "2-Level", f"{time2:.6f}", f"{cost2:.6f}", f"{viol2:.2f}"])
 
         # 4. K-Level Solver
         t4 = time.time()
@@ -186,12 +184,10 @@ def run_experiment(n_values, epsilon=0.05, k_level=4, output_csv="balanced_resul
         
         costK = torch.norm(P_blue - P_red[solverK.MB], p=1, dim=1).sum().item() / n
         timeK = t5 - t4
-        errK = abs(costK - exact_cost)
-        relK = errK / max(abs(exact_cost), 1e-9)
         violK = calc_violations_solver(solverK.MB, L_red, L_blue)
         
         with open(output_csv, "a", newline="") as f:
-            csv.writer(f).writerow([n, epsilon, k_level, "K-Level", f"{timeK:.6f}", f"{costK:.6f}", f"{errK:.6f}", f"{relK:.6f}", f"{violK:.2f}"])
+            csv.writer(f).writerow([n, epsilon, k_level, "K-Level", f"{timeK:.6f}", f"{costK:.6f}", f"{violK:.2f}"])
             
         print(f"Violations: POT={viol_pot:.1f}%, 2-Lvl={viol2:.1f}%, K-Lvl={violK:.1f}%")
         
@@ -203,17 +199,16 @@ def run_experiment(n_values, epsilon=0.05, k_level=4, output_csv="balanced_resul
 
 def print_summary_table(csv_filename):
     print("\n" + "="*85)
-    print(f"{'N':<6} | {'Algo':<12} | {'Time(s)':<8} | {'Cost':<10} | {'Err %':<8} | {'Viol %':<8}")
-    print("-" * 85)
+    print(f"{'N':<6} | {'Algo':<12} | {'Time(s)':<8} | {'Cost':<10} | {'Viol %':<8}")
+    print("-" * 73)
     
     with open(csv_filename, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            err = float(row['rel_error']) * 100
-            print(f"{row['n']:<6} | {row['algo']:<12} | {float(row['time_s']):<8.4f} | {float(row['cost']):<10.4f} | {err:<8.4f} | {row['violation_pct']:<8}")
-    print("="*85 + "\n")
+            print(f"{row['n']:<6} | {row['algo']:<12} | {float(row['time_s']):<8.4f} | {float(row['cost']):<10.4f} | {row['violation_pct']:<8}")
+    print("="*73 + "\n")
 
 if __name__ == "__main__":
     # N values must be divisible by 10
-    n_values = [100, 200, 500, 1000, 2000] 
+    n_values = [100, 200, 500, 1000, 2000, 2500, 5000]
     run_experiment(n_values, epsilon=0.1, k_level=4, output_csv="balanced_results.csv")
