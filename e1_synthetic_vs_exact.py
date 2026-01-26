@@ -199,7 +199,7 @@ def main():
                 MB = solver.MB
                 red_idx = MB.cpu()  # get indices on CPU
                 dists = torch.norm(P_blue - P_red[red_idx], p=2, dim=1)
-                match_cost = dists.sum().item()
+                match_cost = dists.sum().item() / n
                 peak_mem = torch.cuda.max_memory_allocated() / (1024**2)
                 status = "success"
             except Exception as e:
@@ -244,7 +244,7 @@ def main():
                 MB_k = solver_k.MB
                 red_idx_k = MB_k.cpu()
                 dists_k = torch.norm(P_blue - P_red[red_idx_k], p=2, dim=1)
-                match_cost_k = dists_k.sum().item()
+                match_cost_k = dists_k.sum().item() / n
                 peak_mem_k = torch.cuda.max_memory_allocated() / (1024**2)
                 status_k = "success"
             except Exception as e:
