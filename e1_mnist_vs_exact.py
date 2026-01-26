@@ -187,6 +187,7 @@ def main():
                 for j in range(n):
                     i = MB[j]
                     cost_val += float(torch.norm(P_blue[j] - P_red[i], p=1).cpu().item())
+                cost_val /= n
                 peak_mem = torch.cuda.max_memory_allocated() / (1024**2)
                 status = "success"
             except Exception as e:
@@ -229,6 +230,7 @@ def main():
                 for j in range(n):
                     i = MBk[j]
                     cost_valK += float(torch.norm(P_blue[j] - P_red[i], p=1).cpu().item())
+                cost_valK /= n
                 peak_memK = torch.cuda.max_memory_allocated() / (1024**2)
                 statusK = "success"
             except Exception as e:
