@@ -513,6 +513,7 @@ class GPUClusteredSolver:
         DEBUG = False
         DEBUG_EVERY = 50
         DEBUG_SYNC = False
+        DEBUG_PIPE = False
 
         def maybe_sync():
             if use_cuda and DEBUG_SYNC:
@@ -543,6 +544,12 @@ class GPUClusteredSolver:
             dbg_min_slack_est = None
             dbg_max_slack_est = None
             zero_deg = 0
+            if DEBUG_PIPE:
+                dbg_cand_initial = 0
+                dbg_after_free_u = 0
+                dbg_after_free_v = 0
+                dbg_after_conflict = 0
+                dbg_after_commit = 0
             if iteration % 10 == 0:
                 print(f"    [Iter {iteration}] Free: {num_free}")
 
@@ -655,6 +662,10 @@ class GPUClusteredSolver:
             if should_dbg and dbg_min_slack_est is None:
                 dbg_min_slack_est = 0
                 dbg_max_slack_est = 0
+            if DEBUG_PIPE:
+                dbg_cand_initial = int(win_b.numel())
+                dbg_after_free_u = int(win_b.numel())
+                dbg_after_free_v = int(win_b.numel())
             
             # ---------------------------------------------------------
             # C. Resolve Phase (Conflict Resolution)
@@ -716,7 +727,12 @@ class GPUClusteredSolver:
                         r_final = r_final[:pair_count]
                         l_b_final = l_b_final[:pair_count]
                         l_r_final = l_r_final[:pair_count]
+                        if DEBUG_PIPE:
+                            dbg_after_conflict = int(b_final.numel())
 
+                        prev_match_count = None
+                        if DEBUG_PIPE:
+                            prev_match_count = int((self.MA != -1).sum().item())
                         y_b = self.yB[b_final]
                         y_a = self.yA[r_final]
                         
@@ -729,6 +745,9 @@ class GPUClusteredSolver:
                         if b_match.numel() != 0:
                             self.MB[b_match] = r_match.to(self.MB.dtype)
                             self.MA[r_match] = b_match.to(self.MA.dtype)
+                        if DEBUG_PIPE:
+                            new_count = int((self.MA != -1).sum().item())
+                            dbg_after_commit = new_count - prev_match_count
 
             # ---------------------------------------------------------
             # D. Relabel Phase
@@ -748,6 +767,12 @@ class GPUClusteredSolver:
                     f"zeroDeg={zero_deg} eq0={dbg_eq0} leq0={dbg_leq0} "
                     f"minSlack={dbg_min_slack_est} maxSlack={dbg_max_slack_est} "
                     f"matched={matched_now}/{self.N} deltaMatched={delta_matched}"
+                )
+            if DEBUG_PIPE and stuck_iters >= 20:
+                print(
+                    f"[PIPE it={iteration}] init={dbg_cand_initial} freeU={dbg_after_free_u} "
+                    f"freeV={dbg_after_free_v} resolved={dbg_after_conflict} "
+                    f"committed={dbg_after_commit}"
                 )
             prev_matched_count = matched_now
             
