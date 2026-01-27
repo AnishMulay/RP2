@@ -412,6 +412,13 @@ class GPUClusteredSolver:
         # print(f"\n[Step 3] Starting Push-Relabel Loop...")
         iteration = 0
         use_cuda = self.device.type == "cuda"
+        DEBUG = False
+        DEBUG_EVERY = 50
+        DEBUG_SYNC = False
+
+        def maybe_sync():
+            if use_cuda and DEBUG_SYNC:
+                torch.cuda.synchronize()
 
         def log_mem(stage):
             if not use_cuda:
@@ -421,6 +428,10 @@ class GPUClusteredSolver:
             print(f"    [Mem - {stage}] Alloc: {alloc:.1f}MB | Peak: {peak:.1f}MB")
             torch.cuda.reset_peak_memory_stats()
         
+        prev_num_free = None
+        stuck_iters = 0
+        prev_matched_count = None
+
         while True:
             B_free = torch.nonzero(self.MB == -1).squeeze(1)
             num_free = B_free.numel()
@@ -429,14 +440,25 @@ class GPUClusteredSolver:
                 break
             
             iteration += 1
+            if prev_num_free is not None and num_free == prev_num_free:
+                stuck_iters += 1
+            else:
+                stuck_iters = 0
+            prev_num_free = num_free
+            should_dbg = DEBUG and (iteration % DEBUG_EVERY == 0 or stuck_iters >= 20)
+            dbg_total_edges = 0
+            dbg_eq0 = 0
+            dbg_leq0 = 0
+            dbg_min_slack_est = None
+            dbg_max_slack_est = None
+            zero_deg = 0
             # log_mem("Start Iter")
 
             if iteration % 10 == 0:
                 print(f"    [Iter {iteration}] Free: {num_free}")
 
             # A. Maintenance: Max yA per Center
-            if use_cuda:
-                torch.cuda.synchronize()
+            maybe_sync()
             yA_expanded = self.yA[self.red_indices]
             center_max_yA = torch.zeros(
                 len(self.red_offsets)-1, device=self.device, dtype=torch.int32
@@ -450,13 +472,11 @@ class GPUClusteredSolver:
                 reduce="amax",
                 include_self=False,
             )
-            if use_cuda:
-                torch.cuda.synchronize()
+            maybe_sync()
             # log_mem("After Maint")
             
             # B. Push (Ragged Gather)
-            if use_cuda:
-                torch.cuda.synchronize()
+            maybe_sync()
             push_batch_size = 5000
             all_win_b = []
             all_win_c = []
@@ -466,10 +486,27 @@ class GPUClusteredSolver:
             ends_all = self.blue_offsets[B_free + 1]
             lengths_all = ends_all - starts_all
             total_edges = int(lengths_all.sum().item())
+            if should_dbg:
+                dbg_total_edges = total_edges
+                zero_deg = int((lengths_all == 0).sum().item())
+                if zero_deg > 0:
+                    print(f"[DBG it={iteration}] zero-degree free points: {zero_deg}/{num_free}")
             if total_edges == 0:
-                if use_cuda:
-                    torch.cuda.synchronize()
+                maybe_sync()
                 self.yB[B_free] += 1
+                if should_dbg:
+                    if dbg_min_slack_est is None:
+                        dbg_min_slack_est = 0
+                        dbg_max_slack_est = 0
+                    matched_now = self.N - num_free
+                    delta_matched = 0 if prev_matched_count is None else matched_now - prev_matched_count
+                    print(
+                        f"[DBG it={iteration}] free={num_free} stuck={stuck_iters} edges={dbg_total_edges} "
+                        f"zeroDeg={zero_deg} eq0={dbg_eq0} leq0={dbg_leq0} "
+                        f"minSlack={dbg_min_slack_est} maxSlack={dbg_max_slack_est} "
+                        f"matched={matched_now}/{self.N} deltaMatched={delta_matched}"
+                    )
+                prev_matched_count = self.N - num_free
                 continue
 
             for i in range(0, num_free, push_batch_size):
@@ -506,9 +543,18 @@ class GPUClusteredSolver:
                     - center_max_yA[active_c_ids]
                 )
 
+                if should_dbg:
+                    dbg_eq0 += int((slacks_est == 0).sum().item())
+                    dbg_leq0 += int((slacks_est <= 0).sum().item())
+                    local_min = int(slacks_est.min().item())
+                    local_max = int(slacks_est.max().item())
+                    if dbg_min_slack_est is None or local_min < dbg_min_slack_est:
+                        dbg_min_slack_est = local_min
+                    if dbg_max_slack_est is None or local_max > dbg_max_slack_est:
+                        dbg_max_slack_est = local_max
+
                 candidates = slacks_est == 0
-                if use_cuda:
-                    torch.cuda.synchronize()
+                maybe_sync()
                 # log_mem("After Push")
 
                 if candidates.any():
@@ -544,11 +590,13 @@ class GPUClusteredSolver:
                 win_c = torch.cat(all_win_c)
                 win_l_b = torch.cat(all_win_l_b)
             del all_win_b, all_win_c, all_win_l_b
+            if should_dbg and dbg_min_slack_est is None:
+                dbg_min_slack_est = 0
+                dbg_max_slack_est = 0
 
             if win_b.numel() != 0:
                 # C. Resolve
-                if use_cuda:
-                    torch.cuda.synchronize()
+                maybe_sync()
                 # We have (Blue, Center) pairs that MIGHT have a match.
 
                 free_red_mask = self.MA[self.red_indices] == -1
@@ -636,23 +684,30 @@ class GPUClusteredSolver:
                         l_r_final,
                     )
                 del red_ids, red_levels, red_c_ids, free_red_mask, win_b, win_c, win_l_b
-                if use_cuda:
-                    torch.cuda.synchronize()
+                maybe_sync()
             # log_mem("After Resolve")
 
             # D. Relabel
-            if use_cuda:
-                torch.cuda.synchronize()
+            maybe_sync()
             still_free = torch.nonzero(self.MB == -1).squeeze(1)
             self.yB[still_free] += 1
             
             matched_r = torch.nonzero(self.MA != -1).squeeze(1)
             self.yA[matched_r] -= 1
-            if use_cuda:
-                torch.cuda.synchronize()
+            maybe_sync()
             # log_mem("After Relabel")
             if use_cuda:
                 torch.cuda.empty_cache()
+            matched_now = self.N - still_free.numel()
+            if should_dbg:
+                delta_matched = 0 if prev_matched_count is None else matched_now - prev_matched_count
+                print(
+                    f"[DBG it={iteration}] free={num_free} stuck={stuck_iters} edges={dbg_total_edges} "
+                    f"zeroDeg={zero_deg} eq0={dbg_eq0} leq0={dbg_leq0} "
+                    f"minSlack={dbg_min_slack_est} maxSlack={dbg_max_slack_est} "
+                    f"matched={matched_now}/{self.N} deltaMatched={delta_matched}"
+                )
+            prev_matched_count = matched_now
             
             if iteration > 50000:
                 # print("Max Iterations Reached.")

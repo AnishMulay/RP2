@@ -510,7 +510,18 @@ class GPUClusteredSolver:
         # print(f"\n[Step 3] Starting Push-Relabel Loop...")
         iteration = 0
         use_cuda = self.device.type == "cuda"
+        DEBUG = False
+        DEBUG_EVERY = 50
+        DEBUG_SYNC = False
+
+        def maybe_sync():
+            if use_cuda and DEBUG_SYNC:
+                torch.cuda.synchronize()
         
+        prev_num_free = None
+        stuck_iters = 0
+        prev_matched_count = None
+
         while True:
             # Check convergence
             B_free = torch.nonzero(self.MB == -1).squeeze(1)
@@ -520,6 +531,18 @@ class GPUClusteredSolver:
                 break
             
             iteration += 1
+            if prev_num_free is not None and num_free == prev_num_free:
+                stuck_iters += 1
+            else:
+                stuck_iters = 0
+            prev_num_free = num_free
+            should_dbg = DEBUG and (iteration % DEBUG_EVERY == 0 or stuck_iters >= 20)
+            dbg_total_edges = 0
+            dbg_eq0 = 0
+            dbg_leq0 = 0
+            dbg_min_slack_est = None
+            dbg_max_slack_est = None
+            zero_deg = 0
             if iteration % 10 == 0:
                 print(f"    [Iter {iteration}] Free: {num_free}")
 
@@ -527,7 +550,7 @@ class GPUClusteredSolver:
             # A. Price Refinement (Global Update)
             # ---------------------------------------------------------
             # Calculate max(yA) per cluster
-            if use_cuda: torch.cuda.synchronize()
+            maybe_sync()
             
             yA_expanded = self.yA[self.red_indices]
             center_max_yA = torch.zeros(
@@ -545,13 +568,22 @@ class GPUClusteredSolver:
             # ---------------------------------------------------------
             # B. Push Phase (Ragged Gather)
             # ---------------------------------------------------------
-            if use_cuda: torch.cuda.synchronize()
+            maybe_sync()
             
             # We process free Blue points in batches to manage memory
             push_batch_size = 5000 
             all_win_b = []
             all_win_c = []
             all_win_l_b = []
+
+            if should_dbg:
+                starts_all = self.blue_offsets[B_free]
+                ends_all = self.blue_offsets[B_free + 1]
+                lengths_all = ends_all - starts_all
+                dbg_total_edges = int(lengths_all.sum().item())
+                zero_deg = int((lengths_all == 0).sum().item())
+                if zero_deg > 0:
+                    print(f"[DBG it={iteration}] zero-degree free points: {zero_deg}/{num_free}")
 
             for i in range(0, num_free, push_batch_size):
                 chunk = B_free[i : i + push_batch_size]
@@ -594,6 +626,16 @@ class GPUClusteredSolver:
                     - center_max_yA[active_c_ids]
                 )
 
+                if should_dbg:
+                    dbg_eq0 += int((slacks_est == 0).sum().item())
+                    dbg_leq0 += int((slacks_est <= 0).sum().item())
+                    local_min = int(slacks_est.min().item())
+                    local_max = int(slacks_est.max().item())
+                    if dbg_min_slack_est is None or local_min < dbg_min_slack_est:
+                        dbg_min_slack_est = local_min
+                    if dbg_max_slack_est is None or local_max > dbg_max_slack_est:
+                        dbg_max_slack_est = local_max
+
                 candidates = slacks_est == 0
                 
                 if candidates.any():
@@ -610,6 +652,9 @@ class GPUClusteredSolver:
                 win_b = torch.cat(all_win_b)
                 win_c = torch.cat(all_win_c)
                 win_l_b = torch.cat(all_win_l_b)
+            if should_dbg and dbg_min_slack_est is None:
+                dbg_min_slack_est = 0
+                dbg_max_slack_est = 0
             
             # ---------------------------------------------------------
             # C. Resolve Phase (Conflict Resolution)
@@ -695,6 +740,16 @@ class GPUClusteredSolver:
             # Decrease potential of matched Red points to maintain constraints
             matched_r = torch.nonzero(self.MA != -1).squeeze(1)
             self.yA[matched_r] -= 1
+            matched_now = self.N - still_free.numel()
+            if should_dbg:
+                delta_matched = 0 if prev_matched_count is None else matched_now - prev_matched_count
+                print(
+                    f"[DBG it={iteration}] free={num_free} stuck={stuck_iters} edges={dbg_total_edges} "
+                    f"zeroDeg={zero_deg} eq0={dbg_eq0} leq0={dbg_leq0} "
+                    f"minSlack={dbg_min_slack_est} maxSlack={dbg_max_slack_est} "
+                    f"matched={matched_now}/{self.N} deltaMatched={delta_matched}"
+                )
+            prev_matched_count = matched_now
             
             if iteration > 50000:
                 # print("Max Iterations Reached.")
