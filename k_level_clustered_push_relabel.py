@@ -346,7 +346,7 @@ class GPUClusteredSolver:
                 }
             clusters = int(torch.unique(centers).numel())
             max_level = levels.max().to(torch.long)
-            bucket_keys = centers.to(torch.long) * (max_level + 1) + levels.to(torch.long)
+            bucket_keys = (centers.to(torch.long) * (max_level + 1)) + levels.to(torch.long)
             buckets = int(torch.unique(bucket_keys).numel())
             avg_cluster = edges / max(clusters, 1)
             mem_mb = edges * 12 / (1024 ** 2)
@@ -444,7 +444,7 @@ class GPUClusteredSolver:
         
         # Sort by (Center, Level)
         max_red_level = red_levels.max().to(torch.long)
-        r_sort_key = red_centers.to(torch.long) * (max_red_level + 1) + red_levels.to(torch.long)
+        r_sort_key = (red_centers.to(torch.long) * (max_red_level + 1)) + red_levels.to(torch.long)
         perm_r = torch.argsort(r_sort_key)
         
         self.red_indices = red_points[perm_r].to(device=self.device, dtype=torch.int32)
@@ -682,7 +682,7 @@ class GPUClusteredSolver:
                     max_level = torch.maximum(win_l_b.max(), red_levels.max()).to(torch.long)
                     key_scale = max_level + 1
 
-                    b_sort_key = win_c.to(torch.long) * key_scale + win_l_b.to(torch.long)
+                    b_sort_key = (win_c.to(torch.long) * key_scale) + win_l_b.to(torch.long)
                     b_perm = torch.argsort(b_sort_key)
                     
                     b_sorted = win_b[b_perm]
