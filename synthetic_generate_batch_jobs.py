@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 import os
+import shutil
 from pathlib import Path
 
 # -----------------------
 # Config (edit if needed)
 # -----------------------
-MIN_N = 5000
+MIN_N = 500
 MAX_N = 30000
-STEP  = 1000
+STEP  = 500
 
 TIME_LIMIT = "01:00:00"
 PARTITION  = "rtx2060super"
@@ -26,6 +27,7 @@ BASE_DIR = Path("synthetic_batch")
 SCRIPTS_DIR = BASE_DIR / "scripts"
 LOGS_DIR = BASE_DIR / "logs"
 RESULTS_DIR = BASE_DIR / "results"
+AGG_DIR = BASE_DIR / "agg"
 
 SLURM_TEMPLATE = """#!/bin/bash
 #SBATCH -J synthetic_n{n}
@@ -63,8 +65,10 @@ echo "Finished synthetic job for N={n}"
 """
 
 def main():
-    # Ensure directories exist
-    for d in [SCRIPTS_DIR, LOGS_DIR, RESULTS_DIR]:
+    # Reset batch directories so we always start clean
+    for d in [SCRIPTS_DIR, LOGS_DIR, RESULTS_DIR, AGG_DIR]:
+        if d.exists():
+            shutil.rmtree(d)
         d.mkdir(parents=True, exist_ok=True)
 
     ns = list(range(MIN_N, MAX_N + 1, STEP))
