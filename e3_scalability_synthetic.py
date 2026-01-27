@@ -83,7 +83,6 @@ def main():
             writer.writerow([dataset, n, args.dim, args.epsilon, args.k,
                              "2-Level", status, "", "", "", "", ""])
             f.flush()
-            break  # break out of loop, as larger n will also fail
         finally:
             try: del solver2
             except: pass
