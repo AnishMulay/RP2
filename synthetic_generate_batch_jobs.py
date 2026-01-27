@@ -18,7 +18,7 @@ CONDA_ENV = "clusterenv"
 # Experiment defaults
 EPSILON = 0.01
 K_LEVELS = 4
-TRIALS = 1
+TRIALS = 10
 SEED = 42
 
 REPO_ENTRYPOINT = "e1_synthetic_vs_exact.py"

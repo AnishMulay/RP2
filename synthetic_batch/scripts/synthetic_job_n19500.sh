@@ -26,7 +26,7 @@ python -u e1_synthetic_vs_exact.py \
   --n_values 19500 \
   --epsilon 0.01 \
   --k 4 \
-  --trials 1 \
+  --trials 10 \
   --seed 42 \
   --csv "synthetic_batch/results/results_n19500.csv"
 
