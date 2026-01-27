@@ -270,23 +270,24 @@ class FastGPUMultiLevelClustering:
 # ==========================================
 
 class GPUClusteredSolver:
-    def __init__(self, P_red, P_blue, epsilon, k=4, metric="L2"):
+    def __init__(self, P_red, P_blue, epsilon, k=4, batch_size=None, metric="L2"):
         self.device = P_red.device
         self.N = P_red.shape[0]
         self.epsilon = epsilon
         self.k = k
         self.P_red = P_red
         self.P_blue = P_blue
+        self.batch_size = 2048 if batch_size is None else batch_size
         self.metric = metric
         
         print("="*60)
-        print(f"[Init] Config: N={self.N}, Eps={epsilon}, Levels={k}, Metric={metric}, Device={self.device}")
+        print(f"[Init] Config: N={self.N}, Eps={epsilon}, Levels={k}, Batch={self.batch_size}, Metric={metric}, Device={self.device}")
         
         # 1. Multi-Level Clustering
         print("[Step 1] Running Multi-Level Hierarchical Clustering...")
         t0 = time.time()
         cluster_engine = FastGPUMultiLevelClustering(
-            epsilon, k=k, batch_size=2048, metric=metric
+            epsilon, k=k, batch_size=self.batch_size, metric=metric
         )
         blue_coo, red_coo, levels_red, levels_blue = cluster_engine.run(P_red, P_blue)
         torch.cuda.synchronize()

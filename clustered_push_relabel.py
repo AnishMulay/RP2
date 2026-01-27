@@ -193,22 +193,23 @@ class FastGPUClustering:
 # ==========================================
 
 class GPUClusteredSolver:
-    def __init__(self, P_red, P_blue, epsilon, metric="L2"):
+    def __init__(self, P_red, P_blue, epsilon, batch_size=None, metric="L2"):
         self.device = P_red.device
         self.N = P_red.shape[0]
         self.epsilon = epsilon
         self.P_red = P_red
         self.P_blue = P_blue
+        self.batch_size = 1024 if batch_size is None else batch_size
         self.metric = metric
         
         print("="*60)
-        print(f"[Init] Configuration: N={self.N}, Eps={epsilon}, Metric={metric}, Device={self.device}")
+        print(f"[Init] Configuration: N={self.N}, Eps={epsilon}, Batch={self.batch_size}, Metric={metric}, Device={self.device}")
         
         # 1. Clustering
         print("[Step 1] Running Geometric Clustering...")
         t0 = time.time()
         cluster_engine = FastGPUClustering(
-            epsilon, batch_size=1024, micro_batch_size=32, metric=metric
+            epsilon, batch_size=self.batch_size, micro_batch_size=32, metric=metric
         )
         blue_coo, red_coo, r_mask, b_mask = cluster_engine.run(P_red, P_blue)
         torch.cuda.synchronize()
