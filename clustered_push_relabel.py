@@ -222,6 +222,8 @@ class GPUClusteredSolver:
         self._build_csr_from_coo_cpu(blue_coo, red_coo, r_mask, b_mask)
         print(f"         Indexing done in {time.time()-t0:.2f}s")
         
+        print("   [Debug] Starting GC and State Init...")
+        t_setup = time.time()
         del blue_coo, red_coo, cluster_engine
         gc.collect()
         torch.cuda.empty_cache()
@@ -231,6 +233,8 @@ class GPUClusteredSolver:
         self.yB = torch.full((self.N,), 1, device=self.device, dtype=torch.int32)
         self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
         self.MB = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
+        torch.cuda.synchronize()
+        print(f"   [Debug] GC & State Init finished in {time.time() - t_setup:.4f}s")
 
     def cleanup_remaining_points(self):
         free_b = torch.nonzero(self.MB == -1).squeeze(1)
@@ -403,6 +407,7 @@ class GPUClusteredSolver:
         print(f"         Avg Degree: {(self.blue_center_indices.numel() + self.red_indices.numel())/N:.2f}")
 
     def solve(self):
+        print("[Debug] Entering solve() method...")
         # print(f"\n[Step 3] Starting Push-Relabel Loop...")
         iteration = 0
         use_cuda = self.device.type == "cuda"
@@ -426,8 +431,7 @@ class GPUClusteredSolver:
             # log_mem("Start Iter")
 
             if iteration % 10 == 0:
-                # print(f"    [Iter {iteration}] Free: {num_free}")
-                pass
+                print(f"    [Iter {iteration}] Free: {num_free}")
 
             # A. Maintenance: Max yA per Center
             if use_cuda:

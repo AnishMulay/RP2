@@ -301,6 +301,8 @@ class GPUClusteredSolver:
         print(f"         Indexing done in {time.time()-t0:.2f}s")
         
         # Cleanup
+        print("   [Debug] Starting GC and State Init...")
+        t_setup = time.time()
         del blue_coo, red_coo, levels_red, levels_blue, cluster_engine
         gc.collect()
         torch.cuda.empty_cache()
@@ -310,6 +312,8 @@ class GPUClusteredSolver:
         self.yB = torch.full((self.N,), 1, device=self.device, dtype=torch.int32)
         self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
         self.MB = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
+        torch.cuda.synchronize()
+        print(f"   [Debug] GC & State Init finished in {time.time() - t_setup:.4f}s")
 
     def _build_csr_from_coo_cpu(self, blue_coo, red_coo, levels_red, levels_blue):
         """
@@ -501,6 +505,7 @@ class GPUClusteredSolver:
         print(f"Avg {label} Cost: {avg_cost.item():.4f}")
 
     def solve(self):
+        print("[Debug] Entering solve() method...")
         # print(f"\n[Step 3] Starting Push-Relabel Loop...")
         iteration = 0
         use_cuda = self.device.type == "cuda"
@@ -515,8 +520,7 @@ class GPUClusteredSolver:
             
             iteration += 1
             if iteration % 10 == 0:
-                # print(f"    [Iter {iteration}] Free: {num_free}")
-                pass
+                print(f"    [Iter {iteration}] Free: {num_free}")
 
             # ---------------------------------------------------------
             # A. Price Refinement (Global Update)
