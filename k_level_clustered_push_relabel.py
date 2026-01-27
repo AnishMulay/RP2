@@ -571,6 +571,16 @@ class GPUClusteredSolver:
                 reduce="amax",
                 include_self=False,
             )
+            center_max_L_A = torch.zeros(
+                len(self.red_offsets)-1, device=self.device, dtype=torch.int32
+            )
+            center_max_L_A.scatter_reduce_(
+                0,
+                self.red_expand_center_ids.to(torch.long),
+                self.red_levels,
+                reduce="amax",
+                include_self=False,
+            )
             
             # ---------------------------------------------------------
             # B. Push Phase (Ragged Gather)
@@ -632,6 +642,12 @@ class GPUClusteredSolver:
                     - self.yB[active_b_ids] 
                     - center_max_yA[active_c_ids]
                 )
+                active_max_L_A = center_max_L_A[active_c_ids]
+                slacks_high = (
+                    2 * torch.maximum(active_b_levels, active_max_L_A)
+                    - self.yB[active_b_ids]
+                    - center_max_yA[active_c_ids]
+                )
 
                 if should_dbg:
                     dbg_eq0 += int((slacks_est == 0).sum().item())
@@ -643,7 +659,7 @@ class GPUClusteredSolver:
                     if dbg_max_slack_est is None or local_max > dbg_max_slack_est:
                         dbg_max_slack_est = local_max
 
-                candidates = slacks_est == 0
+                candidates = (slacks_est <= 0) & (slacks_high >= 0)
                 
                 if candidates.any():
                     all_win_b.append(active_b_ids[candidates])
