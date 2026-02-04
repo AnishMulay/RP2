@@ -228,16 +228,14 @@ class GPUClusteredSolver:
         speed_mps,
         k=4,
         batch_size=2048,
-        stop_threshold=0.01,
-        min_free_count=0,
+        threshold=0,
     ):
         self.device = P_red.device
         self.N = P_red.shape[0]
         self.epsilon = epsilon
         self.k = k
         self.speed_mps = speed_mps
-        self.stop_threshold = stop_threshold
-        self.min_free_count = min_free_count
+        self.threshold = threshold
         self.P_red = P_red
         self.P_blue = P_blue
         self.T_red = T_red   # Drop-off Times (Points A)
@@ -247,7 +245,7 @@ class GPUClusteredSolver:
         print("="*60)
         print(
             f"[Init] N={self.N}, Eps={epsilon}, Levels={k}, Speed={speed_mps} m/s, "
-            f"StopThreshold={stop_threshold}, MinFreeCount={min_free_count}, Device={self.device}"
+            f"Threshold={threshold}, Device={self.device}"
         )
         
         # 1. Multi-Level Clustering (Spatial Only)
@@ -360,18 +358,14 @@ class GPUClusteredSolver:
         use_cuda = self.device.type == "cuda"
         self.stat_candidates_total = 0
         self.stat_candidates_rejected = 0
-        
-        # Limit max iterations for safety
-        MAX_ITER = 20000 
-        
-        while iteration < MAX_ITER:
+
+        while True:
             # Check convergence
             B_free = torch.nonzero(self.MB == -1).squeeze(1)
             num_free = B_free.numel()
-            if num_free <= self.stop_threshold * self.N or num_free <= self.min_free_count:
+            if num_free <= self.threshold:
                 print(
-                    f"[Converged] Free points {num_free} "
-                    f"(stop_threshold*N={self.stop_threshold * self.N:.2f}, min_free_count={self.min_free_count})."
+                    f"[Converged] Free points {num_free} <= Threshold {self.threshold}."
                 )
                 break
             
@@ -559,8 +553,7 @@ def main():
     parser.add_argument("--device", type=str, default=None, help="cuda or cpu")
     parser.add_argument("--k-levels", type=int, default=4, help="Hierarchy levels")
     parser.add_argument("--epsilon", type=float, default=100.0, help="Bucket width (meters approx)")
-    parser.add_argument("--stop-threshold", type=float, default=0.01, help="Convergence threshold as a fraction of N")
-    parser.add_argument("--min-free-count", type=int, default=0, help="Converge when remaining free points <= this count")
+    parser.add_argument("--threshold", type=int, default=0, help="Converge when remaining free points <= this threshold")
     parser.add_argument("--speed-mps", type=float, default=8.0, help="Avg taxi speed in m/s")
     parser.add_argument("--out", type=str, default=None, help="Output JSON path")
     
@@ -609,8 +602,7 @@ def main():
         speed_mps=args.speed_mps,
         k=args.k_levels,
         batch_size=4096,
-        stop_threshold=args.stop_threshold,
-        min_free_count=args.min_free_count,
+        threshold=args.threshold,
     )
     
     start_time = time.time()
