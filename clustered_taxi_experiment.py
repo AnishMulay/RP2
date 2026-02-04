@@ -11,7 +11,6 @@ import math
 import sys
 import time
 from pathlib import Path
-from dataclasses import dataclass, asdict
 
 import torch
 import numpy as np
@@ -92,8 +91,8 @@ def load_taxi_csv(filepath, n=None, seed=42):
     print(f"[Loader] {len(df)} trips loaded.")
     
     # Parse dates
-    df['pickup_datetime'] = pd.to_datetime(df['pickup_datetime'])
-    df['dropoff_datetime'] = pd.to_datetime(df['dropoff_datetime'])
+    df['pickup_datetime'] = pd.to_datetime(df['pickup_datetime'], format='mixed')
+    df['dropoff_datetime'] = pd.to_datetime(df['dropoff_datetime'], format='mixed')
     
     # Convert time to relative seconds (float) from the earliest time in the batch
     min_time = min(df['pickup_datetime'].min(), df['dropoff_datetime'].min())
@@ -219,12 +218,26 @@ class FastGPUMultiLevelClustering:
 # ==========================================
 
 class GPUClusteredSolver:
-    def __init__(self, P_red, P_blue, T_red, T_blue, epsilon, speed_mps, k=4, batch_size=2048):
+    def __init__(
+        self,
+        P_red,
+        P_blue,
+        T_red,
+        T_blue,
+        epsilon,
+        speed_mps,
+        k=4,
+        batch_size=2048,
+        stop_threshold=0.01,
+        min_free_count=0,
+    ):
         self.device = P_red.device
         self.N = P_red.shape[0]
         self.epsilon = epsilon
         self.k = k
         self.speed_mps = speed_mps
+        self.stop_threshold = stop_threshold
+        self.min_free_count = min_free_count
         self.P_red = P_red
         self.P_blue = P_blue
         self.T_red = T_red   # Drop-off Times (Points A)
@@ -232,7 +245,10 @@ class GPUClusteredSolver:
         self.batch_size = batch_size
         
         print("="*60)
-        print(f"[Init] N={self.N}, Eps={epsilon}, Levels={k}, Speed={speed_mps} m/s, Device={self.device}")
+        print(
+            f"[Init] N={self.N}, Eps={epsilon}, Levels={k}, Speed={speed_mps} m/s, "
+            f"StopThreshold={stop_threshold}, MinFreeCount={min_free_count}, Device={self.device}"
+        )
         
         # 1. Multi-Level Clustering (Spatial Only)
         print("[Step 1] Running Spatial Multi-Level Clustering...")
@@ -255,6 +271,8 @@ class GPUClusteredSolver:
         self.yB = torch.full((self.N,), 1, device=self.device, dtype=torch.int32)
         self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
         self.MB = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
+        self.stat_candidates_total = 0
+        self.stat_candidates_rejected = 0
 
     def _build_csr_from_coo_cpu(self, blue_coo, red_coo, levels_red, levels_blue):
         # Unchanged from original except for variable names
@@ -340,6 +358,8 @@ class GPUClusteredSolver:
         print("[Step 3] Starting Push-Relabel Loop (with Time/Speed Constraints)...")
         iteration = 0
         use_cuda = self.device.type == "cuda"
+        self.stat_candidates_total = 0
+        self.stat_candidates_rejected = 0
         
         # Limit max iterations for safety
         MAX_ITER = 20000 
@@ -348,13 +368,19 @@ class GPUClusteredSolver:
             # Check convergence
             B_free = torch.nonzero(self.MB == -1).squeeze(1)
             num_free = B_free.numel()
-            if num_free <= self.epsilon * self.N:
-                print(f"[Converged] Free points {num_free} <= Threshold.")
+            if num_free <= self.stop_threshold * self.N or num_free <= self.min_free_count:
+                print(
+                    f"[Converged] Free points {num_free} "
+                    f"(stop_threshold*N={self.stop_threshold * self.N:.2f}, min_free_count={self.min_free_count})."
+                )
                 break
             
             iteration += 1
             if iteration % 50 == 0:
-                print(f"    [Iter {iteration}] Free: {num_free}")
+                print(
+                    f"    [Iter {iteration}] Free: {num_free} | "
+                    f"Speed Reject: {self.stat_candidates_rejected}/{self.stat_candidates_total}"
+                )
 
             if use_cuda: torch.cuda.synchronize()
 
@@ -476,6 +502,9 @@ class GPUClusteredSolver:
                         
                         # === CRITICAL MODIFICATION: TIME & SPEED CONSTRAINT ===
                         if b_match.numel() > 0:
+                            proposed_pairs = int(b_match.numel())
+                            self.stat_candidates_total += proposed_pairs
+
                             # Calculate Euclidean Distance for candidates
                             # Shape (K, 2)
                             p_b_coords = self.P_blue[b_match]
@@ -494,6 +523,8 @@ class GPUClusteredSolver:
                             t_dropoff = self.T_red[r_match]
                             
                             is_reachable = t_pickup >= (t_dropoff + travel_time_sec)
+                            rejected_pairs = proposed_pairs - int(is_reachable.sum().item())
+                            self.stat_candidates_rejected += rejected_pairs
                             
                             # Filter
                             b_match = b_match[is_reachable]
@@ -528,6 +559,8 @@ def main():
     parser.add_argument("--device", type=str, default=None, help="cuda or cpu")
     parser.add_argument("--k-levels", type=int, default=4, help="Hierarchy levels")
     parser.add_argument("--epsilon", type=float, default=100.0, help="Bucket width (meters approx)")
+    parser.add_argument("--stop-threshold", type=float, default=0.01, help="Convergence threshold as a fraction of N")
+    parser.add_argument("--min-free-count", type=int, default=0, help="Converge when remaining free points <= this count")
     parser.add_argument("--speed-mps", type=float, default=8.0, help="Avg taxi speed in m/s")
     parser.add_argument("--out", type=str, default=None, help="Output JSON path")
     
@@ -575,7 +608,9 @@ def main():
         epsilon=args.epsilon,
         speed_mps=args.speed_mps,
         k=args.k_levels,
-        batch_size=4096 
+        batch_size=4096,
+        stop_threshold=args.stop_threshold,
+        min_free_count=args.min_free_count,
     )
     
     start_time = time.time()
@@ -587,7 +622,7 @@ def main():
     N = P_red.shape[0]
     
     output = {
-        "params": asdict(argparse.Namespace(**vars(args))),
+        "params": vars(args),
         "results": {
             "total_points": N,
             "matched_points": matched_count,
