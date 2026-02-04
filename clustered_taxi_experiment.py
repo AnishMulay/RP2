@@ -307,8 +307,10 @@ class GPUClusteredSolver:
         red_points = all_points[red_mask]
         red_levels = all_levels[red_mask]
         
-        max_red_level = red_levels.max().to(torch.long)
-        r_sort_key = (red_centers.to(torch.long) * (max_red_level + 1)) + red_levels.to(torch.long)
+        red_times = self.T_red[red_points.to(self.T_red.device)].to(
+            device=red_centers.device, dtype=torch.float64
+        )
+        r_sort_key = (red_centers.to(torch.float64) * 1_000_000) + red_times
         perm_r = torch.argsort(r_sort_key)
         
         self.red_indices = red_points[perm_r].to(device=self.device, dtype=torch.int32)
@@ -354,6 +356,7 @@ class GPUClusteredSolver:
 
     def solve(self):
         print("[Step 3] Starting Push-Relabel Loop (with Time/Speed Constraints)...")
+        self.stat_rejected = 0
         iteration = 0
         use_cuda = self.device.type == "cuda"
         self.stat_candidates_total = 0
@@ -372,8 +375,7 @@ class GPUClusteredSolver:
             iteration += 1
             if iteration % 50 == 0:
                 print(
-                    f"    [Iter {iteration}] Free: {num_free} | "
-                    f"Speed Reject: {self.stat_candidates_rejected}/{self.stat_candidates_total}"
+                    f"    [Iter {iteration}] Free: {num_free} | Rejected: {self.stat_rejected}"
                 )
 
             if use_cuda: torch.cuda.synchronize()
@@ -450,7 +452,7 @@ class GPUClusteredSolver:
                     max_level = torch.maximum(win_l_b.max(), red_levels.max()).to(torch.long)
                     key_scale = max_level + 1
 
-                    b_sort_key = (win_c.to(torch.long) * key_scale) + win_l_b.to(torch.long)
+                    b_sort_key = (win_c.to(torch.float64) * 1_000_000) + self.T_blue[win_b].to(torch.float64)
                     b_perm = torch.argsort(b_sort_key)
                     b_sorted = win_b[b_perm]
                     c_sorted = win_c[b_perm]
@@ -517,6 +519,8 @@ class GPUClusteredSolver:
                             t_dropoff = self.T_red[r_match]
                             
                             is_reachable = t_pickup >= (t_dropoff + travel_time_sec)
+                            num_rejected = int((~is_reachable).sum().item())
+                            self.stat_rejected += num_rejected
                             rejected_pairs = proposed_pairs - int(is_reachable.sum().item())
                             self.stat_candidates_rejected += rejected_pairs
                             
