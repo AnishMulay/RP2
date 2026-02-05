@@ -2,10 +2,9 @@
 
 > **⚠️ ACADEMIC NOTICE / COPYRIGHT WARNING**
 >
-> This repository contains the ongoing research code for the "[Your Project/Paper Title]" project.
+> This repository contains the ongoing research code for an ongoing project.
 >
 > **Status:** Active Research / Work in Progress
-> **Copyright:** © 2026 [Your Name]. All Rights Reserved.
 >
 > **Usage Policy:**
 > This code is publicly accessible for **transparency and academic verification purposes only**.
