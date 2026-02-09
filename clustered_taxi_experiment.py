@@ -373,8 +373,6 @@ class GPUClusteredSolver:
                 break
             
             iteration += 1
-            should_debug_iter = iteration % 50 == 0
-
             if use_cuda: torch.cuda.synchronize()
 
             # ---------------------------------------------------------
@@ -439,7 +437,6 @@ class GPUClusteredSolver:
             # ---------------------------------------------------------
             # C. Resolve Phase (Conflict Resolution + CONSTRAINT CHECK)
             # ---------------------------------------------------------
-            sort_strategy = "N/A (No Candidates)"
             count_proposed = 0
             count_speed_rejected = 0
             count_pushed = 0
@@ -452,13 +449,7 @@ class GPUClusteredSolver:
 
                 if red_ids.numel() != 0:
                     max_level = torch.maximum(win_l_b.max(), red_levels.max()).to(torch.long)
-                    key_scale = max_level + 1
-
                     b_sort_key = (win_c.to(torch.float64) * 1_000_000) + self.T_blue[win_b].to(torch.float64)
-                    if (b_sort_key % 1 > 0).any():
-                        sort_strategy = "TIME (Center + Timestamp)"
-                    else:
-                        sort_strategy = "LEVEL (Center + Level)"
                     b_perm = torch.argsort(b_sort_key)
                     b_sorted = win_b[b_perm]
                     c_sorted = win_c[b_perm]
@@ -541,12 +532,11 @@ class GPUClusteredSolver:
                                 self.MB[b_match] = r_match.to(self.MB.dtype)
                                 self.MA[r_match] = b_match.to(self.MA.dtype)
 
-            if should_debug_iter:
-                print(f"[Iter {iteration} Analysis]")
-                print(f"  Strategy:         {sort_strategy}")
-                print(f"  Candidates:       {count_proposed}")
-                print(f"  Speed Rejected:   {count_speed_rejected}")
-                print(f"  Actually Pushed:  {count_pushed}")
+            if iteration % 50 == 0:
+                print(
+                    f"[Iter {iteration}] Free: {num_free} | Proposed: {count_proposed} "
+                    f"| Speed Rejected: {count_speed_rejected} | Pushed: {count_pushed}"
+                )
 
             # ---------------------------------------------------------
             # D. Relabel Phase
