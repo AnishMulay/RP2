@@ -373,10 +373,7 @@ class GPUClusteredSolver:
                 break
             
             iteration += 1
-            if iteration % 50 == 0:
-                print(
-                    f"    [Iter {iteration}] Free: {num_free} | Rejected: {self.stat_rejected}"
-                )
+            should_debug_iter = iteration % 50 == 0
 
             if use_cuda: torch.cuda.synchronize()
 
@@ -442,6 +439,11 @@ class GPUClusteredSolver:
             # ---------------------------------------------------------
             # C. Resolve Phase (Conflict Resolution + CONSTRAINT CHECK)
             # ---------------------------------------------------------
+            sort_strategy = "N/A (No Candidates)"
+            count_proposed = 0
+            count_speed_rejected = 0
+            count_pushed = 0
+
             if win_b.numel() != 0:
                 free_red_mask = self.MA[self.red_indices] == -1
                 red_ids = self.red_indices[free_red_mask]
@@ -453,6 +455,10 @@ class GPUClusteredSolver:
                     key_scale = max_level + 1
 
                     b_sort_key = (win_c.to(torch.float64) * 1_000_000) + self.T_blue[win_b].to(torch.float64)
+                    if (b_sort_key % 1 > 0).any():
+                        sort_strategy = "TIME (Center + Timestamp)"
+                    else:
+                        sort_strategy = "LEVEL (Center + Level)"
                     b_perm = torch.argsort(b_sort_key)
                     b_sorted = win_b[b_perm]
                     c_sorted = win_c[b_perm]
@@ -498,7 +504,8 @@ class GPUClusteredSolver:
                         
                         # === CRITICAL MODIFICATION: TIME & SPEED CONSTRAINT ===
                         if b_match.numel() > 0:
-                            proposed_pairs = int(b_match.numel())
+                            count_proposed = int(b_match.numel())
+                            proposed_pairs = count_proposed
                             self.stat_candidates_total += proposed_pairs
 
                             # Calculate Euclidean Distance for candidates
@@ -520,6 +527,7 @@ class GPUClusteredSolver:
                             
                             is_reachable = t_pickup >= (t_dropoff + travel_time_sec)
                             num_rejected = int((~is_reachable).sum().item())
+                            count_speed_rejected = num_rejected
                             self.stat_rejected += num_rejected
                             rejected_pairs = proposed_pairs - int(is_reachable.sum().item())
                             self.stat_candidates_rejected += rejected_pairs
@@ -527,10 +535,18 @@ class GPUClusteredSolver:
                             # Filter
                             b_match = b_match[is_reachable]
                             r_match = r_match[is_reachable]
+                            count_pushed = int(b_match.numel())
 
                             if b_match.numel() != 0:
                                 self.MB[b_match] = r_match.to(self.MB.dtype)
                                 self.MA[r_match] = b_match.to(self.MA.dtype)
+
+            if should_debug_iter:
+                print(f"[Iter {iteration} Analysis]")
+                print(f"  Strategy:         {sort_strategy}")
+                print(f"  Candidates:       {count_proposed}")
+                print(f"  Speed Rejected:   {count_speed_rejected}")
+                print(f"  Actually Pushed:  {count_pushed}")
 
             # ---------------------------------------------------------
             # D. Relabel Phase
