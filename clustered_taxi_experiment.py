@@ -361,6 +361,9 @@ class GPUClusteredSolver:
         use_cuda = self.device.type == "cuda"
         self.stat_candidates_total = 0
         self.stat_candidates_rejected = 0
+        sum_proposed = 0
+        sum_rejected = 0
+        sum_pushed = 0
 
         while True:
             # Check convergence
@@ -532,11 +535,18 @@ class GPUClusteredSolver:
                                 self.MB[b_match] = r_match.to(self.MB.dtype)
                                 self.MA[r_match] = b_match.to(self.MA.dtype)
 
+            sum_proposed += count_proposed
+            sum_rejected += count_speed_rejected
+            sum_pushed += count_pushed
+
             if iteration % 50 == 0:
                 print(
-                    f"[Iter {iteration}] Free: {num_free} | Proposed: {count_proposed} "
-                    f"| Speed Rejected: {count_speed_rejected} | Pushed: {count_pushed}"
+                    f"[Iter {iteration}] Free: {num_free} | Sum Proposed (50it): {sum_proposed} "
+                    f"| Sum Rejected: {sum_rejected} | Sum Pushed: {sum_pushed}"
                 )
+                sum_proposed = 0
+                sum_rejected = 0
+                sum_pushed = 0
 
             # ---------------------------------------------------------
             # D. Relabel Phase
