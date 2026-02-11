@@ -97,7 +97,8 @@ class KLevelVectorIndex:
     def __init__(self, epsilon, k=4, batch_size=2048):
         self.cluster_engine = FastGPUMultiLevelClustering(epsilon, k, batch_size)
         self.centroids = None
-        self.centroid_to_points = {}
+        self.col_indices = None
+        self.crow_indices = None
         self.dataset = None
 
     def build_index(self, X):
@@ -111,23 +112,50 @@ class KLevelVectorIndex:
         top_level_mask = (levels == self.cluster_engine.k - 1)
         top_level_indices = torch.nonzero(top_level_mask).squeeze(1)
         self.centroids = X[top_level_indices]
-        
-        # Map global centroid IDs to local index 0...M
-        global_to_local = {global_id.item(): local_id for local_id, global_id in enumerate(top_level_indices)}
-        
-        # Build the inverted list: Centroid -> List of Data Points
-        centers_np = centers.numpy()
-        points_np = points.numpy()
-        
-        for local_id in range(len(self.centroids)):
-            self.centroid_to_points[local_id] = []
-            
-        for c, p in zip(centers_np, points_np):
-            if c in global_to_local:
-                self.centroid_to_points[global_to_local[c]].append(p)
-                
-        # Remove duplicates (since points might be reached multiple times in sieve)
-        for c in self.centroid_to_points:
-            self.centroid_to_points[c] = list(set(self.centroid_to_points[c]))
-            
+
+        # Build CSR inverted lists:
+        # - crow_indices: centroid row offsets (size M+1)
+        # - col_indices: flattened point IDs for all centroid rows
+        num_centroids = top_level_indices.numel()
+        top_level_indices_cpu = top_level_indices.to(device="cpu", dtype=torch.long)
+        centers_cpu = centers.to(device="cpu", dtype=torch.long)
+        points_cpu = points.to(device="cpu", dtype=torch.long)
+
+        global_to_local = torch.full((X.shape[0],), -1, dtype=torch.long)
+        if num_centroids > 0:
+            global_to_local[top_level_indices_cpu] = torch.arange(num_centroids, dtype=torch.long)
+
+        local_center_ids = global_to_local[centers_cpu]
+        valid_mask = local_center_ids >= 0
+        local_center_ids = local_center_ids[valid_mask]
+        point_ids = points_cpu[valid_mask]
+
+        if point_ids.numel() > 0:
+            pairs = torch.stack((local_center_ids, point_ids), dim=1)
+            unique_pairs = torch.unique(pairs, dim=0)
+            sort_order = torch.argsort(unique_pairs[:, 0])
+            sorted_centers = unique_pairs[sort_order, 0]
+            sorted_points = unique_pairs[sort_order, 1]
+            counts = torch.bincount(sorted_centers, minlength=num_centroids)
+        else:
+            sorted_points = torch.empty(0, dtype=torch.long)
+            counts = torch.zeros(num_centroids, dtype=torch.long)
+
+        crow_indices = torch.zeros(num_centroids + 1, dtype=torch.long)
+        if num_centroids > 0:
+            crow_indices[1:] = torch.cumsum(counts, dim=0)
+
+        self.col_indices = sorted_points.to(X.device)
+        self.crow_indices = crow_indices.to(X.device)
+
+        cluster_sizes = (crow_indices[1:] - crow_indices[:-1]).to(torch.float32)
+        if cluster_sizes.numel() > 0:
+            print(
+                "[*] Cluster size stats (top-level): "
+                f"min={int(cluster_sizes.min().item())}, "
+                f"max={int(cluster_sizes.max().item())}, "
+                f"mean={cluster_sizes.mean().item():.2f}, "
+                f"median={cluster_sizes.median().item():.2f}"
+            )
+
         print(f"[*] Index built with {len(self.centroids)} top-level centroids.")

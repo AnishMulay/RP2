@@ -1,5 +1,6 @@
 import torch
 import time
+import tracemalloc
 from k_level_index import KLevelVectorIndex
 from custom_vector_search import BruteForceSearcher, KLevelSearcher, FaissSearcher
 
@@ -28,6 +29,16 @@ def calculate_recall(ground_truth, predictions):
         recalls.append(len(intersection) / len(gt_set))
     return sum(recalls) / len(recalls)
 
+def run_search_with_memory(label, search_fn):
+    tracemalloc.start()
+    t0 = time.time()
+    indices = search_fn()
+    elapsed = time.time() - t0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    print(f"    - {label} done in {elapsed:.3f}s (peak tracemalloc: {peak / (1024 * 1024):.2f} MiB)")
+    return indices
+
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[*] Using device: {device}")
@@ -52,18 +63,19 @@ def main():
 
     # 4. Run Queries & Measure Accuracy
     print("\n[*] Running Queries...")
-    
-    t0 = time.time()
-    gt_indices = brute_searcher.search(queries, top_k=K_NEIGHBORS)
-    print(f"    - Brute Force done in {time.time() - t0:.3f}s")
-    
-    t0 = time.time()
-    faiss_indices = faiss_searcher.search(queries, top_k=K_NEIGHBORS)
-    print(f"    - FAISS done in {time.time() - t0:.3f}s")
 
-    t0 = time.time()
-    klevel_indices = klevel_searcher.search(queries, top_k=K_NEIGHBORS)
-    print(f"    - K-Level done in {time.time() - t0:.3f}s")
+    gt_indices = run_search_with_memory(
+        "Brute Force",
+        lambda: brute_searcher.search(queries, top_k=K_NEIGHBORS),
+    )
+    faiss_indices = run_search_with_memory(
+        "FAISS",
+        lambda: faiss_searcher.search(queries, top_k=K_NEIGHBORS),
+    )
+    klevel_indices = run_search_with_memory(
+        "K-Level",
+        lambda: klevel_searcher.search(queries, top_k=K_NEIGHBORS),
+    )
 
     # 5. Calculate Recall
     faiss_recall = calculate_recall(gt_indices, faiss_indices)

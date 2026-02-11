@@ -20,35 +20,86 @@ class KLevelSearcher:
         self.n_probe = n_probe # How many centroids to scan
 
     def search(self, queries, top_k=10):
-        results = []
-        for q in queries:
-            q = q.unsqueeze(0)
-            
-            # Step A: Coarse Quantization (Find nearest centroid)
-            centroid_dists = torch.cdist(q, self.index.centroids, p=2).squeeze(0)
-            best_centroid_idxs = torch.topk(centroid_dists, self.n_probe, largest=False)[1].cpu().numpy()
-            
-            # Step B: Gather cluster candidates
-            candidate_idxs = set()
-            for c_idx in best_centroid_idxs:
-                candidate_idxs.update(self.index.centroid_to_points[c_idx])
-            
-            candidate_idxs = list(candidate_idxs)
-            if len(candidate_idxs) < top_k:
-                # Fallback if cluster is too small
-                candidate_idxs = list(range(self.index.dataset.shape[0]))
-                
-            candidate_vectors = self.index.dataset[candidate_idxs]
-            
-            # Step C: Fine Search
-            fine_dists = torch.cdist(q, candidate_vectors, p=2).squeeze(0)
-            best_fine_idxs = torch.topk(fine_dists, min(top_k, len(candidate_idxs)), largest=False)[1]
-            
-            # Map back to global IDs
-            global_best = [candidate_idxs[i.item()] for i in best_fine_idxs]
-            results.append(global_best)
-            
-        return torch.tensor(results, device=queries.device)
+        if queries.shape[0] == 0:
+            return torch.empty((0, 0), dtype=torch.long, device=queries.device)
+
+        # Step A: Batched coarse quantization for all queries.
+        centroid_dists = torch.cdist(queries, self.index.centroids, p=2)
+        best_centroid_idxs = torch.topk(
+            centroid_dists, self.n_probe, largest=False, dim=1
+        ).indices
+
+        # Step B: Build ragged candidate sets from CSR, then pad to a dense tensor.
+        crow = self.index.crow_indices
+        col = self.index.col_indices
+        dataset_size = self.index.dataset.shape[0]
+        full_dataset_idxs = torch.arange(dataset_size, device=queries.device)
+
+        candidate_lists = []
+        candidate_sizes = []
+        for q_centroids in best_centroid_idxs:
+            starts = crow[q_centroids]
+            ends = crow[q_centroids + 1]
+
+            query_slices = []
+            for start, end in zip(starts.tolist(), ends.tolist()):
+                if end > start:
+                    query_slices.append(col[start:end])
+
+            if query_slices:
+                candidate_idxs = torch.unique(torch.cat(query_slices))
+            else:
+                candidate_idxs = torch.empty(0, dtype=torch.long, device=queries.device)
+
+            if candidate_idxs.numel() < top_k:
+                candidate_idxs = full_dataset_idxs
+
+            candidate_lists.append(candidate_idxs)
+            candidate_sizes.append(candidate_idxs.numel())
+
+        max_cluster_size = max(candidate_sizes) if candidate_sizes else 0
+        candidate_vectors = torch.zeros(
+            (queries.shape[0], max_cluster_size, queries.shape[1]),
+            device=queries.device,
+            dtype=self.index.dataset.dtype,
+        )
+        candidate_ids_padded = torch.full(
+            (queries.shape[0], max_cluster_size),
+            -1,
+            device=queries.device,
+            dtype=torch.long,
+        )
+        valid_mask = torch.zeros(
+            (queries.shape[0], max_cluster_size),
+            device=queries.device,
+            dtype=torch.bool,
+        )
+
+        for q_idx, candidate_idxs in enumerate(candidate_lists):
+            count = candidate_idxs.numel()
+            if count == 0:
+                continue
+            candidate_vectors[q_idx, :count] = self.index.dataset[candidate_idxs]
+            candidate_ids_padded[q_idx, :count] = candidate_idxs
+            valid_mask[q_idx, :count] = True
+
+        # Step C: Batched fine search over padded candidate matrix.
+        fine_dists = torch.cdist(queries.unsqueeze(1), candidate_vectors, p=2).squeeze(1)
+        fine_dists = fine_dists.masked_fill(~valid_mask, float("inf"))
+        k_eff = min(top_k, max_cluster_size)
+        best_fine_local = torch.topk(fine_dists, k_eff, largest=False, dim=1).indices
+        global_best = torch.gather(candidate_ids_padded, 1, best_fine_local)
+
+        total_candidates_evaluated = int(sum(candidate_sizes))
+        candidate_ratio = total_candidates_evaluated / (queries.shape[0] * dataset_size)
+        print(
+            f"[*] Candidate Ratio: {candidate_ratio:.4f} "
+            f"({total_candidates_evaluated} / {queries.shape[0] * dataset_size})"
+        )
+        if candidate_ratio > 0.5:
+            print("[!] Candidate Ratio exceeds 50%; top-level clusters are likely too large.")
+
+        return global_best
 
 class FaissSearcher:
     """Industry standard FAISS IVFFlat for comparison."""
