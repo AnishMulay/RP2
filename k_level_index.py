@@ -99,7 +99,6 @@ class KLevelVectorIndex:
         self.centroids = None
         self.col_indices = None
         self.crow_indices = None
-        self.bucket_offsets = None
         self.dataset = None
 
     def build_index(self, X):
@@ -134,36 +133,20 @@ class KLevelVectorIndex:
         if point_ids.numel() > 0:
             pairs = torch.stack((local_center_ids, point_ids), dim=1)
             unique_pairs = torch.unique(pairs, dim=0)
-            edge_levels = self._compute_edge_levels(X, top_level_indices, unique_pairs)
-
-            # Keep CSR rows grouped by center and sorted by bucket level inside each row.
-            max_level = edge_levels.max().to(torch.long)
-            sort_key = (unique_pairs[:, 0].to(torch.long) * (max_level + 1)) + edge_levels
-            sort_order = torch.argsort(sort_key)
-
+            sort_order = torch.argsort(unique_pairs[:, 0])
             sorted_centers = unique_pairs[sort_order, 0]
             sorted_points = unique_pairs[sort_order, 1]
-            sorted_levels = edge_levels[sort_order]
             counts = torch.bincount(sorted_centers, minlength=num_centroids)
         else:
             sorted_points = torch.empty(0, dtype=torch.long)
-            sorted_levels = torch.empty(0, dtype=torch.long)
             counts = torch.zeros(num_centroids, dtype=torch.long)
 
         crow_indices = torch.zeros(num_centroids + 1, dtype=torch.long)
         if num_centroids > 0:
             crow_indices[1:] = torch.cumsum(counts, dim=0)
 
-        bucket_offsets = self._build_bucket_offsets(
-            sorted_centers=sorted_centers if point_ids.numel() > 0 else torch.empty(0, dtype=torch.long),
-            sorted_levels=sorted_levels,
-            num_centroids=num_centroids,
-            device=X.device,
-        )
-
         self.col_indices = sorted_points.to(X.device)
         self.crow_indices = crow_indices.to(X.device)
-        self.bucket_offsets = bucket_offsets
 
         cluster_sizes = (crow_indices[1:] - crow_indices[:-1]).to(torch.float32)
         if cluster_sizes.numel() > 0:
@@ -174,66 +157,5 @@ class KLevelVectorIndex:
                 f"mean={cluster_sizes.mean().item():.2f}, "
                 f"median={cluster_sizes.median().item():.2f}"
             )
-        print(
-            f"[*] Bucket metadata entries: "
-            f"{int(self.bucket_offsets['levels'].numel())}"
-        )
 
         print(f"[*] Index built with {len(self.centroids)} top-level centroids.")
-
-    def _compute_edge_levels(self, X, top_level_indices, unique_pairs, chunk_size=65536):
-        if unique_pairs.numel() == 0:
-            return torch.empty(0, dtype=torch.long)
-
-        all_levels = []
-        epsilon = float(self.cluster_engine.epsilon)
-        for start in range(0, unique_pairs.shape[0], chunk_size):
-            end = min(start + chunk_size, unique_pairs.shape[0])
-            pair_chunk = unique_pairs[start:end]
-
-            local_center_ids = pair_chunk[:, 0].to(X.device)
-            point_ids = pair_chunk[:, 1].to(X.device)
-            global_center_ids = top_level_indices[local_center_ids]
-
-            diffs = X[global_center_ids] - X[point_ids]
-            dists = torch.norm(diffs, dim=1)
-            levels = torch.ceil(dists / epsilon).to(torch.long)
-            all_levels.append(levels.cpu())
-
-        return torch.cat(all_levels, dim=0)
-
-    def _build_bucket_offsets(self, sorted_centers, sorted_levels, num_centroids, device):
-        bucket_row_ptr = torch.zeros(num_centroids + 1, dtype=torch.long)
-        if sorted_centers.numel() == 0:
-            return {
-                "row_ptr": bucket_row_ptr.to(device),
-                "levels": torch.empty(0, dtype=torch.long, device=device),
-                "ends": torch.empty(0, dtype=torch.long, device=device),
-            }
-
-        transition_mask = (
-            (sorted_centers[1:] != sorted_centers[:-1]) |
-            (sorted_levels[1:] != sorted_levels[:-1])
-        )
-        transition_positions = torch.nonzero(transition_mask, as_tuple=False).squeeze(1) + 1
-
-        bucket_starts = torch.cat(
-            [torch.tensor([0], dtype=torch.long), transition_positions],
-            dim=0,
-        )
-        bucket_ends = torch.cat(
-            [transition_positions, torch.tensor([sorted_centers.numel()], dtype=torch.long)],
-            dim=0,
-        )
-        bucket_centers = sorted_centers[bucket_starts]
-        bucket_levels = sorted_levels[bucket_starts]
-
-        bucket_counts = torch.bincount(bucket_centers, minlength=num_centroids)
-        if num_centroids > 0:
-            bucket_row_ptr[1:] = torch.cumsum(bucket_counts, dim=0)
-
-        return {
-            "row_ptr": bucket_row_ptr.to(device),
-            "levels": bucket_levels.to(device),
-            "ends": bucket_ends.to(device),
-        }

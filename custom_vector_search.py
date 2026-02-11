@@ -1,7 +1,6 @@
 import torch
 import faiss
 import time
-import math
 
 class BruteForceSearcher:
     """Ground truth exact nearest neighbors."""
@@ -20,38 +19,9 @@ class KLevelSearcher:
         self.index = index
         self.n_probe = n_probe # How many centroids to scan
 
-    def _resolve_pruned_end(self, center_id, row_start, row_end, radius_level):
-        if radius_level is None or self.index.bucket_offsets is None:
-            return row_end
-
-        bucket_meta = self.index.bucket_offsets
-        row_ptr = bucket_meta["row_ptr"]
-        levels = bucket_meta["levels"]
-        ends = bucket_meta["ends"]
-
-        bucket_start = int(row_ptr[center_id].item())
-        bucket_end = int(row_ptr[center_id + 1].item())
-        if bucket_end <= bucket_start:
-            return row_end
-
-        level_segment = levels[bucket_start:bucket_end]
-        end_segment = ends[bucket_start:bucket_end]
-        keep_count = int(torch.searchsorted(level_segment, radius_level, right=True).item())
-        if keep_count == 0:
-            return row_start
-
-        pruned_end = int(end_segment[keep_count - 1].item())
-        return min(pruned_end, row_end)
-
-    def search(self, queries, top_k=10, search_radius_level=None):
+    def search(self, queries, top_k=10):
         if queries.shape[0] == 0:
             return torch.empty((0, 0), dtype=torch.long, device=queries.device)
-
-        radius_level = None
-        if search_radius_level is not None:
-            radius_value = float(search_radius_level)
-            if not math.isinf(radius_value):
-                radius_level = int(radius_value)
 
         # Step A: Batched coarse quantization for all queries.
         centroid_dists = torch.cdist(queries, self.index.centroids, p=2)
@@ -72,15 +42,9 @@ class KLevelSearcher:
             ends = crow[q_centroids + 1]
 
             query_slices = []
-            for center_id, start, end in zip(q_centroids.tolist(), starts.tolist(), ends.tolist()):
-                pruned_end = self._resolve_pruned_end(
-                    center_id=center_id,
-                    row_start=start,
-                    row_end=end,
-                    radius_level=radius_level,
-                )
-                if pruned_end > start:
-                    query_slices.append(col[start:pruned_end])
+            for start, end in zip(starts.tolist(), ends.tolist()):
+                if end > start:
+                    query_slices.append(col[start:end])
 
             if query_slices:
                 candidate_idxs = torch.unique(torch.cat(query_slices))
