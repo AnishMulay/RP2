@@ -1,6 +1,5 @@
 import torch
 import faiss
-import time
 
 class BruteForceSearcher:
     """Ground truth exact nearest neighbors."""
@@ -8,66 +7,62 @@ class BruteForceSearcher:
         self.dataset = dataset
 
     def search(self, query, top_k=10):
-        # Ensure query is (1, D)
-        if query.dim() == 1:
-            query = query.unsqueeze(0)
-            
-        dists = torch.cdist(query, self.dataset, p=2)
-        top_dists, top_indices = torch.topk(dists, top_k, largest=False, dim=1)
-        return top_indices.squeeze(0)
+        if query.dim() == 1: query = query.unsqueeze(0)
+        dists = torch.cdist(query, self.dataset)
+        return torch.topk(dists, top_k, largest=False).indices.squeeze(0)
 
 class KLevelSearcher:
     """
-    Searcher for all-points Voronoi index.
-    Strictly NO batching. Searches one query at a time on GPU.
+    All-Points Searcher.
+    Step 1: Scan ALL points to find the Pivot (p_best).
+    Step 2: Retrieve C_{p_best} (points closer to p_best than to S).
+    Step 3: Scan C_{p_best}.
     """
     def __init__(self, index):
         self.index = index
 
     def search_one(self, query, top_k=10):
-        """
-        Performs all-points pivot scan + CSR cluster refinement for one query.
-        query: (D,) Tensor on GPU
-        """
-        if query.dim() == 1:
-            query = query.unsqueeze(0)
+        if query.dim() == 1: query = query.unsqueeze(0)
 
-        # Step A: Global scan over all points
-        dists_all = torch.cdist(query, self.index.dataset, p=2).squeeze(0)  # (N,)
+        # Step 1: Find the nearest Pivot (Global Scan over P)
+        # Note: This is O(N), same as Brute Force.
+        # We do this to validate the CLUSTERING logic (Recall), not speed.
+        dists_global = torch.cdist(query, self.index.dataset)
+        pivot_idx = torch.argmin(dists_global).item()
 
-        # Step B: Pivot = nearest point globally
-        best_pivot = torch.argmin(dists_all)
+        # Step 2: Retrieve the Cluster (The Bucket)
+        start = self.index.crow_indices[pivot_idx]
+        end = self.index.crow_indices[pivot_idx + 1]
+        
+        # If cluster is empty (rare, but possible if pivot is a landmark), handle it
+        if end == start:
+            return torch.tensor([pivot_idx], device=query.device)
 
-        # Step C: Retrieve that pivot's cluster from CSR
-        start = int(self.index.crow_indices[best_pivot].item())
-        end = int(self.index.crow_indices[best_pivot + 1].item())
-        cluster_ids = self.index.col_indices[start:end]
+        candidate_indices = self.index.col_indices[start:end]
+        local_points = self.index.dataset[candidate_indices]
 
-        if cluster_ids.numel() == 0:
-            return torch.empty(0, dtype=torch.long, device=query.device)
-
-        # Step D: Reuse precomputed global distances (no recomputation)
-        cluster_dists = dists_all[cluster_ids]
-        k_actual = min(top_k, cluster_ids.numel())
-        local_top_k = torch.topk(cluster_dists, k_actual, largest=False).indices
-        return cluster_ids[local_top_k]
+        # Step 3: Local Scan
+        dists_local = torch.cdist(query, local_points)
+        
+        k_actual = min(top_k, local_points.shape[0])
+        local_top_k = torch.topk(dists_local, k_actual, largest=False).indices.squeeze(0)
+        
+        # Map back to global IDs
+        global_ids = candidate_indices[local_top_k]
+        
+        return global_ids
 
 class FaissSearcher:
-    """Industry standard FAISS IVFFlat wrapper for single-query comparison."""
+    """FAISS Wrapper."""
     def __init__(self, dataset, n_centroids, n_probe=1):
         self.d = dataset.shape[1]
         quantizer = faiss.IndexFlatL2(self.d)
         self.index = faiss.IndexIVFFlat(quantizer, self.d, n_centroids, faiss.METRIC_L2)
-        
-        # FAISS requires CPU numpy arrays for build
-        ds_np = dataset.cpu().numpy()
-        print(f"[*] Training FAISS with {n_centroids} centroids...")
-        self.index.train(ds_np)
-        self.index.add(ds_np)
+        self.index.train(dataset.cpu().numpy())
+        self.index.add(dataset.cpu().numpy())
         self.index.nprobe = n_probe
 
     def search_one(self, query, top_k=10):
-        # FAISS expects (1, D) numpy array
         q_np = query.cpu().numpy().reshape(1, -1)
-        D, I = self.index.search(q_np, top_k)
+        _, I = self.index.search(q_np, top_k)
         return torch.tensor(I[0], device=query.device)
