@@ -7,115 +7,76 @@ class BruteForceSearcher:
     def __init__(self, dataset):
         self.dataset = dataset
 
-    def search(self, queries, top_k=10):
-        # Using pure cdist for absolute exactness
-        dists = torch.cdist(queries, self.dataset, p=2)
+    def search(self, query, top_k=10):
+        # Ensure query is (1, D)
+        if query.dim() == 1:
+            query = query.unsqueeze(0)
+            
+        dists = torch.cdist(query, self.dataset, p=2)
         top_dists, top_indices = torch.topk(dists, top_k, largest=False, dim=1)
-        return top_indices
+        return top_indices.squeeze(0)
 
 class KLevelSearcher:
-    """ANN Search using your custom hierarchical index."""
-    def __init__(self, index, n_probe=1):
+    """
+    Simplified Flattened Searcher.
+    Strictly NO batching. Searches one query at a time on GPU.
+    """
+    def __init__(self, index):
         self.index = index
-        self.n_probe = n_probe # How many centroids to scan
 
-    def search(self, queries, top_k=10):
-        if queries.shape[0] == 0:
-            return torch.empty((0, 0), dtype=torch.long, device=queries.device)
+    def search_one(self, query, top_k=10):
+        """
+        Performs the 2-step lookup for a SINGLE query vector.
+        query: (D,) Tensor on GPU
+        """
+        if query.dim() == 1:
+            query = query.unsqueeze(0) # (1, D)
 
-        # Step A: Batched coarse quantization for all queries.
-        centroid_dists = torch.cdist(queries, self.index.centroids, p=2)
-        best_centroid_idxs = torch.topk(
-            centroid_dists, self.n_probe, largest=False, dim=1
-        ).indices
+        # Step 1: Find the nearest Top-Level Centroid (The Pivot)
+        # Global Search over K centroids
+        dists_global = torch.cdist(query, self.index.centroids, p=2) # (1, K)
+        best_centroid_idx = torch.argmin(dists_global).item()
 
-        # Step B: Build ragged candidate sets from CSR, then pad to a dense tensor.
-        crow = self.index.crow_indices
-        col = self.index.col_indices
-        dataset_size = self.index.dataset.shape[0]
-        full_dataset_idxs = torch.arange(dataset_size, device=queries.device)
+        # Step 2: Retrieve the specific cluster (The Bucket)
+        start = self.index.offsets[best_centroid_idx]
+        end = self.index.offsets[best_centroid_idx + 1]
+        
+        # Zero-copy slice from VRAM
+        local_points = self.index.sorted_dataset[start:end]
+        
+        # Step 3: Local Search within the bucket
+        # If bucket is empty or smaller than k, handle gracefully
+        if local_points.shape[0] == 0:
+            return torch.empty(0, dtype=torch.long, device=query.device)
 
-        candidate_lists = []
-        candidate_sizes = []
-        for q_centroids in best_centroid_idxs:
-            starts = crow[q_centroids]
-            ends = crow[q_centroids + 1]
-
-            query_slices = []
-            for start, end in zip(starts.tolist(), ends.tolist()):
-                if end > start:
-                    query_slices.append(col[start:end])
-
-            if query_slices:
-                candidate_idxs = torch.unique(torch.cat(query_slices))
-            else:
-                candidate_idxs = torch.empty(0, dtype=torch.long, device=queries.device)
-
-            if candidate_idxs.numel() < top_k:
-                candidate_idxs = full_dataset_idxs
-
-            candidate_lists.append(candidate_idxs)
-            candidate_sizes.append(candidate_idxs.numel())
-
-        max_cluster_size = max(candidate_sizes) if candidate_sizes else 0
-        candidate_vectors = torch.zeros(
-            (queries.shape[0], max_cluster_size, queries.shape[1]),
-            device=queries.device,
-            dtype=self.index.dataset.dtype,
-        )
-        candidate_ids_padded = torch.full(
-            (queries.shape[0], max_cluster_size),
-            -1,
-            device=queries.device,
-            dtype=torch.long,
-        )
-        valid_mask = torch.zeros(
-            (queries.shape[0], max_cluster_size),
-            device=queries.device,
-            dtype=torch.bool,
-        )
-
-        for q_idx, candidate_idxs in enumerate(candidate_lists):
-            count = candidate_idxs.numel()
-            if count == 0:
-                continue
-            candidate_vectors[q_idx, :count] = self.index.dataset[candidate_idxs]
-            candidate_ids_padded[q_idx, :count] = candidate_idxs
-            valid_mask[q_idx, :count] = True
-
-        # Step C: Batched fine search over padded candidate matrix.
-        fine_dists = torch.cdist(queries.unsqueeze(1), candidate_vectors, p=2).squeeze(1)
-        fine_dists = fine_dists.masked_fill(~valid_mask, float("inf"))
-        k_eff = min(top_k, max_cluster_size)
-        best_fine_local = torch.topk(fine_dists, k_eff, largest=False, dim=1).indices
-        global_best = torch.gather(candidate_ids_padded, 1, best_fine_local)
-
-        total_candidates_evaluated = int(sum(candidate_sizes))
-        candidate_ratio = total_candidates_evaluated / (queries.shape[0] * dataset_size)
-        print(
-            f"[*] Candidate Ratio: {candidate_ratio:.4f} "
-            f"({total_candidates_evaluated} / {queries.shape[0] * dataset_size})"
-        )
-        if candidate_ratio > 0.5:
-            print("[!] Candidate Ratio exceeds 50%; top-level clusters are likely too large.")
-
-        return global_best
+        dists_local = torch.cdist(query, local_points, p=2) # (1, ClusterSize)
+        
+        k_actual = min(top_k, local_points.shape[0])
+        local_top_k = torch.topk(dists_local, k_actual, largest=False, dim=1).indices.squeeze(0)
+        
+        # Step 4: Map back to Global IDs
+        # We found the index in the 'sorted' dataset (offset by start)
+        sorted_indices = local_top_k + start
+        global_ids = self.index.original_indices[sorted_indices]
+        
+        return global_ids
 
 class FaissSearcher:
-    """Industry standard FAISS IVFFlat for comparison."""
+    """Industry standard FAISS IVFFlat wrapper for single-query comparison."""
     def __init__(self, dataset, n_centroids, n_probe=1):
         self.d = dataset.shape[1]
         quantizer = faiss.IndexFlatL2(self.d)
         self.index = faiss.IndexIVFFlat(quantizer, self.d, n_centroids, faiss.METRIC_L2)
         
-        # FAISS requires CPU numpy arrays
+        # FAISS requires CPU numpy arrays for build
         ds_np = dataset.cpu().numpy()
         print(f"[*] Training FAISS with {n_centroids} centroids...")
         self.index.train(ds_np)
         self.index.add(ds_np)
         self.index.nprobe = n_probe
 
-    def search(self, queries, top_k=10):
-        q_np = queries.cpu().numpy()
+    def search_one(self, query, top_k=10):
+        # FAISS expects (1, D) numpy array
+        q_np = query.cpu().numpy().reshape(1, -1)
         D, I = self.index.search(q_np, top_k)
-        return torch.tensor(I, device=queries.device)
+        return torch.tensor(I[0], device=query.device)
