@@ -37,7 +37,7 @@ def run_search_with_memory(label, search_fn):
     _, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     print(f"    - {label} done in {elapsed:.3f}s (peak tracemalloc: {peak / (1024 * 1024):.2f} MiB)")
-    return indices
+    return indices, elapsed
 
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -64,29 +64,45 @@ def main():
     # 4. Run Queries & Measure Accuracy
     print("\n[*] Running Queries...")
 
-    gt_indices = run_search_with_memory(
+    gt_indices, _ = run_search_with_memory(
         "Brute Force",
         lambda: brute_searcher.search(queries, top_k=K_NEIGHBORS),
     )
-    faiss_indices = run_search_with_memory(
+    faiss_indices, faiss_time = run_search_with_memory(
         "FAISS",
         lambda: faiss_searcher.search(queries, top_k=K_NEIGHBORS),
     )
-    klevel_indices = run_search_with_memory(
-        "K-Level",
-        lambda: klevel_searcher.search(queries, top_k=K_NEIGHBORS),
-    )
-
-    # 5. Calculate Recall
     faiss_recall = calculate_recall(gt_indices, faiss_indices)
-    klevel_recall = calculate_recall(gt_indices, klevel_indices)
 
-    print("\n" + "="*40)
+    # 5. Sweep radius-level pruning for custom K-Level ANN.
+    radius_sweep = [1, 2, 4, 8, None]
+    sweep_results = []
+    for radius_level in radius_sweep:
+        radius_label = "None" if radius_level is None else str(radius_level)
+        klevel_indices, elapsed = run_search_with_memory(
+            f"K-Level (radius={radius_label})",
+            lambda radius_level=radius_level: klevel_searcher.search(
+                queries,
+                top_k=K_NEIGHBORS,
+                search_radius_level=radius_level,
+            ),
+        )
+        recall = calculate_recall(gt_indices, klevel_indices)
+        sweep_results.append((radius_label, elapsed, recall * 100.0))
+
+    print("\n" + "="*52)
     print(" EXPERIMENT RESULTS: RECALL@10")
-    print("="*40)
+    print("="*52)
     print(f" FAISS (IVFFlat) Recall: {faiss_recall * 100:.2f}%")
-    print(f" Custom K-Level Recall:  {klevel_recall * 100:.2f}%")
-    print("="*40)
+    print(f" FAISS Time:             {faiss_time:.3f}s")
+    print("="*52)
+    print(" K-Level Radius Sweep")
+    print("="*52)
+    print(f"{'Radius Level':<14} | {'Time (s)':>9} | {'Recall (%)':>10}")
+    print("-" * 52)
+    for radius_label, elapsed, recall_pct in sweep_results:
+        print(f"{radius_label:<14} | {elapsed:>9.3f} | {recall_pct:>10.2f}")
+    print("="*52)
 
 if __name__ == "__main__":
     main()
