@@ -36,12 +36,10 @@ def main():
     dataset = generate_mock_embeddings(n_samples=N, dim=DIM, device=device)
     queries = generate_mock_embeddings(n_samples=NUM_QUERIES, dim=DIM, device=device)
 
-    # 2. Build K-Level Index
-    # Note: Epsilon controls the number of centroids. Lower epsilon = More centroids.
-    # Try 0.5 - 0.9 range.
-    k_level_idx = KLevelVectorIndex(epsilon=0.6, k=4)
+    # 2. Build all-points Voronoi index (conceptual 2-level setup)
+    k_level_idx = KLevelVectorIndex(epsilon=0.6, k=2)
     k_level_idx.build_index(dataset)
-    num_centroids = k_level_idx.centroids.shape[0]
+    num_centroids = max(1, int(k_level_idx.landmark_indices.numel()))
     
     # 3. Initialize Searchers
     brute_searcher = BruteForceSearcher(dataset)

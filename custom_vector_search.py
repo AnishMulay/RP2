@@ -18,7 +18,7 @@ class BruteForceSearcher:
 
 class KLevelSearcher:
     """
-    Simplified Flattened Searcher.
+    Searcher for all-points Voronoi index.
     Strictly NO batching. Searches one query at a time on GPU.
     """
     def __init__(self, index):
@@ -26,40 +26,31 @@ class KLevelSearcher:
 
     def search_one(self, query, top_k=10):
         """
-        Performs the 2-step lookup for a SINGLE query vector.
+        Performs all-points pivot scan + CSR cluster refinement for one query.
         query: (D,) Tensor on GPU
         """
         if query.dim() == 1:
-            query = query.unsqueeze(0) # (1, D)
+            query = query.unsqueeze(0)
 
-        # Step 1: Find the nearest Top-Level Centroid (The Pivot)
-        # Global Search over K centroids
-        dists_global = torch.cdist(query, self.index.centroids, p=2) # (1, K)
-        best_centroid_idx = torch.argmin(dists_global).item()
+        # Step A: Global scan over all points
+        dists_all = torch.cdist(query, self.index.dataset, p=2).squeeze(0)  # (N,)
 
-        # Step 2: Retrieve the specific cluster (The Bucket)
-        start = self.index.offsets[best_centroid_idx]
-        end = self.index.offsets[best_centroid_idx + 1]
-        
-        # Zero-copy slice from VRAM
-        local_points = self.index.sorted_dataset[start:end]
-        
-        # Step 3: Local Search within the bucket
-        # If bucket is empty or smaller than k, handle gracefully
-        if local_points.shape[0] == 0:
+        # Step B: Pivot = nearest point globally
+        best_pivot = torch.argmin(dists_all)
+
+        # Step C: Retrieve that pivot's cluster from CSR
+        start = int(self.index.crow_indices[best_pivot].item())
+        end = int(self.index.crow_indices[best_pivot + 1].item())
+        cluster_ids = self.index.col_indices[start:end]
+
+        if cluster_ids.numel() == 0:
             return torch.empty(0, dtype=torch.long, device=query.device)
 
-        dists_local = torch.cdist(query, local_points, p=2) # (1, ClusterSize)
-        
-        k_actual = min(top_k, local_points.shape[0])
-        local_top_k = torch.topk(dists_local, k_actual, largest=False, dim=1).indices.squeeze(0)
-        
-        # Step 4: Map back to Global IDs
-        # We found the index in the 'sorted' dataset (offset by start)
-        sorted_indices = local_top_k + start
-        global_ids = self.index.original_indices[sorted_indices]
-        
-        return global_ids
+        # Step D: Reuse precomputed global distances (no recomputation)
+        cluster_dists = dists_all[cluster_ids]
+        k_actual = min(top_k, cluster_ids.numel())
+        local_top_k = torch.topk(cluster_dists, k_actual, largest=False).indices
+        return cluster_ids[local_top_k]
 
 class FaissSearcher:
     """Industry standard FAISS IVFFlat wrapper for single-query comparison."""
