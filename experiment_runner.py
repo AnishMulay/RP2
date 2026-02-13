@@ -32,12 +32,13 @@ def main():
     DIM = 128
     K_NEIGHBORS = 10
     NUM_QUERIES = 1000
+    EPSILON = 0.6
     
     dataset = generate_mock_embeddings(n_samples=N, dim=DIM, device=device)
     queries = generate_mock_embeddings(n_samples=NUM_QUERIES, dim=DIM, device=device)
 
     # 2. Build all-points Voronoi index (conceptual 2-level setup)
-    k_level_idx = KLevelVectorIndex(epsilon=0.6, k=2)
+    k_level_idx = KLevelVectorIndex(epsilon=EPSILON, k=2)
     k_level_idx.build_index(dataset)
     num_centroids = max(1, int(k_level_idx.landmark_indices.numel()))
     
