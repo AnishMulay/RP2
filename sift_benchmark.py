@@ -48,6 +48,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     EPSILON = 0.5
     print(f"[*] Using device: {device}")
+
+    def sync_if_cuda():
+        if device.type == "cuda":
+            torch.cuda.synchronize()
     
     # Check for SIFT10K (Small) or SIFT1M (Big)
     if os.path.exists("./siftsmall"):
@@ -102,10 +106,15 @@ def main():
     # 2. Build Custom Index
     print("\n[*] Building Custom Index (All-Points)...")
     t0 = time.time()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     # Batch size controls GPU memory usage during construction
     idx = KLevelVectorIndex(epsilon=EPSILON, batch_size=1024) 
     idx.build_index(dataset)
     print(f"    Build Time: {time.time()-t0:.2f}s")
+    if device.type == "cuda":
+        peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        print(f"    Peak Memory: {peak_mem:.2f} MB")
     
     custom_searcher = KLevelSearcher(idx)
     
@@ -121,6 +130,13 @@ def main():
     
     # Run only 100 queries for speed
     num_queries_to_run = min(100, queries.shape[0])
+
+    # GPU warm-up (not measured)
+    warmup_queries = min(10, num_queries_to_run)
+    print(f"[*] Warm-up: running {warmup_queries} custom queries...")
+    for i in range(warmup_queries):
+        _ = custom_searcher.search_one(queries[i], top_k=10)
+    sync_if_cuda()
     
     for i in range(num_queries_to_run):
         q = queries[i]
@@ -132,18 +148,18 @@ def main():
             gt = gt_indices[i, :10]
 
         # Custom Search
-        torch.cuda.synchronize()
+        sync_if_cuda()
         t0 = time.time()
         res_c = custom_searcher.search_one(q, top_k=10)
-        torch.cuda.synchronize()
-        c_times.append(time.time() - t0)
+        sync_if_cuda()
+        c_times.append((time.time() - t0) * 1000.0)
         
         # FAISS Search
-        torch.cuda.synchronize()
+        sync_if_cuda()
         t0 = time.time()
         res_f = faiss_searcher.search_one(q, top_k=10)
-        torch.cuda.synchronize()
-        f_times.append(time.time() - t0)
+        sync_if_cuda()
+        f_times.append((time.time() - t0) * 1000.0)
         
         # Recall
         gt_set = set(gt.cpu().tolist())
@@ -159,7 +175,10 @@ def main():
     print(f" Metric        | FAISS         | Custom")
     print("-" * 50)
     print(f" Recall@10     | {np.mean(f_recalls)*100:.2f}%        | {np.mean(c_recalls)*100:.2f}%")
-    print(f" Latency (ms)  | {np.mean(f_times)*1000:.2f}         | {np.mean(c_times)*1000:.2f}")
+    print(f" Lat Mean (ms) | {np.mean(f_times):.2f}         | {np.mean(c_times):.2f}")
+    print(f" Lat P50 (ms)  | {np.percentile(f_times, 50):.2f}         | {np.percentile(c_times, 50):.2f}")
+    print(f" Lat P95 (ms)  | {np.percentile(f_times, 95):.2f}         | {np.percentile(c_times, 95):.2f}")
+    print(f" Lat P99 (ms)  | {np.percentile(f_times, 99):.2f}         | {np.percentile(c_times, 99):.2f}")
     print("="*50)
 
 if __name__ == "__main__":
