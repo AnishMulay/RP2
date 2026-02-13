@@ -46,6 +46,7 @@ def read_ivecs(filename):
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    EPSILON = 0.5
     print(f"[*] Using device: {device}")
     
     # Check for SIFT10K (Small) or SIFT1M (Big)
@@ -85,6 +86,8 @@ def main():
 
     dataset = dataset.to(device)
     queries = queries.to(device)
+    dataset = torch.nn.functional.normalize(dataset, p=2, dim=1)
+    queries = torch.nn.functional.normalize(queries, p=2, dim=1)
     gt_indices = gt_indices.long().to(device)
 
     print(f"[*] Dataset: {dataset.shape}")
@@ -100,7 +103,7 @@ def main():
     print("\n[*] Building Custom Index (All-Points)...")
     t0 = time.time()
     # Batch size controls GPU memory usage during construction
-    idx = KLevelVectorIndex(batch_size=1024) 
+    idx = KLevelVectorIndex(epsilon=EPSILON, batch_size=1024) 
     idx.build_index(dataset)
     print(f"    Build Time: {time.time()-t0:.2f}s")
     
