@@ -1,3 +1,6 @@
+import pathlib
+import os
+BASE_DIR = pathlib.Path(__file__).resolve().parent.parent.parent
 import os, time, gzip, csv
 import numpy as np
 import torch
@@ -5,8 +8,8 @@ import ot
 
 # Import your solvers
 # Ensure these files are in the same directory
-from clustered_push_relabel import GPUClusteredSolver as TwoLevelSolver
-from k_level_clustered_push_relabel import GPUClusteredSolver as KLevelSolver
+from clustered_push_relabel.solvers.bipartite import TwoLevelBipartiteSolver as TwoLevelSolver
+from clustered_push_relabel.solvers.bipartite import KLevelBipartiteSolver as KLevelSolver
 
 def load_balanced_mnist_data(n_samples, device):
     """

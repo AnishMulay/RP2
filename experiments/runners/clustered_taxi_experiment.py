@@ -1,3 +1,6 @@
+import pathlib
+import os
+BASE_DIR = pathlib.Path(__file__).resolve().parent.parent.parent
 #!/usr/bin/env python3
 """
 Single-file implementation of the K-Level Clustered Push-Relabel algorithm 

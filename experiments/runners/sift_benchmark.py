@@ -1,3 +1,6 @@
+import pathlib
+import os
+BASE_DIR = pathlib.Path(__file__).resolve().parent.parent.parent
 import os
 import torch
 import numpy as np
@@ -54,9 +57,9 @@ def main():
             torch.cuda.synchronize()
     
     # Check for SIFT10K (Small) or SIFT1M (Big)
-    if os.path.exists("./siftsmall"):
+    if os.path.exists(str(BASE_DIR / "data/siftsmall")):
         print("[*] Detected SIFT10K (Small Dataset)")
-        data_dir = "./siftsmall"
+        data_dir = str(BASE_DIR / "data/siftsmall")
         base_file = "siftsmall_base.fvecs"
         query_file = "siftsmall_query.fvecs"
         gt_file = "siftsmall_groundtruth.ivecs"

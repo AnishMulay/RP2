@@ -1,3 +1,6 @@
+import pathlib
+import os
+BASE_DIR = pathlib.Path(__file__).resolve().parent.parent.parent
 #!/usr/bin/env python3
 import os, csv, time
 import argparse
@@ -11,8 +14,8 @@ try:
 except ImportError:
     ot = None
 try:
-    from clustered_push_relabel import GPUClusteredSolver as TwoLevelSolver
-    from k_level_clustered_push_relabel import GPUClusteredSolver as KLevelSolver
+    from clustered_push_relabel.solvers.bipartite import TwoLevelBipartiteSolver as TwoLevelSolver
+    from clustered_push_relabel.solvers.bipartite import KLevelBipartiteSolver as KLevelSolver
 except ImportError as e:
     raise ImportError(f"Error importing solvers: {e}")
 

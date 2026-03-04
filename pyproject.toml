@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clustered_push_relabel"
+version = "0.1.0"
+dependencies = [
+    "torch",
+    "numpy",
+    "POT"
+]
+description = "Clustered Push-Relabel Solver for Min Cost Bipartite Matching and Optimal Transport"
+readme = "README.md"
+requires-python = ">=3.8"
+
+[project.optional-dependencies]
+test = [
+    "pytest"
+]

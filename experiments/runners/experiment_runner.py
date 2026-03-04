@@ -1,3 +1,6 @@
+import pathlib
+import os
+BASE_DIR = pathlib.Path(__file__).resolve().parent.parent.parent
 import torch
 import time
 from k_level_index import KLevelVectorIndex

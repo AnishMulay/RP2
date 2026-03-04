@@ -1,3 +1,6 @@
+import pathlib
+import os
+BASE_DIR = pathlib.Path(__file__).resolve().parent.parent.parent
 import os
 import gzip
 # CRITICAL: Prevent JAX from hogging all GPU memory
@@ -18,8 +21,8 @@ import numpy as np
 # IMPORTS: SOLVERS
 # ==========================================
 try:
-    from clustered_push_relabel import GPUClusteredSolver as TwoLevelSolver
-    from k_level_clustered_push_relabel import GPUClusteredSolver as KLevelSolver
+    from clustered_push_relabel.solvers.bipartite import TwoLevelBipartiteSolver as TwoLevelSolver
+    from clustered_push_relabel.solvers.bipartite import KLevelBipartiteSolver as KLevelSolver
 except ImportError as e:
     print(f"[Error] Could not import custom solvers: {e}")
     sys.exit(1)

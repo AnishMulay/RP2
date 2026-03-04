@@ -1,198 +1,10 @@
 import torch
-import math
 import time
-import sys
 import gc
+from ..clustering.two_level import FastGPUClustering
+from ..clustering.k_level import FastGPUMultiLevelClustering
 
-# ==========================================
-# PART 1: LOW-LEVEL KERNELS (GPU)
-# ==========================================
-
-class TiledEuclideanKernel:
-    """
-    Computes distances ||x - y||^2 = ||x||^2 + ||y||^2 - 2<x, y>
-    without materializing the full N x N matrix.
-    """
-    def __init__(self, chunk_size=1024):
-        self.chunk_size = chunk_size
-
-    def prepare_workspace(self, P):
-        return {
-            "P": P,
-            "P_T": P.t(),
-            "P_norms_sq": (P ** 2).sum(dim=1, keepdim=True)
-        }
-
-    def compute_dist_tile(self, query_points, workspace):
-        P = workspace["P"]
-        P_norms_sq = workspace["P_norms_sq"]
-        Q_norms_sq = (query_points ** 2).sum(dim=1, keepdim=True).t()
-        dists_sq = P_norms_sq + Q_norms_sq
-        dists_sq.addmm_(P, query_points.t(), beta=1.0, alpha=-2.0)
-        return torch.clamp(dists_sq, min=0.0)
-
-    def compute_squared_dist_tile(self, query_points, workspace):
-        return self.compute_dist_tile(query_points, workspace)
-
-class TiledManhattanKernel:
-    """
-    Computes L1 (Manhattan) distances using torch.cdist.
-    """
-    def __init__(self, chunk_size=1024):
-        self.chunk_size = chunk_size
-
-    def prepare_workspace(self, P):
-        return {"P": P}
-
-    def compute_dist_tile(self, query_points, workspace):
-        dists = torch.cdist(query_points, workspace["P"], p=1)
-        # Match TiledEuclideanKernel's (P, query) layout.
-        return dists.t()
-
-# ==========================================
-# PART 2: GEOMETRIC CLUSTERING (Voronoi + Shells)
-# ==========================================
-
-class FastGPUClustering:
-    """
-    Optimized Clustering using Voronoi constraints and minimal shells.
-    Generates a sparse O(N^1.5) cover instead of a dense one.
-    """
-    def __init__(self, epsilon, batch_size=1024, micro_batch_size=32, metric="L2"):
-        self.epsilon = epsilon
-        self.batch_size = batch_size
-        self.micro_batch_size = micro_batch_size
-        self.metric = metric
-        if metric == "L1":
-            self.kernel = TiledManhattanKernel(chunk_size=batch_size)
-        else:
-            self.kernel = TiledEuclideanKernel(chunk_size=batch_size)
-
-    def _sample_landmarks(self, n, device):
-        # Sample ~sqrt(N) landmarks
-        prob = n ** (-0.5)
-        mask = torch.rand(n, device=device) < prob
-        if not mask.any(): mask[torch.randint(0, n, (1,), device=device)] = True
-        return torch.nonzero(mask).squeeze(1), mask
-
-    def _compute_voronoi_bounds(self, targets, landmarks, workspace):
-        # D[x] = min d(x, s) for s in landmarks
-        n_targets = targets.shape[0]
-        n_landmarks = landmarks.shape[0]
-        D_y = torch.full((n_targets,), float('inf'), device=targets.device)
-        
-        for i in range(0, n_landmarks, self.batch_size):
-            end = min(i + self.batch_size, n_landmarks)
-            batch = landmarks[i:end]
-            dists = self.kernel.compute_dist_tile(batch, workspace)
-            batch_min, _ = dists.min(dim=1)
-            D_y = torch.min(D_y, batch_min)
-        return D_y
-
-    def _build_cover_bulk(self, centers, center_mask_P1, targets_ws, D_voronoi):
-        """
-        Builds the cluster cover using the Sampled/Non-Sampled split.
-        Returns (Center, Level, Point) triplets on CPU.
-        """
-        n_centers = centers.shape[0]
-        n_targets = targets_ws["P"].shape[0]
-        
-        chunk_center_ids = []
-        chunk_level_ids = []
-        chunk_point_ids = []
-
-        # We process centers in batches
-        for start_q in range(0, n_centers, self.batch_size):
-            end_q = min(start_q + self.batch_size, n_centers)
-            q_batch = centers[start_q:end_q]
-            curr_bs = q_batch.shape[0]
-            
-            # Identify which centers in this batch are landmarks
-            is_landmark_batch = center_mask_P1[start_q:end_q].view(curr_bs, 1)
-
-            for start_mb in range(0, curr_bs, self.micro_batch_size):
-                end_mb = min(start_mb + self.micro_batch_size, curr_bs)
-                q_micro = q_batch[start_mb:end_mb]
-                micro_is_landmark = is_landmark_batch[start_mb:end_mb]
-                
-                # 1. Compute Distances (Micro x Targets)
-                dists = self.kernel.compute_dist_tile(q_micro, targets_ws).t() # (Micro, Targets)
-                
-                # 2. Apply Voronoi Constraint
-                # If Landmark: Connect to everything (up to some reasonable bound, effectively inf here)
-                # If Non-Landmark: Connect only if dist < D_voronoi[point]
-                
-                # Prepare Voronoi bounds for broadcast: (1, Targets)
-                dv_row = D_voronoi.view(1, n_targets)
-                
-                # Mask Logic:
-                # Landmark: True
-                # Non-Landmark: dists < dv_row
-                
-                # Note: dists and dv_row are squared (L2) or linear (L1) distances
-                mask = dists < dv_row
-                mask = torch.where(micro_is_landmark, torch.tensor(True, device=mask.device), mask)
-                
-                if not mask.any(): 
-                    continue
-                
-                # 3. Compute Levels for valid edges
-                # Level = ceil(dist / epsilon) (dist is L1 or sqrt(L2))
-                # We only compute this for the valid mask indices to save ops
-                valid_indices = torch.nonzero(mask)
-                
-                # Extract distances for these pairs
-                valid_dists_raw = dists[valid_indices[:, 0], valid_indices[:, 1]]
-                if self.metric == "L2":
-                    valid_dists = torch.sqrt(valid_dists_raw)
-                else:
-                    valid_dists = valid_dists_raw
-                levels = torch.ceil(valid_dists / self.epsilon).to(torch.long)
-                
-                # Filter out Level 0 (self-loops with 0 cost can be tricky, set to 1 or keep 0)
-                # Usually cost >= 0 is fine.
-                
-                # Move to CPU
-                indices_cpu = valid_indices.cpu()
-                levels_cpu = levels.cpu()
-                
-                local_c = indices_cpu[:, 0]
-                global_c = local_c + (start_q + start_mb)
-                
-                chunk_center_ids.append(global_c)
-                chunk_level_ids.append(levels_cpu)
-                chunk_point_ids.append(indices_cpu[:, 1])
-
-        if not chunk_center_ids:
-            return (torch.empty(0, dtype=torch.long), 
-                    torch.empty(0, dtype=torch.long), 
-                    torch.empty(0, dtype=torch.long))
-
-        return (torch.cat(chunk_center_ids), 
-                torch.cat(chunk_level_ids), 
-                torch.cat(chunk_point_ids))
-
-    def run(self, P_red, P_blue):
-        P_all = torch.cat([P_red, P_blue], dim=0)
-        workspace = self.kernel.prepare_workspace(P_all)
-        
-        red_idx, red_mask = self._sample_landmarks(P_red.shape[0], P_red.device)
-        blue_idx, blue_mask = self._sample_landmarks(P_blue.shape[0], P_blue.device)
-        
-        D_red = self._compute_voronoi_bounds(P_all, P_red[red_idx], workspace)
-        D_blue = self._compute_voronoi_bounds(P_all, P_blue[blue_idx], workspace)
-        
-        # Build Shell Covers
-        b_c, b_l, b_p = self._build_cover_bulk(P_blue, blue_mask, workspace, D_blue)
-        r_c, r_l, r_p = self._build_cover_bulk(P_red, red_mask, workspace, D_red)
-        
-        return (b_c, b_l, b_p), (r_c, r_l, r_p), red_mask.cpu(), blue_mask.cpu()
-
-# ==========================================
-# PART 3: CLUSTERED SOLVER (Dynamic Costs)
-# ==========================================
-
-class GPUClusteredSolver:
+class TwoLevelBipartiteSolver:
     def __init__(self, P_red, P_blue, epsilon, batch_size=None, metric="L2"):
         self.device = P_red.device
         self.N = P_red.shape[0]
@@ -766,20 +578,544 @@ class GPUClusteredSolver:
         print(f"Matched: {(self.MB != -1).sum().item()}/{self.N}")
         self.calculate_final_stats()
 
-# ==========================================
-# PART 4: MAIN ENTRY
-# ==========================================
-if __name__ == "__main__":
-    N = 5000
-    DIM = 2
-    EPS = 0.1
-    
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {dev}")
-    
-    torch.manual_seed(42)
-    P_red = torch.randn(N, DIM, device=dev)
-    P_blue = torch.randn(N, DIM, device=dev)
-    
-    solver = GPUClusteredSolver(P_red, P_blue, EPS)
+
+class KLevelBipartiteSolver:
+    def __init__(self, P_red, P_blue, epsilon, k=4, batch_size=None, metric="L2"):
+        self.device = P_red.device
+        self.N = P_red.shape[0]
+        self.epsilon = epsilon
+        self.k = k
+        self.P_red = P_red
+        self.P_blue = P_blue
+        self.batch_size = 2048 if batch_size is None else batch_size
+        self.metric = metric
+        
+        print("="*60)
+        print(f"[Init] Config: N={self.N}, Eps={epsilon}, Levels={k}, Batch={self.batch_size}, Metric={metric}, Device={self.device}")
+        
+        # 1. Multi-Level Clustering
+        print("[Step 1] Running Multi-Level Hierarchical Clustering...")
+        t0 = time.time()
+        cluster_engine = FastGPUMultiLevelClustering(
+            epsilon, k=k, batch_size=self.batch_size, metric=metric
+        )
+        blue_coo, red_coo, levels_red, levels_blue = cluster_engine.run(P_red, P_blue)
+        torch.cuda.synchronize()
+        print(f"         Clustering done in {time.time()-t0:.2f}s")
+        print(f"         Red Edges:  {red_coo[0].numel()}")
+        print(f"         Blue Edges: {blue_coo[0].numel()}")
+        
+        # 2. Indexing
+        print("[Step 2] Building CSR Index (Unified Center Space)...")
+        t0 = time.time()
+        self._build_csr_from_coo_cpu(blue_coo, red_coo, levels_red, levels_blue)
+        print(f"         Indexing done in {time.time()-t0:.2f}s")
+        
+        # Cleanup
+        print("   [Debug] Starting GC and State Init...")
+        t_setup = time.time()
+        del blue_coo, red_coo, levels_red, levels_blue, cluster_engine
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # 3. State Init (Integer Scaling)
+        self.yA = torch.zeros(self.N, device=self.device, dtype=torch.int32)
+        self.yB = torch.full((self.N,), 1, device=self.device, dtype=torch.int32)
+        self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
+        self.MB = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
+        torch.cuda.synchronize()
+        print(f"   [Debug] GC & State Init finished in {time.time() - t_setup:.4f}s")
+
+    def _build_csr_from_coo_cpu(self, blue_coo, red_coo, levels_red, levels_blue):
+        """
+        Builds CSR structures.
+        Crucial Change: Centers are now disjoint sets from the hierarchy.
+        We need to unify 'Red Centers' and 'Blue Centers' into a single index space.
+        
+        Mappings:
+        - Red Centers: Indices 0..N-1 (referenced in red_coo[0])
+        - Blue Centers: Indices 0..N-1 (referenced in blue_coo[0])
+        
+        We treat Blue Centers as IDs N..2N-1 internally here to merge, then filter.
+        """
+        b_c, b_l, b_p = blue_coo
+        r_c, r_l, r_p = red_coo
+        N = self.N
+        levels_red = levels_red.cpu()
+        levels_blue = levels_blue.cpu()
+
+        def _category_stats(centers, levels):
+            edges = int(centers.numel())
+            if edges == 0:
+                return {
+                    "edges": 0,
+                    "clusters": 0,
+                    "buckets": 0,
+                    "avg_cluster": 0.0,
+                    "mem_mb": 0.0,
+                }
+            clusters = int(torch.unique(centers).numel())
+            max_level = levels.max().to(torch.long)
+            bucket_keys = (centers.to(torch.long) * (max_level + 1)) + levels.to(torch.long)
+            buckets = int(torch.unique(bucket_keys).numel())
+            avg_cluster = edges / max(clusters, 1)
+            mem_mb = edges * 12 / (1024 ** 2)
+            return {
+                "edges": edges,
+                "clusters": clusters,
+                "buckets": buckets,
+                "avg_cluster": avg_cluster,
+                "mem_mb": mem_mb,
+            }
+
+        total_stats = {
+            "edges": 0,
+            "clusters": 0,
+            "buckets": 0,
+            "avg_cluster": 0.0,
+            "mem_mb": 0.0,
+        }
+        if r_c.numel() != 0 or b_c.numel() != 0:
+            total_centers = torch.cat([r_c, b_c + N])
+            total_levels = torch.cat([r_l, b_l])
+            total_stats = _category_stats(total_centers, total_levels)
+
+        print("    [Cluster Analysis]")
+        print("    Category       | Clusters | Buckets  | Edges        | Avg Clust | Mem (MB)")
+        print("    ------------------------------------------------------------------------")
+        def _print_row(label, stats):
+            print(
+                f"    {label:<14} | {stats['clusters']:>8} | {stats['buckets']:>7} | "
+                f"{stats['edges']:>12,} | {stats['avg_cluster']:>9.1f} | {stats['mem_mb']:>7.1f}"
+            )
+        for i in range(self.k - 1, -1, -1):
+            red_mask = levels_red[r_c] == i
+            blue_mask = levels_blue[b_c] == i
+            red_stats = _category_stats(r_c[red_mask], r_l[red_mask])
+            blue_stats = _category_stats(b_c[blue_mask], b_l[blue_mask])
+            _print_row(f"RED (Lvl {i})", red_stats)
+            _print_row(f"BLUE (Lvl {i})", blue_stats)
+        print("    ------------------------------------------------------------------------")
+        _print_row("TOTAL", total_stats)
+
+        # Shift Blue Center IDs to avoid collision with Red Center IDs
+        b_c_shifted = b_c + N
+        
+        # Concatenate all edges to find Active Centers (those that bridge Red and Blue)
+        # We need centers that have at least one Red point and one Blue point.
+        
+        # Edges coming from Red Centers
+        # r_c: Center ID (0..N-1)
+        # r_p: Point ID (0..2N-1). 0..N-1 is Red, N..2N-1 is Blue.
+        
+        # Edges coming from Blue Centers
+        # b_c_shifted: Center ID (N..2N-1)
+        # b_p: Point ID.
+        
+        # 1. Global Lists
+        all_centers = torch.cat([r_c, b_c_shifted])
+        all_levels = torch.cat([r_l, b_l])
+        all_points = torch.cat([r_p, b_p])
+        
+        # 2. Filter Active Centers
+        # A center is active if it connects to >=1 Red Node AND >=1 Blue Node.
+        is_red_point = all_points < N
+        
+        # Find centers connected to Red Points
+        centers_with_red = torch.unique(all_centers[is_red_point])
+        # Find centers connected to Blue Points
+        centers_with_blue = torch.unique(all_centers[~is_red_point])
+        
+        # Intersection
+        valid_centers = centers_with_red[torch.isin(centers_with_red, centers_with_blue)]
+        
+        if valid_centers.numel() == 0:
+            raise ValueError("No valid clusters found (Intersection Empty).")
+            
+        print(f"         Active Centers: {valid_centers.numel()}")
+        
+        # 3. Filter Edges to Valid Centers Only
+        mask_valid = torch.isin(all_centers, valid_centers)
+        all_centers = all_centers[mask_valid]
+        all_levels = all_levels[mask_valid]
+        all_points = all_points[mask_valid]
+        is_red_point = is_red_point[mask_valid] # Re-slice mask
+        
+        # 4. Map Sparse Center IDs to Dense IDs (0..K-1)
+        # This is required for CSR offsets
+        center_map = torch.searchsorted(valid_centers, all_centers)
+        
+        # 5. Build Red CSR (Points 0..N-1)
+        # Group by Center
+        red_mask = is_red_point
+        red_centers = center_map[red_mask]
+        red_points = all_points[red_mask] # Already 0..N-1
+        red_levels = all_levels[red_mask]
+        
+        # Sort by (Center, Level)
+        max_red_level = red_levels.max().to(torch.long)
+        r_sort_key = (red_centers.to(torch.long) * (max_red_level + 1)) + red_levels.to(torch.long)
+        perm_r = torch.argsort(r_sort_key)
+        
+        self.red_indices = red_points[perm_r].to(device=self.device, dtype=torch.int32)
+        self.red_levels = red_levels[perm_r].to(device=self.device, dtype=torch.int32)
+        sorted_r_centers = red_centers[perm_r]
+        
+        r_counts = torch.bincount(sorted_r_centers, minlength=valid_centers.numel())
+        r_counts_i32 = r_counts.to(device=self.device, dtype=torch.int32)
+        self.red_offsets = torch.cat(
+            [torch.zeros(1, device=self.device, dtype=torch.int32), torch.cumsum(r_counts_i32, 0)]
+        )
+        # Expansion array for scatter operations
+        self.red_expand_center_ids = torch.repeat_interleave(
+            torch.arange(valid_centers.numel(), device=self.device, dtype=torch.int32), r_counts_i32
+        )
+        
+        # 6. Build Blue CSR (Points N..2N-1 -> Remap to 0..N-1)
+        # Inverted Index: We need to lookup Neighbors of Blue Points efficiently.
+        # Blue CSR: Rows = Blue Points, Cols = Centers
+        blue_mask = ~is_red_point
+        blue_centers = center_map[blue_mask]
+        blue_points = all_points[blue_mask] - N # Rebase to 0..N-1
+        blue_levels = all_levels[blue_mask]
+        
+        # Sort by Blue Point ID
+        perm_b = torch.argsort(blue_points)
+        self.blue_center_indices = blue_centers[perm_b].to(device=self.device, dtype=torch.int32)
+        self.blue_levels = blue_levels[perm_b].to(device=self.device, dtype=torch.int32)
+        sorted_b_pts = blue_points[perm_b]
+        
+        b_counts = torch.bincount(sorted_b_pts, minlength=N)
+        b_counts_i32 = b_counts.to(device=self.device, dtype=torch.int32)
+        self.blue_offsets = torch.cat(
+            [torch.zeros(1, device=self.device, dtype=torch.int32), torch.cumsum(b_counts_i32, 0)]
+        )
+        
+        print(f"         Red CSR Entries: {self.red_indices.numel()}")
+        print(f"         Blue CSR Entries: {self.blue_center_indices.numel()}")
+
+    def cleanup_remaining_points(self):
+        free_b = torch.nonzero(self.MB == -1).squeeze(1)
+        free_r = torch.nonzero(self.MA == -1).squeeze(1)
+        count = min(free_b.numel(), free_r.numel())
+        if count > 0:
+            self.MB[free_b[:count]] = free_r[:count].to(self.MB.dtype)
+            self.MA[free_r[:count]] = free_b[:count].to(self.MA.dtype)
+        print(f"[Cleanup] Arbitrarily matched {count} remaining pairs.")
+
+    def calculate_final_stats(self):
+        if self.metric == "L1":
+            dists = torch.norm(self.P_blue - self.P_red[self.MB], p=1, dim=1)
+            label = "Manhattan"
+        else:
+            dists = torch.norm(self.P_blue - self.P_red[self.MB], p=2, dim=1)
+            label = "Euclidean"
+        total_cost = dists.sum()
+        avg_cost = total_cost / self.N
+        print(f"Total {label} Cost: {total_cost.item():.4f}")
+        print(f"Avg {label} Cost: {avg_cost.item():.4f}")
+
+    def solve(self):
+        print("[Debug] Entering solve() method...")
+        # print(f"\n[Step 3] Starting Push-Relabel Loop...")
+        iteration = 0
+        use_cuda = self.device.type == "cuda"
+        DEBUG = False
+        DEBUG_EVERY = 50
+        DEBUG_SYNC = False
+        DEBUG_PIPE = False
+
+        def maybe_sync():
+            if use_cuda and DEBUG_SYNC:
+                torch.cuda.synchronize()
+        
+        prev_num_free = None
+        stuck_iters = 0
+        prev_matched_count = None
+
+        while True:
+            # Check convergence
+            B_free = torch.nonzero(self.MB == -1).squeeze(1)
+            num_free = B_free.numel()
+            if num_free <= self.epsilon * self.N:
+                # print("[Converged] Free points <= Threshold. Stopping.")
+                break
+            
+            iteration += 1
+            if prev_num_free is not None and num_free == prev_num_free:
+                stuck_iters += 1
+            else:
+                stuck_iters = 0
+            prev_num_free = num_free
+            should_dbg = DEBUG and (iteration % DEBUG_EVERY == 0 or stuck_iters >= 20)
+            dbg_total_edges = 0
+            dbg_eq0 = 0
+            dbg_leq0 = 0
+            dbg_min_slack_est = None
+            dbg_max_slack_est = None
+            zero_deg = 0
+            if DEBUG_PIPE:
+                dbg_cand_initial = 0
+                dbg_after_free_u = 0
+                dbg_after_free_v = 0
+                dbg_after_conflict = 0
+                dbg_after_commit = 0
+            if iteration % 10 == 0:
+                print(f"    [Iter {iteration}] Free: {num_free}")
+
+            # ---------------------------------------------------------
+            # A. Price Refinement (Global Update)
+            # ---------------------------------------------------------
+            # Calculate max(yA) per cluster
+            maybe_sync()
+            
+            yA_expanded = self.yA[self.red_indices]
+            center_max_yA = torch.zeros(
+                len(self.red_offsets)-1, device=self.device, dtype=torch.int32
+            )
+            # Scatter max: For each cluster, find highest dual weight of connected Red points
+            center_max_yA.scatter_reduce_(
+                0,
+                self.red_expand_center_ids.to(torch.long),
+                yA_expanded,
+                reduce="amax",
+                include_self=False,
+            )
+            center_max_L_A = torch.zeros(
+                len(self.red_offsets)-1, device=self.device, dtype=torch.int32
+            )
+            center_max_L_A.scatter_reduce_(
+                0,
+                self.red_expand_center_ids.to(torch.long),
+                self.red_levels,
+                reduce="amax",
+                include_self=False,
+            )
+            
+            # ---------------------------------------------------------
+            # B. Push Phase (Ragged Gather)
+            # ---------------------------------------------------------
+            maybe_sync()
+            
+            # We process free Blue points in batches to manage memory
+            push_batch_size = 5000 
+            all_win_b = []
+            all_win_c = []
+            all_win_l_b = []
+
+            if should_dbg:
+                starts_all = self.blue_offsets[B_free]
+                ends_all = self.blue_offsets[B_free + 1]
+                lengths_all = ends_all - starts_all
+                dbg_total_edges = int(lengths_all.sum().item())
+                zero_deg = int((lengths_all == 0).sum().item())
+                if zero_deg > 0:
+                    print(f"[DBG it={iteration}] zero-degree free points: {zero_deg}/{num_free}")
+
+            for i in range(0, num_free, push_batch_size):
+                chunk = B_free[i : i + push_batch_size]
+                
+                # Get CSR ranges for these points
+                starts = self.blue_offsets[chunk]
+                ends = self.blue_offsets[chunk + 1]
+                lengths = ends - starts
+                total_edges = int(lengths.sum().item())
+                
+                if total_edges == 0:
+                    self.yB[chunk] += 1 # Relabel disconnected points
+                    continue
+
+                # Vectorized ragged access via repeat_interleave
+                # 1. Expand Point IDs to match edges
+                active_b_ids = torch.repeat_interleave(chunk, lengths)
+                
+                # 2. Compute indices into flat CSR arrays
+                # offset within segment = range(len)
+                cum_len = torch.cumsum(lengths, 0)
+                segment_starts_packed = cum_len - lengths
+                global_range = torch.arange(total_edges, device=self.device)
+                repeat_packed_starts = torch.repeat_interleave(segment_starts_packed, lengths)
+                offsets = global_range - repeat_packed_starts
+                
+                repeat_starts = torch.repeat_interleave(starts, lengths)
+                active_edge_indices = repeat_starts + offsets
+                
+                # 3. Gather Edge Attributes
+                active_c_ids = self.blue_center_indices[active_edge_indices]
+                active_b_levels = self.blue_levels[active_edge_indices]
+
+                # 4. Slack Check
+                # Condition: Slack <= 0
+                # Slack_Lower_Bound = 2 * Level - yB - Max_yA
+                slacks_est = (
+                    2 * active_b_levels 
+                    - self.yB[active_b_ids] 
+                    - center_max_yA[active_c_ids]
+                )
+                active_max_L_A = center_max_L_A[active_c_ids]
+                slacks_high = (
+                    2 * torch.maximum(active_b_levels, active_max_L_A)
+                    - self.yB[active_b_ids]
+                    - center_max_yA[active_c_ids]
+                )
+
+                if should_dbg:
+                    dbg_eq0 += int((slacks_est == 0).sum().item())
+                    dbg_leq0 += int((slacks_est <= 0).sum().item())
+                    local_min = int(slacks_est.min().item())
+                    local_max = int(slacks_est.max().item())
+                    if dbg_min_slack_est is None or local_min < dbg_min_slack_est:
+                        dbg_min_slack_est = local_min
+                    if dbg_max_slack_est is None or local_max > dbg_max_slack_est:
+                        dbg_max_slack_est = local_max
+
+                candidates = (slacks_est <= 0) & (slacks_high >= 0)
+                
+                if candidates.any():
+                    all_win_b.append(active_b_ids[candidates])
+                    all_win_c.append(active_c_ids[candidates])
+                    all_win_l_b.append(active_b_levels[candidates])
+            
+            # Combine candidates from all batches
+            if not all_win_b:
+                win_b = torch.empty(0, device=self.device, dtype=torch.long)
+                win_c = torch.empty(0, device=self.device, dtype=torch.long)
+                win_l_b = torch.empty(0, device=self.device, dtype=torch.long)
+            else:
+                win_b = torch.cat(all_win_b)
+                win_c = torch.cat(all_win_c)
+                win_l_b = torch.cat(all_win_l_b)
+            if should_dbg and dbg_min_slack_est is None:
+                dbg_min_slack_est = 0
+                dbg_max_slack_est = 0
+            if DEBUG_PIPE:
+                dbg_cand_initial = int(win_b.numel())
+                dbg_after_free_u = int(win_b.numel())
+                dbg_after_free_v = int(win_b.numel())
+            
+            # ---------------------------------------------------------
+            # C. Resolve Phase (Conflict Resolution)
+            # ---------------------------------------------------------
+            if win_b.numel() != 0:
+                # Identify free Red points
+                free_red_mask = self.MA[self.red_indices] == -1
+                red_ids = self.red_indices[free_red_mask]
+                red_levels = self.red_levels[free_red_mask]
+                red_c_ids = self.red_expand_center_ids[free_red_mask]
+
+                if red_ids.numel() != 0:
+                    # Sort candidates by (Center, Level) to match Red's sorting
+                    max_level = torch.maximum(win_l_b.max(), red_levels.max()).to(torch.long)
+                    key_scale = max_level + 1
+
+                    b_sort_key = (win_c.to(torch.long) * key_scale) + win_l_b.to(torch.long)
+                    b_perm = torch.argsort(b_sort_key)
+                    
+                    b_sorted = win_b[b_perm]
+                    c_sorted = win_c[b_perm]
+                    l_b_sorted = win_l_b[b_perm]
+
+                    # Match available Reds to candidate Blues per Center
+                    # Since both arrays are sorted by Center, we can use counts/offsets
+                    num_centers = self.red_offsets.numel() - 1
+                    
+                    b_counts = torch.bincount(c_sorted, minlength=num_centers)
+                    r_counts = torch.bincount(red_c_ids, minlength=num_centers)
+                    limits = torch.minimum(b_counts, r_counts) # Min available
+
+                    # Calculate ranks to pair 1-to-1
+                    b_offsets_scan = torch.zeros(num_centers + 1, device=self.device, dtype=torch.long)
+                    b_offsets_scan[1:] = torch.cumsum(b_counts, 0)
+                    
+                    r_offsets_scan = torch.zeros(num_centers + 1, device=self.device, dtype=torch.long)
+                    r_offsets_scan[1:] = torch.cumsum(r_counts, 0)
+
+                    b_rank = torch.arange(c_sorted.numel(), device=self.device) - b_offsets_scan[c_sorted]
+                    r_rank = torch.arange(red_c_ids.numel(), device=self.device) - r_offsets_scan[red_c_ids]
+
+                    b_keep = b_rank < limits[c_sorted]
+                    r_keep = r_rank < limits[red_c_ids]
+
+                    b_final = b_sorted[b_keep]
+                    l_b_final = l_b_sorted[b_keep]
+                    r_final = red_ids[r_keep]
+                    l_r_final = red_levels[r_keep]
+
+                    # Exact Slack Check (now that we have pairs)
+                    # Slack = 2 * max(L_b, L_a) - yB - yA
+                    # Note: We must pair them 1-to-1. The filtering above ensures equal counts per center.
+                    # However, strictly speaking, we need to ensure the *ordering* aligns the lowest slack pairs.
+                    # Since we sorted by level, we are pairing lowest levels first.
+                    
+                    pair_count = min(b_final.numel(), r_final.numel())
+                    if pair_count > 0:
+                        b_final = b_final[:pair_count]
+                        r_final = r_final[:pair_count]
+                        l_b_final = l_b_final[:pair_count]
+                        l_r_final = l_r_final[:pair_count]
+                        if DEBUG_PIPE:
+                            dbg_after_conflict = int(b_final.numel())
+
+                        prev_match_count = None
+                        if DEBUG_PIPE:
+                            prev_match_count = int((self.MA != -1).sum().item())
+                        y_b = self.yB[b_final]
+                        y_a = self.yA[r_final]
+                        
+                        slack = 2 * torch.maximum(l_b_final, l_r_final) - y_b - y_a
+                        valid = slack == 0
+
+                        b_match = b_final[valid]
+                        r_match = r_final[valid]
+                        
+                        if b_match.numel() != 0:
+                            self.MB[b_match] = r_match.to(self.MB.dtype)
+                            self.MA[r_match] = b_match.to(self.MA.dtype)
+                        if DEBUG_PIPE:
+                            new_count = int((self.MA != -1).sum().item())
+                            dbg_after_commit = new_count - prev_match_count
+
+            # ---------------------------------------------------------
+            # D. Relabel Phase
+            # ---------------------------------------------------------
+            # Increase potential of unmatched Blue points to help them find edges
+            still_free = torch.nonzero(self.MB == -1).squeeze(1)
+            self.yB[still_free] += 1
+            
+            # Decrease potential of matched Red points to maintain constraints
+            matched_r = torch.nonzero(self.MA != -1).squeeze(1)
+            self.yA[matched_r] -= 1
+            matched_now = self.N - still_free.numel()
+            if should_dbg:
+                delta_matched = 0 if prev_matched_count is None else matched_now - prev_matched_count
+                print(
+                    f"[DBG it={iteration}] free={num_free} stuck={stuck_iters} edges={dbg_total_edges} "
+                    f"zeroDeg={zero_deg} eq0={dbg_eq0} leq0={dbg_leq0} "
+                    f"minSlack={dbg_min_slack_est} maxSlack={dbg_max_slack_est} "
+                    f"matched={matched_now}/{self.N} deltaMatched={delta_matched}"
+                )
+            if DEBUG_PIPE and stuck_iters >= 20:
+                print(
+                    f"[PIPE it={iteration}] init={dbg_cand_initial} freeU={dbg_after_free_u} "
+                    f"freeV={dbg_after_free_v} resolved={dbg_after_conflict} "
+                    f"committed={dbg_after_commit}"
+                )
+            prev_matched_count = matched_now
+            
+            if iteration > 50000:
+                # print("Max Iterations Reached.")
+                break
+
+        self.cleanup_remaining_points()
+        print(f"Matched: {(self.MB != -1).sum().item()}/{self.N}")
+        self.calculate_final_stats()
+
+
+def solve_bipartite_matching(x, y, epsilon, k=4, batch_size=None, metric="L2"):
+    """Public interface. Returns the assignment vector."""
+    if k is None or k < 2:
+        solver = TwoLevelBipartiteSolver(x, y, epsilon, batch_size=batch_size, metric=metric)
+    else:
+        solver = KLevelBipartiteSolver(x, y, epsilon, k=k, batch_size=batch_size, metric=metric)
     solver.solve()
+    return {"assignment_vector": solver.MB}

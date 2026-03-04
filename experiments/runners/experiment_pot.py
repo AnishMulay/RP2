@@ -1,3 +1,6 @@
+import pathlib
+import os
+BASE_DIR = pathlib.Path(__file__).resolve().parent.parent.parent
 import os, time, gzip, csv
 import numpy as np
 import torch
@@ -6,8 +9,8 @@ import torch
 import ot
 
 # Import the GPU OT solvers (assumes these modules are in the same directory or installed)
-from clustered_push_relabel import GPUClusteredSolver as TwoLevelSolver
-from k_level_clustered_push_relabel import GPUClusteredSolver as KLevelSolver
+from clustered_push_relabel.solvers.bipartite import TwoLevelBipartiteSolver as TwoLevelSolver
+from clustered_push_relabel.solvers.bipartite import KLevelBipartiteSolver as KLevelSolver
 
 def load_mnist_data(n_samples, device):
     """Load MNIST images, flatten to 784-D, normalize each to sum 1 (with 1e-6 jitter), and sample two sets."""
