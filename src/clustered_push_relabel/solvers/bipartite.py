@@ -5,6 +5,19 @@ from ..clustering.two_level import FastGPUClustering
 from ..clustering.k_level import FastGPUMultiLevelClustering
 
 class TwoLevelBipartiteSolver:
+    """
+    Bipartite matching solver using a two-level (flat) cluster decomposition.
+
+    This engine partitions points into a single layer of spatial cells 
+    to localize push-relabel operations, significantly reducing peak memory.
+
+    Args:
+        P_red (torch.Tensor): Source point set (N, D).
+        P_blue (torch.Tensor): Target point set (N, D).
+        epsilon (float): Base geometric scale for clustering.
+        batch_size (int, optional): Processing chunk size. Defaults to 1024.
+        metric (str, optional): Distance metric ("L2" or "L1"). Defaults to "L2".
+    """
     def __init__(self, P_red, P_blue, epsilon, batch_size=None, metric="L2"):
         self.device = P_red.device
         self.N = P_red.shape[0]
@@ -580,6 +593,20 @@ class TwoLevelBipartiteSolver:
 
 
 class KLevelBipartiteSolver:
+    """
+    Bipartite matching solver using a K-level hierarchical decomposition.
+
+    This engine builds a deep spatial tree of clusters, enabling extreme 
+    scale execution by routing flow through multiple scales of resolution.
+
+    Args:
+        P_red (torch.Tensor): Source point set (N, D).
+        P_blue (torch.Tensor): Target point set (N, D).
+        epsilon (float): Discretization base scale.
+        k (int, optional): Number of levels in the hierarchy. Defaults to 4.
+        batch_size (int, optional): Processing chunk size. Defaults to 2048.
+        metric (str, optional): Distance metric ("L2" or "L1"). Defaults to "L2".
+    """
     def __init__(self, P_red, P_blue, epsilon, k=4, batch_size=None, metric="L2"):
         self.device = P_red.device
         self.N = P_red.shape[0]
@@ -1112,7 +1139,25 @@ class KLevelBipartiteSolver:
 
 
 def solve_bipartite_matching(x, y, epsilon, k=4, batch_size=None, metric="L2"):
-    """Public interface. Returns the assignment vector."""
+    """
+    Solves min-cost bipartite matching using K-level clustered push-relabel.
+
+    Finds a minimum weight perfect matching between a source and target point
+    cloud based on the specified distance metric. For scales k >= 2, routes 
+    assignments through a spatial hierarchy.
+
+    Args:
+        x (torch.Tensor): Source point cloud of shape (N, D).
+        y (torch.Tensor): Target point cloud of shape (N, D).
+        epsilon (float): Discretization / stopping threshold parameter.
+        k (int, optional): Number of hierarchy levels. Defaults to 4.
+        batch_size (int, optional): GPU batch size for clustering. Defaults to None.
+        metric (str, optional): Distance metric ("L2" or "L1"). Defaults to "L2".
+
+    Returns:
+        dict: A dictionary containing the 'assignment_vector' (torch.Tensor) 
+              mapping each target point to a source point.
+    """
     if k is None or k < 2:
         solver = TwoLevelBipartiteSolver(x, y, epsilon, batch_size=batch_size, metric=metric)
     else:

@@ -1,0 +1,24 @@
+site_name: Clustered Push-Relabel
+site_description: High-performance GPU library for discrete Optimal Transport and Bipartite Matching.
+
+theme:
+  name: material
+  features:
+    - navigation.indexes
+    - navigation.tabs
+    - toc.integrate
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: google
+
+nav:
+  - Home: index.md
+  - Getting Started: getting_started.md
+  - API Reference:
+    - Clustering: api/clustering.md
+    - Solvers: api/solvers.md

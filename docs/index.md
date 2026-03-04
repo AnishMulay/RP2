@@ -3,7 +3,6 @@
 [![CI](https://github.com/YourOrg/RP2/actions/workflows/ci.yml/badge.svg)](https://github.com/YourOrg/RP2/actions/workflows/ci.yml)
 [![Python versions](https://img.shields.io/pypi/pyversions/clustered-push-relabel.svg)](https://pypi.org/project/clustered-push-relabel/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![PyPI version](https://badge.fury.io/py/clustered-push-relabel.svg)](https://badge.fury.io/py/clustered-push-relabel)
 
 A high-performance GPU library for discrete Optimal Transport and Bipartite Matching, accelerated by K-level spatial clustering.
 

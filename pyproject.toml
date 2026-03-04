@@ -18,3 +18,7 @@ requires-python = ">=3.8"
 test = [
     "pytest"
 ]
+docs = [
+    "mkdocs-material",
+    "mkdocstrings[python]"
+]

@@ -5,6 +5,22 @@ import math
 from ..clustering.k_level import FastGPUMultiLevelClustering
 
 class GPUClusteredOTSolver:
+    """
+    Stateful underlying engine for hierarchical optimal transport.
+    
+    Tracks mass conservation and fractional flow across nested spatial clusters 
+    using the dual variables of the push-relabel algorithm.
+    
+    Args:
+        P_red (torch.Tensor): Source point cloud (N, D).
+        P_blue (torch.Tensor): Target point cloud (M, D).
+        DA (torch.Tensor): Source mass distribution (N,).
+        SB (torch.Tensor): Target mass distribution (M,).
+        epsilon (float): Discretization and scaling threshold.
+        k (int, optional): Number of clustering levels. Defaults to 4.
+        batch_size (int, optional): CPU/GPU Batch parameter. Defaults to 2048.
+        metric (str, optional): Distance metric ("L1" or "L2"). Defaults to "L2".
+    """
     def __init__(self, P_red, P_blue, DA, SB, epsilon, k=4, batch_size=2048, metric="L2"):
         self.device = P_red.device
         self.N = P_red.shape[0]
@@ -211,6 +227,10 @@ class GPUClusteredOTSolver:
             iteration += 1
             if iteration % 100 == 0:
                 print(f"    [Iter {iteration}] Remaining Flow: {f.item()}")
+            
+            if iteration > 5000:
+                print("Max Iterations Reached.")
+                break
                 
         self.de_scale_and_cleanup()
 
@@ -234,7 +254,28 @@ class GPUClusteredOTSolver:
 
 
 def solve_optimal_transport(x, y, mass_x, mass_y, epsilon, k=4, batch_size=2048, metric="L2"):
-    """Public interface. Extracts the sparse flow plan from solver state."""
+    """
+    Solves discrete Optimal Transport using K-level clustered push-relabel.
+
+    Finds the fractional mass routing between two un-normalized distributions
+    that minimizes the total transport cost defined by the distance metric.
+
+    Args:
+        x (torch.Tensor): Source point coordinates of shape (N, D).
+        y (torch.Tensor): Target point coordinates of shape (M, D).
+        mass_x (torch.Tensor): Masses for source points of shape (N,).
+        mass_y (torch.Tensor): Masses for target points of shape (M,).
+        epsilon (float): Discretization / stopping threshold parameter.
+        k (int, optional): Number of hierarchy levels. Defaults to 4.
+        batch_size (int, optional): GPU batch size for clustering. Defaults to 2048.
+        metric (str, optional): Distance metric ("L2" or "L1"). Defaults to "L2".
+
+    Returns:
+        dict: A dictionary representing the sparse transport plan containing:
+            - 'source_edges' (torch.Tensor): Source point indices.
+            - 'target_edges' (torch.Tensor): Target point indices.
+            - 'flow' (torch.Tensor): The fractional mass transported across each edge.
+    """
     solver = GPUClusteredOTSolver(x, y, mass_x, mass_y, epsilon, k=k, batch_size=batch_size, metric=metric)
     solver.solve()
     solver.de_scale_and_cleanup()

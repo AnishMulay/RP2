@@ -4,6 +4,15 @@ from ..utils.distance import TiledEuclideanKernel, TiledManhattanKernel
 class FastGPUMultiLevelClustering:
     """
     Implements the Multi-Level Hierarchical Clustering (Decomposition) on GPU.
+
+    This stateful engine partitions point clouds into a hierarchy of clusters, 
+    forming a spatial tree to accelerate distance and flow computations.
+
+    Args:
+        epsilon (float): The base radius/scale parameter for clustering discretization.
+        k (int, optional): Number of levels in the clustering hierarchy. Defaults to 4.
+        batch_size (int, optional): GPU batch size for processing centers. Defaults to 2048.
+        metric (str, optional): Distance metric to use ("L2" or "L1"). Defaults to "L2".
     """
     def __init__(self, epsilon, k=4, batch_size=2048, metric="L2"):
         self.epsilon = epsilon
@@ -113,7 +122,26 @@ class FastGPUMultiLevelClustering:
         return blue_coo, red_coo, levels_red, levels_blue
 
 def k_level_cluster(x, y, epsilon, k=4, batch_size=2048, metric="L2"):
-    """Public functional interface for K-Level Clustering."""
+    """
+    Public functional interface for K-Level Clustering.
+
+    Partitions two point clouds into a K-level unified hierarchy of spatial cells.
+
+    Args:
+        x (torch.Tensor): Source point cloud of shape (N, D).
+        y (torch.Tensor): Target point cloud of shape (M, D).
+        epsilon (float): Discretization base radius parameter.
+        k (int, optional): Number of hierarchy levels. Defaults to 4.
+        batch_size (int, optional): GPU batch size for distance calculations. Defaults to 2048.
+        metric (str, optional): Distance metric ("L2" or "L1"). Defaults to "L2".
+
+    Returns:
+        dict: A dictionary containing:
+            - 'blue_cover' (tuple): COO tensor representation of edges (centers, levels, points) for the target (blue) points.
+            - 'red_cover' (tuple): COO tensor representation of edges (centers, levels, points) for the source (red) points.
+            - 'levels_red' (torch.Tensor): Sampled discrete level assignments for each source point.
+            - 'levels_blue' (torch.Tensor): Sampled discrete level assignments for each target point.
+    """
     model = FastGPUMultiLevelClustering(epsilon=epsilon, k=k, batch_size=batch_size, metric=metric)
     blue_coo, red_coo, levels_red, levels_blue = model.run(x, y)
     return {
