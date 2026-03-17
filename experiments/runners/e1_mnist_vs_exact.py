@@ -20,14 +20,49 @@ try:
 except ImportError as e:
     raise ImportError(f"Error importing solvers: {e}")
 
-# MNIST data loader (expects MNIST files in ./data)
-def load_mnist_flat(n_samples, seed=0):
+# MNIST data loader
+def resolve_mnist_paths(data_dir=None):
+    """Resolve MNIST image/label file paths from an explicit dir or common repo locations."""
+    candidate_dirs = []
+    if data_dir:
+        candidate_dirs.append(pathlib.Path(data_dir))
+
+    env_data_dir = os.environ.get("MNIST_DATA_DIR")
+    if env_data_dir:
+        candidate_dirs.append(pathlib.Path(env_data_dir))
+
+    candidate_dirs.extend([
+        BASE_DIR / "data",
+        BASE_DIR / "experiments" / "data",
+        pathlib.Path.cwd() / "data",
+        pathlib.Path.cwd() / "experiments" / "data",
+    ])
+
+    seen = set()
+    deduped_dirs = []
+    for directory in candidate_dirs:
+        resolved = directory.expanduser().resolve()
+        if resolved not in seen:
+            deduped_dirs.append(resolved)
+            seen.add(resolved)
+
+    for directory in deduped_dirs:
+        img_path = directory / "train-images-idx3-ubyte.gz"
+        lbl_path = directory / "train-labels-idx1-ubyte.gz"
+        if img_path.is_file() and lbl_path.is_file():
+            return img_path, lbl_path
+
+    searched = ", ".join(str(path) for path in deduped_dirs)
+    raise FileNotFoundError(
+        "MNIST data files not found. Searched: "
+        f"{searched}. Expected train-images-idx3-ubyte.gz and "
+        "train-labels-idx1-ubyte.gz."
+    )
+
+def load_mnist_flat(n_samples, seed=0, data_dir=None):
     """Load MNIST images, normalize pixels to [0,1], sample n_samples for red and blue."""
     import gzip
-    img_path = os.path.join("data", "train-images-idx3-ubyte.gz")
-    lbl_path = os.path.join("data", "train-labels-idx1-ubyte.gz")
-    if not os.path.isfile(img_path) or not os.path.isfile(lbl_path):
-        raise FileNotFoundError("MNIST data files not found in ./data/. Please download train-images-idx3-ubyte.gz and train-labels-idx1-ubyte.gz.")
+    img_path, lbl_path = resolve_mnist_paths(data_dir=data_dir)
     # Load images
     with gzip.open(img_path, "rb") as f:
         images = np.frombuffer(f.read(), dtype=np.uint8, offset=16).reshape(-1, 784)
@@ -70,6 +105,7 @@ def main():
     parser.add_argument("--trials", type=int, default=1, help="Trials per N (different random samples)")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
     parser.add_argument("--csv", type=str, default="results_e1_mnist.csv", help="Output CSV file")
+    parser.add_argument("--data_dir", type=str, default=None, help="Directory containing MNIST .gz files")
     parser.add_argument("--with_sinkhorn", action="store_true", help="Include entropic Sinkhorn baseline")
     args = parser.parse_args()
 
@@ -98,7 +134,7 @@ def main():
             trial_seed = base_seed + t
             print(f"\nRunning MNIST n={n}, trial {t+1}")
             # Load data
-            red, blue = load_mnist_flat(n, seed=trial_seed)
+            red, blue = load_mnist_flat(n, seed=trial_seed, data_dir=args.data_dir)
             # Move to GPU for our solvers
             P_red = red.to(device)
             P_blue = blue.to(device)

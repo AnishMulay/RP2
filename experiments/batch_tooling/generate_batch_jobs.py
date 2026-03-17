@@ -31,6 +31,11 @@ PATH=/usr/bin:/bin:$PATH conda activate clusterenv
 
 echo "Starting Job for N={n}"
 
+MNIST_DATA_ARGS=()
+if [ -n "${MNIST_DATA_DIR:-}" ]; then
+  MNIST_DATA_ARGS=(--data_dir "$MNIST_DATA_DIR")
+fi
+
 # Run the script for a SPECIFIC N
 # We use --n_values {n} so it only runs that one size
 # We write to a unique CSV for this job
@@ -38,8 +43,9 @@ python -u experiments/runners/e1_mnist_vs_exact.py \\
   --n_values {n} \\
   --epsilon 0.01 \\
   --k 4 \\
-  --trials 10 \\
+  --trials 1 \\
   --seed 42 \\
+  "${MNIST_DATA_ARGS[@]}" \\
   --csv batch/results/results_n{n}.csv
 
 echo "Job N={n} Complete"
