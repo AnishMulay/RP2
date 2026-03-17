@@ -1,8 +1,8 @@
 import os
 
 # Configuration
-min_n = 100
-max_n = 5100
+min_n = 1000
+max_n = 20000
 step = 100
 template_path = "batch/scripts/job_n{}.sh"
 
@@ -34,7 +34,7 @@ echo "Starting Job for N={n}"
 # Run the script for a SPECIFIC N
 # We use --n_values {n} so it only runs that one size
 # We write to a unique CSV for this job
-python -u e1_mnist_vs_exact.py \\
+python -u experiments/runners/e1_mnist_vs_exact.py \\
   --n_values {n} \\
   --epsilon 0.01 \\
   --k 4 \\
@@ -48,6 +48,10 @@ conda deactivate || true
 """
 
 def generate_scripts():
+    os.makedirs("batch/scripts", exist_ok=True)
+    os.makedirs("batch/logs", exist_ok=True)
+    os.makedirs("batch/results", exist_ok=True)
+
     count = 0
     # Range is inclusive of max_n, so we add 1 to the stop value
     for n in range(min_n, max_n + 1, step):

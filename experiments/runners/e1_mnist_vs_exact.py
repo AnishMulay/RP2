@@ -4,6 +4,7 @@ BASE_DIR = pathlib.Path(__file__).resolve().parent.parent.parent
 #!/usr/bin/env python3
 import os, csv, time
 import argparse
+import math
 import numpy as np
 import torch
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
