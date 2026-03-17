@@ -32,7 +32,7 @@ PATH=/usr/bin:/bin:$PATH conda activate clusterenv
 echo "Starting Job for N={n}"
 
 MNIST_DATA_ARGS=()
-if [ -n "${MNIST_DATA_DIR:-}" ]; then
+if [ -n "${{MNIST_DATA_DIR:-}}" ]; then
   MNIST_DATA_ARGS=(--data_dir "$MNIST_DATA_DIR")
 fi
 
@@ -45,7 +45,7 @@ python -u experiments/runners/e1_mnist_vs_exact.py \\
   --k 4 \\
   --trials 1 \\
   --seed 42 \\
-  "${MNIST_DATA_ARGS[@]}" \\
+  "${{MNIST_DATA_ARGS[@]}}" \\
   --csv batch/results/results_n{n}.csv
 
 echo "Job N={n} Complete"
