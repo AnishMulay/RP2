@@ -3,7 +3,7 @@ import os
 # Configuration
 min_n = 1000
 max_n = 20000
-step = 100
+step = 1000
 template_path = "batch/scripts/job_n{}.sh"
 
 # Slurm Header Template (Based on your provided script)
