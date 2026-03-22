@@ -29,7 +29,7 @@ from clustered_push_relabel.clustering.k_level import k_level_cluster
 from clustered_push_relabel.utils.distance import TiledEuclideanKernel
 
 
-K_SEARCH_VALUES = [1, 2, 4, 8, 16, 24, 32, 48, 64]
+K_SEARCH_VALUES = [1, 2, 4, 8, 16, 24, 32, 48, 64, 128, 256, 512, 1024]
 NOISE_STD = 0.5
 EF_CONSTRUCTION = 200
 
