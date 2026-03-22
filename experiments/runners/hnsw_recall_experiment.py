@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import pathlib
 import sys
-from collections import defaultdict
 
 import numpy as np
 import torch
@@ -25,6 +24,7 @@ SRC_DIR = BASE_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from cluster_search import CoverIndex
 from clustered_push_relabel.clustering.k_level import k_level_cluster
 from clustered_push_relabel.utils.distance import TiledEuclideanKernel
 
@@ -78,33 +78,6 @@ def generate_dataset_and_queries(
     return dataset, query_points
 
 
-def build_cover_dicts(blue_cover: tuple[torch.Tensor, torch.Tensor, torch.Tensor], n_points: int) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
-    center_ids, level_ids, point_ids = blue_cover
-    if not (center_ids.numel() == level_ids.numel() == point_ids.numel()):
-        raise ValueError("blue_cover tensors must be parallel 1D tensors of equal length.")
-
-    point_to_centers_sets: dict[int, set[int]] = defaultdict(set)
-    center_to_members_sets: dict[int, set[int]] = defaultdict(set)
-
-    # k_level_cluster builds cover edges against the concatenated red/blue workspace.
-    # Here x == y == dataset, so collapse both copies back to the underlying dataset ID.
-    for center_id, point_id in zip(center_ids.tolist(), point_ids.tolist()):
-        point_idx = int(point_id) % n_points
-        center_idx = int(center_id)
-        point_to_centers_sets[point_idx].add(center_idx)
-        center_to_members_sets[center_idx].add(point_idx)
-
-    point_to_centers = {
-        point_idx: sorted(center_ids_for_point)
-        for point_idx, center_ids_for_point in point_to_centers_sets.items()
-    }
-    center_to_members = {
-        center_idx: sorted(member_ids)
-        for center_idx, member_ids in center_to_members_sets.items()
-    }
-    return point_to_centers, center_to_members
-
-
 def build_hnsw_index(dataset_cpu: np.ndarray, m: int) -> hnswlib.Index:
     n, dim = dataset_cpu.shape
     index = hnswlib.Index(space="l2", dim=dim)
@@ -146,20 +119,46 @@ def topk_from_distances(
     return candidate_tensor[topk_local].tolist()
 
 
+def normalize_candidate_ids(candidate_ids: list[int], n_points: int) -> list[int]:
+    normalized: dict[int, None] = {}
+    for candidate_id in candidate_ids:
+        normalized.setdefault(int(candidate_id) % n_points, None)
+    return list(normalized)
+
+
+def exact_topk_from_candidates(
+    dataset: torch.Tensor,
+    query: torch.Tensor,
+    kernel: TiledEuclideanKernel,
+    candidate_ids: list[int],
+    k: int,
+) -> list[int]:
+    if not candidate_ids:
+        return []
+
+    candidate_tensor = torch.tensor(candidate_ids, device=dataset.device, dtype=torch.long)
+    candidate_points = dataset.index_select(0, candidate_tensor)
+    candidate_workspace = kernel.prepare_workspace(candidate_points)
+    candidate_distances_sq = kernel.compute_dist_tile(query, candidate_workspace).squeeze(1)
+    k_eff = min(k, candidate_tensor.numel())
+    topk_local = torch.topk(candidate_distances_sq, k=k_eff, largest=False).indices
+    return candidate_tensor[topk_local].tolist()
+
+
 def evaluate(
     dataset: torch.Tensor,
     query_points: torch.Tensor,
     query_points_cpu: np.ndarray,
-    point_to_centers: dict[int, list[int]],
-    center_to_members: dict[int, list[int]],
+    cover_index: CoverIndex,
     index: hnswlib.Index,
-) -> tuple[dict[int, float], dict[int, float]]:
+) -> tuple[dict[int, float], dict[int, float], float]:
     max_k = max(K_SEARCH_VALUES)
     kernel = TiledEuclideanKernel(chunk_size=4096)
     workspace = kernel.prepare_workspace(dataset)
 
     hnsw_hits = {k: 0.0 for k in K_SEARCH_VALUES}
     clustering_hits = {k: 0.0 for k in K_SEARCH_VALUES}
+    total_candidate_count = 0.0
 
     for query_idx in range(query_points.shape[0]):
         query = query_points[query_idx : query_idx + 1]
@@ -168,15 +167,9 @@ def evaluate(
 
         query_vector = query_points_cpu[query_idx : query_idx + 1]
         anchor_point = get_anchor_point(index, query_vector)
-        candidate_ids_set = {anchor_point}
-        for center_idx in point_to_centers.get(anchor_point, []):
-            candidate_ids_set.update(center_to_members.get(center_idx, []))
-        candidate_ids = sorted(candidate_ids_set)
-        clustering_top = topk_from_distances(
-            distances_sq,
-            max_k,
-            candidate_ids=candidate_ids,
-        )
+        candidate_ids = normalize_candidate_ids(cover_index.get_candidates(anchor_point), dataset.shape[0])
+        total_candidate_count += len(candidate_ids)
+        clustering_top = exact_topk_from_candidates(dataset, query, kernel, candidate_ids, max_k)
 
         brute_force_sets = {
             k_search: set(brute_force_top[:k_search])
@@ -193,7 +186,8 @@ def evaluate(
     n_queries = float(query_points.shape[0])
     hnsw_recall = {k: hnsw_hits[k] / n_queries for k in K_SEARCH_VALUES}
     clustering_recall = {k: clustering_hits[k] / n_queries for k in K_SEARCH_VALUES}
-    return hnsw_recall, clustering_recall
+    avg_candidate_count = total_candidate_count / n_queries if n_queries else 0.0
+    return hnsw_recall, clustering_recall, avg_candidate_count
 
 
 def save_plot(hnsw_recall: dict[int, float], clustering_recall: dict[int, float], m: int) -> pathlib.Path:
@@ -218,12 +212,18 @@ def save_plot(hnsw_recall: dict[int, float], clustering_recall: dict[int, float]
     return output_path
 
 
-def print_results_table(hnsw_recall: dict[int, float], clustering_recall: dict[int, float]) -> None:
+def print_results_table(
+    hnsw_recall: dict[int, float],
+    clustering_recall: dict[int, float],
+    avg_candidate_count: float,
+) -> None:
     print()
     print(f"{'k_search':>8} | {'HNSW recall':>11} | {'Clustering-aided recall':>24}")
     print("-" * 50)
     for k_search in K_SEARCH_VALUES:
         print(f"{k_search:>8d} | {hnsw_recall[k_search]:>11.4f} | {clustering_recall[k_search]:>24.4f}")
+    print()
+    print(f"Average candidate set size: {avg_candidate_count:.1f}")
 
 
 def main() -> None:
@@ -247,7 +247,7 @@ def main() -> None:
 
     print("Building k-level cover...")
     cover = k_level_cluster(dataset, dataset, epsilon=args.epsilon, k=args.k_cluster)
-    point_to_centers, center_to_members = build_cover_dicts(cover["blue_cover"], args.n)
+    cover_index = CoverIndex(cover["blue_cover"])
 
     print("Preparing HNSW index...")
     dataset_cpu = dataset.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -255,16 +255,15 @@ def main() -> None:
     index = build_hnsw_index(dataset_cpu, args.M)
 
     print("Evaluating recall...")
-    hnsw_recall, clustering_recall = evaluate(
+    hnsw_recall, clustering_recall, avg_candidate_count = evaluate(
         dataset=dataset,
         query_points=query_points,
         query_points_cpu=query_points_cpu,
-        point_to_centers=point_to_centers,
-        center_to_members=center_to_members,
+        cover_index=cover_index,
         index=index,
     )
 
-    print_results_table(hnsw_recall, clustering_recall)
+    print_results_table(hnsw_recall, clustering_recall, avg_candidate_count)
     output_path = save_plot(hnsw_recall, clustering_recall, args.M)
     print()
     print(f"Saved plot to {output_path}")

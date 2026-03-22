@@ -8,7 +8,8 @@ version = "0.1.0"
 dependencies = [
     "torch",
     "numpy",
-    "POT"
+    "POT",
+    "hnswlib"
 ]
 description = "Clustered Push-Relabel Solver for Min Cost Bipartite Matching and Optimal Transport"
 readme = "README.md"
@@ -21,4 +22,16 @@ test = [
 docs = [
     "mkdocs-material",
     "mkdocstrings[python]"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = [
+    "clustered_push_relabel",
+    "clustered_push_relabel.*",
+    "cluster_search",
+    "cluster_search.*"
 ]
