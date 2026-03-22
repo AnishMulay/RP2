@@ -58,11 +58,24 @@ def sync_if_needed(device: torch.device) -> None:
         torch.cuda.synchronize()
 
 
-def generate_dataset(n: int, dim: int, n_clusters: int, device: torch.device) -> torch.Tensor:
-    centroids = torch.randn(n_clusters, dim, device=device)
-    assignments = torch.randint(0, n_clusters, (n,), device=device)
-    points = centroids[assignments] + NOISE_STD * torch.randn(n, dim, device=device)
+def sample_points_from_centroids(centroids: torch.Tensor, n_points: int) -> torch.Tensor:
+    n_clusters, dim = centroids.shape
+    assignments = torch.randint(0, n_clusters, (n_points,), device=centroids.device)
+    points = centroids[assignments] + NOISE_STD * torch.randn(n_points, dim, device=centroids.device)
     return torch.nn.functional.normalize(points, p=2, dim=1)
+
+
+def generate_dataset_and_queries(
+    n: int,
+    dim: int,
+    n_clusters: int,
+    n_queries: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    centroids = torch.randn(n_clusters, dim, device=device)
+    dataset = sample_points_from_centroids(centroids, n)
+    query_points = sample_points_from_centroids(centroids, n_queries)
+    return dataset, query_points
 
 
 def build_cover_dicts(blue_cover: tuple[torch.Tensor, torch.Tensor, torch.Tensor], n_points: int) -> tuple[dict[int, list[int]], dict[int, list[int]]]:
@@ -100,10 +113,10 @@ def build_hnsw_index(dataset_cpu: np.ndarray, m: int) -> hnswlib.Index:
     return index
 
 
-def query_hnsw(index: hnswlib.Index, query_vector: np.ndarray, query_idx: int, k_search: int) -> list[int]:
+def query_hnsw(index: hnswlib.Index, query_vector: np.ndarray, k_search: int) -> list[int]:
     index.set_ef(max(k_search, 50))
     labels, _ = index.knn_query(query_vector, k=k_search)
-    return [int(label) for label in labels[0] if int(label) != query_idx][:k_search]
+    return [int(label) for label in labels[0][:k_search]]
 
 
 def get_anchor_point(index: hnswlib.Index, query_vector: np.ndarray) -> int:
@@ -115,26 +128,18 @@ def get_anchor_point(index: hnswlib.Index, query_vector: np.ndarray) -> int:
 def topk_from_distances(
     distances_sq: torch.Tensor,
     k: int,
-    exclude_idx: int,
     candidate_ids: list[int] | None = None,
 ) -> list[int]:
     if candidate_ids is None:
-        working = distances_sq.clone()
-        working[exclude_idx] = float("inf")
-        k_eff = min(k, working.numel() - 1)
+        k_eff = min(k, distances_sq.numel())
         if k_eff <= 0:
             return []
-        return torch.topk(working, k=k_eff, largest=False).indices.tolist()
+        return torch.topk(distances_sq, k=k_eff, largest=False).indices.tolist()
 
     if not candidate_ids:
         return []
 
     candidate_tensor = torch.tensor(candidate_ids, device=distances_sq.device, dtype=torch.long)
-    keep_mask = candidate_tensor != exclude_idx
-    candidate_tensor = candidate_tensor[keep_mask]
-    if candidate_tensor.numel() == 0:
-        return []
-
     candidate_distances = distances_sq.index_select(0, candidate_tensor)
     k_eff = min(k, candidate_tensor.numel())
     topk_local = torch.topk(candidate_distances, k=k_eff, largest=False).indices
@@ -143,11 +148,11 @@ def topk_from_distances(
 
 def evaluate(
     dataset: torch.Tensor,
-    dataset_cpu: np.ndarray,
+    query_points: torch.Tensor,
+    query_points_cpu: np.ndarray,
     point_to_centers: dict[int, list[int]],
     center_to_members: dict[int, list[int]],
     index: hnswlib.Index,
-    query_indices: list[int],
 ) -> tuple[dict[int, float], dict[int, float]]:
     max_k = max(K_SEARCH_VALUES)
     kernel = TiledEuclideanKernel(chunk_size=4096)
@@ -156,12 +161,12 @@ def evaluate(
     hnsw_hits = {k: 0.0 for k in K_SEARCH_VALUES}
     clustering_hits = {k: 0.0 for k in K_SEARCH_VALUES}
 
-    for query_idx in query_indices:
-        query = dataset[query_idx : query_idx + 1]
+    for query_idx in range(query_points.shape[0]):
+        query = query_points[query_idx : query_idx + 1]
         distances_sq = kernel.compute_dist_tile(query, workspace).squeeze(1)
-        brute_force_top = topk_from_distances(distances_sq, max_k, exclude_idx=query_idx)
+        brute_force_top = topk_from_distances(distances_sq, max_k)
 
-        query_vector = dataset_cpu[query_idx : query_idx + 1]
+        query_vector = query_points_cpu[query_idx : query_idx + 1]
         anchor_point = get_anchor_point(index, query_vector)
         candidate_ids_set = {anchor_point}
         for center_idx in point_to_centers.get(anchor_point, []):
@@ -170,7 +175,6 @@ def evaluate(
         clustering_top = topk_from_distances(
             distances_sq,
             max_k,
-            exclude_idx=query_idx,
             candidate_ids=candidate_ids,
         )
 
@@ -180,13 +184,13 @@ def evaluate(
         }
 
         for k_search in K_SEARCH_VALUES:
-            hnsw_result = query_hnsw(index, query_vector, query_idx, k_search)
+            hnsw_result = query_hnsw(index, query_vector, k_search)
             clustering_result = clustering_top[:k_search]
 
             hnsw_hits[k_search] += len(brute_force_sets[k_search].intersection(hnsw_result)) / k_search
             clustering_hits[k_search] += len(brute_force_sets[k_search].intersection(clustering_result)) / k_search
 
-    n_queries = float(len(query_indices))
+    n_queries = float(query_points.shape[0])
     hnsw_recall = {k: hnsw_hits[k] / n_queries for k in K_SEARCH_VALUES}
     clustering_recall = {k: clustering_hits[k] / n_queries for k in K_SEARCH_VALUES}
     return hnsw_recall, clustering_recall
@@ -231,11 +235,14 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
-    if args.n_queries > args.n:
-        raise ValueError("--n_queries must be less than or equal to --n.")
-
     print(f"Generating dataset on {device}...")
-    dataset = generate_dataset(args.n, args.dim, args.n_clusters, device)
+    dataset, query_points = generate_dataset_and_queries(
+        args.n,
+        args.dim,
+        args.n_clusters,
+        args.n_queries,
+        device,
+    )
     sync_if_needed(device)
 
     print("Building k-level cover...")
@@ -244,18 +251,17 @@ def main() -> None:
 
     print("Preparing HNSW index...")
     dataset_cpu = dataset.detach().cpu().numpy().astype(np.float32, copy=False)
+    query_points_cpu = query_points.detach().cpu().numpy().astype(np.float32, copy=False)
     index = build_hnsw_index(dataset_cpu, args.M)
-
-    query_indices = torch.randperm(args.n, device=device)[: args.n_queries].cpu().tolist()
 
     print("Evaluating recall...")
     hnsw_recall, clustering_recall = evaluate(
         dataset=dataset,
-        dataset_cpu=dataset_cpu,
+        query_points=query_points,
+        query_points_cpu=query_points_cpu,
         point_to_centers=point_to_centers,
         center_to_members=center_to_members,
         index=index,
-        query_indices=query_indices,
     )
 
     print_results_table(hnsw_recall, clustering_recall)
