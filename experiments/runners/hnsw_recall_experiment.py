@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n", type=int, default=10_000)
     parser.add_argument("--dim", type=int, default=128)
     parser.add_argument("--n_clusters", type=int, default=50)
-    parser.add_argument("--epsilon", type=float, default=0.5)
+    parser.add_argument("--epsilon", type=float, default=0.01)
     parser.add_argument("--k_cluster", type=int, default=4)
     parser.add_argument("--M", type=int, default=16)
     parser.add_argument("--n_queries", type=int, default=200)
