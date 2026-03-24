@@ -24,11 +24,15 @@ class CoverIndex:
 
         self._point_to_shells: dict[int, list[tuple[int, int]]] = {}
         self._shell_to_members: dict[tuple[int, int], list[int]] = {}
+        self._center_to_max_level: dict[int, int] = {}
 
         for center_id, level_id, point_id in zip(center_ids, level_ids, point_ids):
             shell = (center_id, level_id)
             self._point_to_shells.setdefault(point_id, []).append(shell)
             self._shell_to_members.setdefault(shell, []).append(point_id)
+            current_max = self._center_to_max_level.get(center_id, -1)
+            if level_id > current_max:
+                self._center_to_max_level[center_id] = level_id
 
     @staticmethod
     def _normalize_coo(coo: object) -> tuple[list[int], list[int], list[int]]:
@@ -81,6 +85,33 @@ class CoverIndex:
             for member_id in self._shell_to_members.get(shell, ()):
                 candidates.setdefault(member_id, None)
         return list(candidates)
+
+    def get_shell_members(self, center_id: int, level_id: int) -> list[int]:
+        """Returns the point IDs stored in a specific shell.
+
+        Args:
+            center_id: Center identifier of the shell.
+            level_id: Level identifier of the shell.
+
+        Returns:
+            A list of point IDs in the ``(center_id, level_id)`` shell. Returns
+            an empty list when the shell is not indexed.
+        """
+
+        return list(self._shell_to_members.get((center_id, level_id), ()))
+
+    def get_max_level(self, center_id: int) -> int:
+        """Returns the maximum indexed shell level for a center.
+
+        Args:
+            center_id: Center identifier to look up.
+
+        Returns:
+            The maximum ``level_id`` observed for ``center_id`` across all
+            indexed shells, or ``-1`` when the center does not exist.
+        """
+
+        return self._center_to_max_level.get(center_id, -1)
 
     def num_shells(self) -> int:
         """Returns the number of unique shells in the index.
