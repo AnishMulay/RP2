@@ -93,12 +93,6 @@ def query_hnsw(index: hnswlib.Index, query_vector: np.ndarray, k_search: int) ->
     return [int(label) for label in labels[0][:k_search]]
 
 
-def get_anchor_point(index: hnswlib.Index, query_vector: np.ndarray) -> int:
-    index.set_ef(50)
-    labels, _ = index.knn_query(query_vector, k=1)
-    return int(labels[0, 0])
-
-
 def topk_from_distances(
     distances_sq: torch.Tensor,
     k: int,
@@ -127,6 +121,7 @@ def evaluate(
     cover_index: CoverIndex,
     index: hnswlib.Index,
     epsilon: float,
+    m: int,
 ) -> tuple[dict[int, float], dict[int, float], float]:
     max_k = max(K_SEARCH_VALUES)
     kernel = TiledEuclideanKernel(chunk_size=4096)
@@ -142,9 +137,8 @@ def evaluate(
         brute_force_top = topk_from_distances(distances_sq, max_k)
 
         query_vector = query_points_cpu[query_idx : query_idx + 1]
-        anchor_point = get_anchor_point(index, query_vector)
-        seeds = [anchor_point]
-        clustering_top = cluster_search(
+        seeds = query_hnsw(index, query_vector, k_search=m)
+        candidates = cluster_search(
             seeds,
             cover_index,
             dataset,
@@ -152,7 +146,15 @@ def evaluate(
             max_k,
             epsilon,
         )
-        total_candidate_count += len(clustering_top)
+        total_candidate_count += len(candidates)
+
+        if candidates:
+            candidate_tensor = torch.tensor(candidates, device=distances_sq.device, dtype=torch.long)
+            candidate_distances = distances_sq.index_select(0, candidate_tensor)
+            sorted_local = torch.argsort(candidate_distances)
+            clustering_top = candidate_tensor[sorted_local].tolist()
+        else:
+            clustering_top = []
 
         brute_force_sets = {
             k_search: set(brute_force_top[:k_search])
@@ -245,6 +247,7 @@ def main() -> None:
         cover_index=cover_index,
         index=index,
         epsilon=args.epsilon,
+        m=args.M,
     )
 
     print_results_table(hnsw_recall, clustering_recall, avg_candidate_count)

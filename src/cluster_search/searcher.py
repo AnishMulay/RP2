@@ -18,7 +18,8 @@ def cluster_search(
     """Expands HNSW seed points through a shell cover.
 
     Args:
-        seeds: Point IDs returned by HNSW.
+        seeds: Exactly M point IDs returned by HNSW (where M is the HNSW base-layer
+            connection count), covering the regime where HNSW is reliable.
         cover_index: A ``CoverIndex`` built from ``build_cover``.
         dataset: Full dataset tensor of shape ``(N, D)``.
         kernel: A ``TiledEuclideanKernel`` instance. It is accepted for API
