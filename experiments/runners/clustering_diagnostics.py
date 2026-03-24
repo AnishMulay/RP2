@@ -115,15 +115,19 @@ def compute_proxy_distance(
     point_x: int,
     point_y: int,
     epsilon: float,
-    shell_cache: dict[int, set[tuple[int, int]]],
+    shell_cache: dict[int, dict[int, int]],
 ) -> float | None:
-    shells_x = shell_cache.setdefault(point_x, set(cover_index.get_shells(point_x)))
-    shells_y = shell_cache.setdefault(point_y, set(cover_index.get_shells(point_y)))
-    shared_shells = shells_x.intersection(shells_y)
-    if not shared_shells:
+    center_to_level_x = shell_cache.setdefault(point_x, dict(cover_index.get_shells(point_x)))
+    center_to_level_y = shell_cache.setdefault(point_y, dict(cover_index.get_shells(point_y)))
+    shared_centers = center_to_level_x.keys() & center_to_level_y.keys()
+    if not shared_centers:
         return None
-    smallest_level = min(level_id for _, level_id in shared_shells)
-    return 2.0 * float(smallest_level) * epsilon
+
+    best_center = min(
+        shared_centers,
+        key=lambda center_id: max(center_to_level_x[center_id], center_to_level_y[center_id]),
+    )
+    return float(center_to_level_x[best_center] + center_to_level_y[best_center]) * epsilon
 
 
 def run_diagnostic_1(dataset: torch.Tensor) -> None:
@@ -165,14 +169,14 @@ def run_proxy_diagnostics(dataset: torch.Tensor, cover_index: CoverIndex) -> Non
         dim=1,
     ).detach().cpu()
 
-    shell_cache: dict[int, set[tuple[int, int]]] = {}
+    shell_cache: dict[int, dict[int, int]] = {}
     ratios: list[float] = []
-    no_shared_shell = 0
+    no_shared_center = 0
 
     for point_x, point_y, true_distance in zip(pair_i.cpu().tolist(), pair_j.cpu().tolist(), true_distances.tolist()):
         proxy_distance = compute_proxy_distance(cover_index, point_x, point_y, EPSILON, shell_cache)
         if proxy_distance is None:
-            no_shared_shell += 1
+            no_shared_center += 1
             continue
 
         if true_distance <= 0.0:
@@ -181,20 +185,20 @@ def run_proxy_diagnostics(dataset: torch.Tensor, cover_index: CoverIndex) -> Non
             ratio = proxy_distance / true_distance
         ratios.append(ratio)
 
-    print("Diagnostic 3 - Shared-shell coverage for proxy distances")
+    print("Diagnostic 3 - Shared-center coverage for proxy distances")
     print(f"  sampled pairs: {PROXY_SAMPLE_COUNT}")
-    print(f"  pairs with no shared shell: {no_shared_shell}")
-    print(f"  fraction with no shared shell: {no_shared_shell / PROXY_SAMPLE_COUNT:.6f}")
+    print(f"  pairs with no shared center: {no_shared_center}")
+    print(f"  fraction with no shared center: {no_shared_center / PROXY_SAMPLE_COUNT:.6f}")
     print()
 
     print("Diagnostic 4 - Distance proxy approximation quality")
     if not ratios:
-        print("  no ratios were available because none of the sampled pairs shared a shell")
+        print("  no ratios were available because none of the sampled pairs shared a center")
         print()
         return
 
     ratio_tensor = torch.tensor(ratios, dtype=torch.float64)
-    print(f"  pairs with a shared shell: {ratio_tensor.numel()}")
+    print(f"  pairs with a shared center: {ratio_tensor.numel()}")
     print(f"  minimum ratio observed: {ratio_tensor.min().item():.6f}")
     print_distribution_summary(ratio_tensor, RATIO_QUANTILES)
 
