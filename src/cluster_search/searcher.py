@@ -47,10 +47,15 @@ def cluster_search(
             break
         _proxy_distance, center_id, level_id, delta_c = heapq.heappop(heap)
 
-        for point_id in cover_index.get_shell_members(center_id, level_id):
-            if point_id not in results:
-                results.add(point_id)
-                result_list.append(point_id)
+        if level_id == 0:
+            if center_id not in results:
+                results.add(center_id)
+                result_list.append(center_id)
+        else:
+            for point_id in cover_index.get_shell_members(center_id, level_id):
+                if point_id not in results:
+                    results.add(point_id)
+                    result_list.append(point_id)
 
         next_level = level_id + 1
         if next_level <= cover_index.get_max_level(center_id):
