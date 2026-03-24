@@ -42,7 +42,9 @@ def cluster_search(
             delta_c = torch.norm(dataset[seed] - dataset[center_id], p=2).item()
             heapq.heappush(heap, (delta_c, center_id, 0, delta_c))
 
-    while len(results) < k_prime and heap:
+    while len(results) < k_prime:
+        if not heap:
+            break
         _proxy_distance, center_id, level_id, delta_c = heapq.heappop(heap)
 
         for point_id in cover_index.get_shell_members(center_id, level_id):

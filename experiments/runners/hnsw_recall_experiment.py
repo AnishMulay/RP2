@@ -142,6 +142,7 @@ def evaluate(
         seeds = query_hnsw(index, query_vector, k_search=m)
 
         for k_search in K_SEARCH_VALUES:
+            print(f"query {query_idx + 1}/{query_points.shape[0]}, k_search={k_search}")
             hnsw_result = query_hnsw(index, query_vector, k_search)
 
             candidates = cluster_search(
