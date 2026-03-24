@@ -38,9 +38,9 @@ def cluster_search(
     result_list: list[int] = []
 
     for seed in seeds:
-        for center_id, _level_id in cover_index.get_shells(seed):
-            delta_c = torch.norm(dataset[seed] - dataset[center_id], p=2).item()
-            heapq.heappush(heap, (delta_c, center_id, 0, delta_c))
+        for center_id, v_level in cover_index.get_shells(seed):
+            base_proxy = epsilon * v_level
+            heapq.heappush(heap, (base_proxy, center_id, v_level, base_proxy))
 
     while len(results) < k_prime:
         if not heap:
