@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import pathlib
 import sys
 
@@ -45,6 +46,18 @@ QUANTILES: list[tuple[float, str]] = [
     (0.99, "99th"),
 ]
 RATIO_QUANTILES: list[tuple[float, str]] = QUANTILES + [(1.00, "100th")]
+NEAREST_NEIGHBOR_RATIO_QUANTILES: list[tuple[float, str]] = [
+    (0.01, "p1"),
+    (0.05, "p5"),
+    (0.10, "p10"),
+    (0.25, "p25"),
+    (0.50, "p50"),
+    (0.75, "p75"),
+    (0.90, "p90"),
+    (0.95, "p95"),
+    (0.99, "p99"),
+    (1.00, "p100"),
+]
 
 
 def require_cuda() -> torch.device:
@@ -200,7 +213,7 @@ def run_proxy_diagnostics(dataset: torch.Tensor, cover_index: CoverIndex) -> Non
     ratio_tensor = torch.tensor(ratios, dtype=torch.float64)
     print(f"  pairs with a shared center: {ratio_tensor.numel()}")
     print(f"  minimum ratio observed: {ratio_tensor.min().item():.6f}")
-    print_distribution_summary(ratio_tensor, RATIO_QUANTILES)
+    print_distribution_summary(ratio_tensor, NEAREST_NEIGHBOR_RATIO_QUANTILES)
 
     below_one_fraction = (ratio_tensor < 1.0).to(torch.float64).mean().item()
     if below_one_fraction > 0.0:
@@ -209,6 +222,59 @@ def run_proxy_diagnostics(dataset: torch.Tensor, cover_index: CoverIndex) -> Non
 
     exceeds_three_fraction = (ratio_tensor > 3.0).to(torch.float64).mean().item()
     print(f"  fraction of ratios exceeding 3: {exceeds_three_fraction:.6f}")
+    print()
+
+
+def run_diagnostic_5(dataset: torch.Tensor, cover_index: CoverIndex) -> None:
+    sqrt_n = int(math.sqrt(N_POINTS))
+    shell_cache: dict[int, dict[int, int]] = {}
+    ratios: list[float] = []
+    no_shared_center = 0
+    total_pairs = 0
+
+    print("Diagnostic 5 - Distance proxy approximation for sqrt(N) nearest neighbors")
+    print(f"  sqrt(N): {sqrt_n}")
+
+    for point_x in range(N_POINTS):
+        true_distances = torch.norm(dataset - dataset[point_x], dim=1)
+        sorted_indices = torch.argsort(true_distances)
+        neighbor_indices = sorted_indices[sorted_indices != point_x][:sqrt_n]
+
+        for point_y in neighbor_indices.tolist():
+            total_pairs += 1
+            true_distance = true_distances[point_y].item()
+            proxy_distance = compute_proxy_distance(cover_index, point_x, point_y, EPSILON, shell_cache)
+            if proxy_distance is None:
+                no_shared_center += 1
+                continue
+
+            if true_distance <= 0.0:
+                ratio = float("inf") if proxy_distance > 0.0 else 1.0
+            else:
+                ratio = proxy_distance / true_distance
+            ratios.append(ratio)
+
+    print(f"  processed pairs: {total_pairs}")
+    print(f"  pairs with no shared center: {no_shared_center}")
+    print(f"  fraction with no shared center: {no_shared_center / total_pairs:.6f}")
+
+    if not ratios:
+        print("  no ratios were available because none of the nearest-neighbor pairs shared a center")
+        print()
+        return
+
+    ratio_tensor = torch.tensor(ratios, dtype=torch.float64)
+    print(f"  pairs with a shared center: {ratio_tensor.numel()}")
+    print(f"  minimum ratio observed: {ratio_tensor.min().item():.6f}")
+    print_distribution_summary(ratio_tensor, RATIO_QUANTILES)
+
+    below_one_fraction = (ratio_tensor < 1.0).to(torch.float64).mean().item()
+    if below_one_fraction > 0.0:
+        print("  warning: at least one proxy ratio is below 1.0")
+        print(f"  fraction of ratios below 1: {below_one_fraction:.6f}")
+
+    exceeds_one_plus_epsilon_fraction = (ratio_tensor > (1.0 + EPSILON)).to(torch.float64).mean().item()
+    print(f"  fraction of ratios exceeding 1 + epsilon (1.01): {exceeds_one_plus_epsilon_fraction:.6f}")
     print()
 
 
@@ -230,6 +296,7 @@ def main() -> None:
     run_diagnostic_1(dataset)
     run_diagnostic_2(dataset, query, kernel, workspace)
     run_proxy_diagnostics(dataset, cover_index)
+    run_diagnostic_5(dataset, cover_index)
 
 
 if __name__ == "__main__":
