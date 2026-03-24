@@ -85,6 +85,11 @@ def build_cover(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Builds a single clustering cover over one point set.
 
+    Sampled centers (hierarchy level > 0) attract points with no restriction.
+    Non-sampled centers (level == 0) enforce strict Voronoi regions: point p
+    is only assigned to a level-0 center q when p and q share the same nearest
+    sampled center, i.e. they lie in the same Voronoi cell of the sampled set.
+
     Args:
         P: A 2D tensor of shape ``(N, D)`` containing the point set.
         epsilon: Base shell radius used to quantize distances into level IDs.
@@ -118,6 +123,30 @@ def build_cover(
     workspace = kernel.prepare_workspace(P)
     sampled_levels = _sample_hierarchy_levels(n, k, P.device)
 
+    # Identify sampled centers: all points assigned a hierarchy level > 0.
+    sampled_center_indices = torch.nonzero(sampled_levels > 0).squeeze(1)
+    num_sampled = sampled_center_indices.shape[0]
+
+    # For every point in P, find the index (into sampled_center_indices) of its
+    # nearest sampled center.  Used to enforce Voronoi ownership for level-0
+    # centers.  Computed in tiles to stay within GPU memory.
+    if num_sampled > 0:
+        sampled_centers = P[sampled_center_indices]
+        voronoi_min_dist = torch.full((n,), float("inf"), device=P.device)
+        voronoi_owner = torch.zeros(n, dtype=torch.long, device=P.device)
+
+        for start in range(0, num_sampled, batch_size):
+            end = min(start + batch_size, num_sampled)
+            batch_sampled = sampled_centers[start:end]
+            # dists: (n, end-start)  — squared distances (kernel convention)
+            dists = kernel.compute_dist_tile(batch_sampled, workspace).t()
+            batch_min, batch_argmin = dists.min(dim=1)
+            update_mask = batch_min < voronoi_min_dist
+            voronoi_min_dist[update_mask] = batch_min[update_mask]
+            voronoi_owner[update_mask] = start + batch_argmin[update_mask]
+    else:
+        voronoi_owner = torch.zeros(n, dtype=torch.long, device=P.device)
+
     all_center_ids: list[torch.Tensor] = []
     all_level_ids: list[torch.Tensor] = []
     all_point_ids: list[torch.Tensor] = []
@@ -139,6 +168,19 @@ def build_cover(
             workspace=workspace,
             batch_size=batch_size,
         )
+
+        # Enforce strict Voronoi regions for non-sampled (level-0) centers.
+        # Point p may only join center q when p and q share the same nearest
+        # sampled center, i.e. voronoi_owner[p] == voronoi_owner[q].
+        if level == 0 and num_sampled > 0 and center_ids.numel() > 0:
+            c_dev = center_ids.to(P.device)
+            p_dev = point_ids.to(P.device)
+            keep = voronoi_owner[p_dev] == voronoi_owner[c_dev]
+            keep_cpu = keep.cpu()
+            center_ids = center_ids[keep_cpu]
+            level_ids = level_ids[keep_cpu]
+            point_ids = point_ids[keep_cpu]
+
         all_center_ids.append(center_ids)
         all_level_ids.append(level_ids)
         all_point_ids.append(point_ids)
