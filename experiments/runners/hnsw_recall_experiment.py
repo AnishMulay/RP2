@@ -125,7 +125,6 @@ def evaluate(
 ) -> tuple[dict[int, float], dict[int, float], float]:
     kernel = TiledEuclideanKernel(chunk_size=4096)
     workspace = kernel.prepare_workspace(dataset)
-    max_k_search = max(K_SEARCH_VALUES)
 
     hnsw_hits = {k: 0.0 for k in K_SEARCH_VALUES}
     clustering_hits = {k: 0.0 for k in K_SEARCH_VALUES}
@@ -142,20 +141,19 @@ def evaluate(
 
         query_vector = query_points_cpu[query_idx : query_idx + 1]
         seeds = query_hnsw(index, query_vector, k_search=m)
-        candidates = cluster_search(
-            seeds,
-            cover_index,
-            dataset,
-            kernel,
-            max_k_search,
-            epsilon,
-        )
-        total_candidate_count += len(candidates)
-        clustering_top = topk_from_distances(distances_sq, max_k_search, candidates)
 
         for k_search in K_SEARCH_VALUES:
             hnsw_result = query_hnsw(index, query_vector, k_search)
-            clustering_result = clustering_top[:k_search]
+            candidates = cluster_search(
+                seeds,
+                cover_index,
+                dataset,
+                kernel,
+                k_search,
+                epsilon,
+            )
+            total_candidate_count += len(candidates)
+            clustering_result = topk_from_distances(distances_sq, k_search, candidates)
 
             hnsw_hits[k_search] += len(brute_force_top[k_search].intersection(hnsw_result)) / k_search
             clustering_hits[k_search] += len(brute_force_top[k_search].intersection(clustering_result)) / k_search
