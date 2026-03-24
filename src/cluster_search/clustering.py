@@ -138,9 +138,10 @@ def build_cover(
         for start in range(0, num_sampled, batch_size):
             end = min(start + batch_size, num_sampled)
             batch_sampled = sampled_centers[start:end]
-            # dists: (n, end-start)  — squared distances (kernel convention)
+            # compute_dist_tile returns (N, |batch|); after .t() -> (|batch|, N)
+            # min(dim=0) reduces over the batch axis -> shape (N,)
             dists = kernel.compute_dist_tile(batch_sampled, workspace).t()
-            batch_min, batch_argmin = dists.min(dim=1)
+            batch_min, batch_argmin = dists.min(dim=0)
             update_mask = batch_min < voronoi_min_dist
             voronoi_min_dist[update_mask] = batch_min[update_mask]
             voronoi_owner[update_mask] = start + batch_argmin[update_mask]
