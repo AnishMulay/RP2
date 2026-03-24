@@ -25,7 +25,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from cluster_search import CoverIndex
-from clustered_push_relabel.clustering.k_level import k_level_cluster
+from cluster_search import build_cover
+from cluster_search import cluster_search
 from clustered_push_relabel.utils.distance import TiledEuclideanKernel
 
 
@@ -119,38 +120,13 @@ def topk_from_distances(
     return candidate_tensor[topk_local].tolist()
 
 
-def normalize_candidate_ids(candidate_ids: list[int], n_points: int) -> list[int]:
-    normalized: dict[int, None] = {}
-    for candidate_id in candidate_ids:
-        normalized.setdefault(int(candidate_id) % n_points, None)
-    return list(normalized)
-
-
-def exact_topk_from_candidates(
-    dataset: torch.Tensor,
-    query: torch.Tensor,
-    kernel: TiledEuclideanKernel,
-    candidate_ids: list[int],
-    k: int,
-) -> list[int]:
-    if not candidate_ids:
-        return []
-
-    candidate_tensor = torch.tensor(candidate_ids, device=dataset.device, dtype=torch.long)
-    candidate_points = dataset.index_select(0, candidate_tensor)
-    candidate_workspace = kernel.prepare_workspace(candidate_points)
-    candidate_distances_sq = kernel.compute_dist_tile(query, candidate_workspace).squeeze(1)
-    k_eff = min(k, candidate_tensor.numel())
-    topk_local = torch.topk(candidate_distances_sq, k=k_eff, largest=False).indices
-    return candidate_tensor[topk_local].tolist()
-
-
 def evaluate(
     dataset: torch.Tensor,
     query_points: torch.Tensor,
     query_points_cpu: np.ndarray,
     cover_index: CoverIndex,
     index: hnswlib.Index,
+    epsilon: float,
 ) -> tuple[dict[int, float], dict[int, float], float]:
     max_k = max(K_SEARCH_VALUES)
     kernel = TiledEuclideanKernel(chunk_size=4096)
@@ -167,9 +143,16 @@ def evaluate(
 
         query_vector = query_points_cpu[query_idx : query_idx + 1]
         anchor_point = get_anchor_point(index, query_vector)
-        candidate_ids = normalize_candidate_ids(cover_index.get_candidates(anchor_point), dataset.shape[0])
-        total_candidate_count += len(candidate_ids)
-        clustering_top = exact_topk_from_candidates(dataset, query, kernel, candidate_ids, max_k)
+        seeds = [anchor_point]
+        clustering_top = cluster_search(
+            seeds,
+            cover_index,
+            dataset,
+            kernel,
+            max_k,
+            epsilon,
+        )
+        total_candidate_count += len(clustering_top)
 
         brute_force_sets = {
             k_search: set(brute_force_top[:k_search])
@@ -246,8 +229,8 @@ def main() -> None:
     sync_if_needed(device)
 
     print("Building k-level cover...")
-    cover = k_level_cluster(dataset, dataset, epsilon=args.epsilon, k=args.k_cluster)
-    cover_index = CoverIndex(cover["blue_cover"])
+    cover = build_cover(dataset, epsilon=args.epsilon, k=args.k_cluster)
+    cover_index = CoverIndex(cover)
 
     print("Preparing HNSW index...")
     dataset_cpu = dataset.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -261,6 +244,7 @@ def main() -> None:
         query_points_cpu=query_points_cpu,
         cover_index=cover_index,
         index=index,
+        epsilon=args.epsilon,
     )
 
     print_results_table(hnsw_recall, clustering_recall, avg_candidate_count)
