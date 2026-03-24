@@ -30,7 +30,7 @@ from cluster_search import cluster_search
 from clustered_push_relabel.utils.distance import TiledEuclideanKernel
 
 
-K_SEARCH_VALUES = [1, 2, 4, 8, 16, 24, 32, 48, 64, 128, 256, 512, 1024]
+K_SEARCH_VALUES = [32, 48, 64, 128, 256, 512, 1024]
 NOISE_STD = 0.5
 EF_CONSTRUCTION = 200
 
@@ -125,12 +125,14 @@ def evaluate(
 ) -> tuple[dict[int, float], dict[int, float], float]:
     kernel = TiledEuclideanKernel(chunk_size=4096)
     workspace = kernel.prepare_workspace(dataset)
+    max_k_search = max(K_SEARCH_VALUES)
 
     hnsw_hits = {k: 0.0 for k in K_SEARCH_VALUES}
     clustering_hits = {k: 0.0 for k in K_SEARCH_VALUES}
     total_candidate_count = 0.0
 
     for query_idx in range(query_points.shape[0]):
+        print(f"query {query_idx + 1}/{query_points.shape[0]}")
         query = query_points[query_idx : query_idx + 1]
         distances_sq = kernel.compute_dist_tile(query, workspace).squeeze(1)
         brute_force_top = {
@@ -140,28 +142,20 @@ def evaluate(
 
         query_vector = query_points_cpu[query_idx : query_idx + 1]
         seeds = query_hnsw(index, query_vector, k_search=m)
+        candidates = cluster_search(
+            seeds,
+            cover_index,
+            dataset,
+            kernel,
+            max_k_search,
+            epsilon,
+        )
+        total_candidate_count += len(candidates)
+        clustering_top = topk_from_distances(distances_sq, max_k_search, candidates)
 
         for k_search in K_SEARCH_VALUES:
-            print(f"query {query_idx + 1}/{query_points.shape[0]}, k_search={k_search}")
             hnsw_result = query_hnsw(index, query_vector, k_search)
-
-            candidates = cluster_search(
-                seeds,
-                cover_index,
-                dataset,
-                kernel,
-                k_search,
-                epsilon,
-            )
-            total_candidate_count += len(candidates)
-
-            if candidates:
-                candidate_tensor = torch.tensor(candidates, device=distances_sq.device, dtype=torch.long)
-                candidate_distances = distances_sq.index_select(0, candidate_tensor)
-                sorted_local = torch.argsort(candidate_distances)
-                clustering_result = candidate_tensor[sorted_local].tolist()
-            else:
-                clustering_result = []
+            clustering_result = clustering_top[:k_search]
 
             hnsw_hits[k_search] += len(brute_force_top[k_search].intersection(hnsw_result)) / k_search
             clustering_hits[k_search] += len(brute_force_top[k_search].intersection(clustering_result)) / k_search
@@ -169,8 +163,7 @@ def evaluate(
     n_queries = float(query_points.shape[0])
     hnsw_recall = {k: hnsw_hits[k] / n_queries for k in K_SEARCH_VALUES}
     clustering_recall = {k: clustering_hits[k] / n_queries for k in K_SEARCH_VALUES}
-    n_evals = n_queries * len(K_SEARCH_VALUES)
-    avg_candidate_count = total_candidate_count / n_evals if n_evals else 0.0
+    avg_candidate_count = total_candidate_count / n_queries if n_queries else 0.0
     return hnsw_recall, clustering_recall, avg_candidate_count
 
 
