@@ -39,8 +39,8 @@ def cluster_search(
 
     for seed in seeds:
         for center_id, v_level in cover_index.get_shells(seed):
-            base_proxy = epsilon * v_level
-            heapq.heappush(heap, (base_proxy, center_id, v_level, base_proxy))
+            delta_c = epsilon * v_level
+            heapq.heappush(heap, (delta_c, center_id, 0, delta_c))
 
     while len(results) < k_prime:
         if not heap:
