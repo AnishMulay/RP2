@@ -62,4 +62,29 @@ def cluster_search(
             next_proxy = delta_c + epsilon * next_level
             heapq.heappush(heap, (next_proxy, center_id, next_level, delta_c))
 
+    shell_cache: dict[int, dict[int, int]] = {}
+    for seed in seeds:
+        shell_cache.setdefault(seed, dict(cover_index.get_shells(seed)))
+
+    def min_proxy_distance_to_seeds(point_id: int) -> float:
+        center_to_level_p = shell_cache.setdefault(point_id, dict(cover_index.get_shells(point_id)))
+        best_proxy = float("inf")
+
+        for seed in seeds:
+            center_to_level_seed = shell_cache[seed]
+            shared_centers = center_to_level_seed.keys() & center_to_level_p.keys()
+            if not shared_centers:
+                continue
+
+            best_center = min(
+                shared_centers,
+                key=lambda center_id: max(center_to_level_seed[center_id], center_to_level_p[center_id]),
+            )
+            proxy_distance = float(center_to_level_seed[best_center] + center_to_level_p[best_center]) * epsilon
+            if proxy_distance < best_proxy:
+                best_proxy = proxy_distance
+
+        return best_proxy
+
+    result_list.sort(key=lambda point_id: (min_proxy_distance_to_seeds(point_id), point_id))
     return result_list[:k_prime]
