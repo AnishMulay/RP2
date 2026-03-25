@@ -6,6 +6,7 @@ import math
 import pathlib
 import sys
 
+import hnswlib
 import numpy as np
 import torch
 
@@ -22,6 +23,7 @@ if str(SRC_DIR) not in sys.path:
 
 from cluster_search import CoverIndex
 from cluster_search import build_cover
+from cluster_search.searcher import cluster_search
 from clustered_push_relabel.utils.distance import TiledEuclideanKernel
 
 
@@ -278,6 +280,65 @@ def run_diagnostic_5(dataset: torch.Tensor, cover_index: CoverIndex) -> None:
     print()
 
 
+def run_diagnostic_6(
+    dataset: torch.Tensor,
+    query: torch.Tensor,
+    cover_index: CoverIndex,
+    kernel: TiledEuclideanKernel,
+) -> None:
+    print("Diagnostic 6 - Heap vs proxy brute force sanity check")
+
+    dataset_cpu = dataset.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    query_cpu = query.detach().to(device="cpu", dtype=torch.float32).contiguous()
+
+    index = hnswlib.Index(space="l2", dim=dataset_cpu.shape[1])
+    index.init_index(max_elements=dataset_cpu.shape[0], ef_construction=200, M=16)
+    index.add_items(dataset_cpu.numpy())
+    index.set_ef(1)
+
+    labels, _distances = index.knn_query(query_cpu.numpy(), k=1)
+    point_v = int(labels[0, 0])
+    print(f"  hnsw nearest neighbor seed v: {point_v}")
+
+    shell_cache: dict[int, dict[int, int]] = {}
+    proxy_distances: list[tuple[float, int]] = []
+    for point_p in range(dataset.shape[0]):
+        proxy_distance = compute_proxy_distance(cover_index, point_v, point_p, EPSILON, shell_cache)
+        if proxy_distance is None:
+            proxy_distances.append((float("inf"), point_p))
+        else:
+            proxy_distances.append((proxy_distance, point_p))
+    proxy_distances.sort()
+
+    for k in [10, 50, 100, 200, 500]:
+        method_1_results = {point_id for _distance, point_id in proxy_distances[:k]}
+        method_2_results = set(
+            cluster_search(
+                seeds=[point_v],
+                cover_index=cover_index,
+                dataset=dataset,
+                kernel=kernel,
+                k_prime=k,
+                epsilon=EPSILON,
+            )
+        )
+        intersection_size = len(method_1_results & method_2_results)
+        recovered_fraction = intersection_size / k
+
+        print(
+            "  "
+            f"k={k}, "
+            f"method_1_size={len(method_1_results)}, "
+            f"method_2_size={len(method_2_results)}, "
+            f"intersection_size={intersection_size}, "
+            f"recovered_fraction={recovered_fraction:.6f}"
+        )
+        if recovered_fraction < 1.0:
+            print("  warning: the heap is missing some proxy nearest neighbors")
+
+    print()
+
+
 def main() -> None:
     device = require_cuda()
 
@@ -297,6 +358,7 @@ def main() -> None:
     run_diagnostic_2(dataset, query, kernel, workspace)
     run_proxy_diagnostics(dataset, cover_index)
     run_diagnostic_5(dataset, cover_index)
+    run_diagnostic_6(dataset, query, cover_index, kernel)
 
 
 if __name__ == "__main__":
