@@ -312,7 +312,7 @@ def run_diagnostic_6(
     proxy_distances.sort()
     proxy_distance_by_point = {point_id: proxy_distance for proxy_distance, point_id in proxy_distances}
 
-    for k in [10, 50, 100, 200, 500]:
+    for k in [10, 20, 50, 100, 200, 500]:
         method_1_results = {point_id for _distance, point_id in proxy_distances[:k]}
         method_2_results = set(
             cluster_search(
@@ -335,7 +335,7 @@ def run_diagnostic_6(
             f"intersection_size={intersection_size}, "
             f"recovered_fraction={recovered_fraction:.6f}"
         )
-        if k == 50:
+        if k == 20:
             method_1_only = sorted(
                 (
                     (proxy_distance_by_point[point_id], point_id)
@@ -345,11 +345,11 @@ def run_diagnostic_6(
                 key=lambda item: (item[0], item[1]),
             )
             if not method_1_only:
-                print("  k=50 targeted trace: no missed point in method_1 \\ method_2")
+                print("  k=20 targeted trace: no missed point in method_1 \\ method_2")
                 continue
 
             missed_point = method_1_only[0][1]
-            print(f"  k=50 targeted trace: missed_point={missed_point}")
+            print(f"  k=20 targeted trace: missed_point={missed_point}")
 
             v_shells = list(cover_index.get_shells(point_v))
             missed_point_shells = list(cover_index.get_shells(missed_point))
@@ -418,7 +418,7 @@ def run_diagnostic_6(
                 heapq.heappush(heap, (delta_c, center_id, 0, delta_c))
 
             target_shell_popped = False
-            while len(results) < 50 and heap:
+            while len(results) < 20 and heap:
                 proxy_distance, center_id, level_id, delta_c = heapq.heappop(heap)
 
                 if level_id == 0:
@@ -445,7 +445,7 @@ def run_diagnostic_6(
                     heapq.heappush(heap, (next_proxy, center_id, next_level, delta_c))
 
             print(
-                "  optimal shell visited before collecting 50 results: "
+                "  optimal shell visited before collecting 20 results: "
                 f"{'yes' if target_shell_popped else 'no'}"
             )
 
