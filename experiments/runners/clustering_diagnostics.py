@@ -309,6 +309,7 @@ def run_diagnostic_6(
         else:
             proxy_distances.append((proxy_distance, point_p))
     proxy_distances.sort()
+    proxy_distance_by_point = {point_id: proxy_distance for proxy_distance, point_id in proxy_distances}
 
     for k in [10, 50, 100, 200, 500]:
         method_1_results = {point_id for _distance, point_id in proxy_distances[:k]}
@@ -335,6 +336,33 @@ def run_diagnostic_6(
         )
         if recovered_fraction < 1.0:
             print("  warning: the heap is missing some proxy nearest neighbors")
+        if k == 10:
+            method_1_sorted = sorted(
+                ((proxy_distance_by_point[point_id], point_id) for point_id in method_1_results),
+                key=lambda item: (item[0], item[1]),
+            )
+            method_2_sorted = sorted(
+                ((proxy_distance_by_point[point_id], point_id) for point_id in method_2_results),
+                key=lambda item: (item[0], item[1]),
+            )
+            method_1_only = [item for item in method_1_sorted if item[1] not in method_2_results]
+            method_2_only = [item for item in method_2_sorted if item[1] not in method_1_results]
+
+            print("  method_1 proxy distances:")
+            for proxy_distance, point_id in method_1_sorted:
+                print(f"    point={point_id}, proxy_distance={proxy_distance:.6f}")
+
+            print("  method_2 proxy distances:")
+            for proxy_distance, point_id in method_2_sorted:
+                print(f"    point={point_id}, proxy_distance={proxy_distance:.6f}")
+
+            print("  method_1_only proxy distances:")
+            for proxy_distance, point_id in method_1_only:
+                print(f"    point={point_id}, proxy_distance={proxy_distance:.6f}")
+
+            print("  method_2_only proxy distances:")
+            for proxy_distance, point_id in method_2_only:
+                print(f"    point={point_id}, proxy_distance={proxy_distance:.6f}")
 
     print()
 
