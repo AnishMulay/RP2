@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import pathlib
 import sys
+import heapq
 
 import hnswlib
 import numpy as np
@@ -334,35 +335,119 @@ def run_diagnostic_6(
             f"intersection_size={intersection_size}, "
             f"recovered_fraction={recovered_fraction:.6f}"
         )
-        if recovered_fraction < 1.0:
-            print("  warning: the heap is missing some proxy nearest neighbors")
-        if k == 10:
-            method_1_sorted = sorted(
-                ((proxy_distance_by_point[point_id], point_id) for point_id in method_1_results),
+        if k == 50:
+            method_1_only = sorted(
+                (
+                    (proxy_distance_by_point[point_id], point_id)
+                    for point_id in method_1_results
+                    if point_id not in method_2_results
+                ),
                 key=lambda item: (item[0], item[1]),
             )
-            method_2_sorted = sorted(
-                ((proxy_distance_by_point[point_id], point_id) for point_id in method_2_results),
-                key=lambda item: (item[0], item[1]),
+            if not method_1_only:
+                print("  k=50 targeted trace: no missed point in method_1 \\ method_2")
+                continue
+
+            missed_point = method_1_only[0][1]
+            print(f"  k=50 targeted trace: missed_point={missed_point}")
+
+            v_shells = list(cover_index.get_shells(point_v))
+            missed_point_shells = list(cover_index.get_shells(missed_point))
+            v_center_to_level = dict(v_shells)
+            missed_center_to_level = dict(missed_point_shells)
+
+            print("  v shells:")
+            for center_id, level_id in v_shells:
+                print(
+                    "    "
+                    f"(center_id={center_id}, level_id={level_id}), "
+                    f"v_proxy_contribution={level_id * EPSILON:.6f}"
+                )
+
+            print("  missed_point shells:")
+            for center_id, level_id in missed_point_shells:
+                print(f"    (center_id={center_id}, level_id={level_id})")
+
+            shared_centers = sorted(v_center_to_level.keys() & missed_center_to_level.keys())
+            if not shared_centers:
+                print("  shared centers: none")
+                continue
+
+            print("  shared centers:")
+            for center_id in shared_centers:
+                v_level = v_center_to_level[center_id]
+                p_level = missed_center_to_level[center_id]
+                proxy_distance = (v_level + p_level) * EPSILON
+                max_level = max(v_level, p_level)
+                print(
+                    "    "
+                    f"center_id={center_id}, "
+                    f"v_level={v_level}, "
+                    f"missed_point_level={p_level}, "
+                    f"proxy_distance={proxy_distance:.6f}, "
+                    f"max_level={max_level}"
+                )
+
+            best_center = min(
+                shared_centers,
+                key=lambda center_id: (max(v_center_to_level[center_id], missed_center_to_level[center_id]), center_id),
             )
-            method_1_only = [item for item in method_1_sorted if item[1] not in method_2_results]
-            method_2_only = [item for item in method_2_sorted if item[1] not in method_1_results]
+            best_v_level = v_center_to_level[best_center]
+            best_p_level = missed_center_to_level[best_center]
+            best_proxy_distance = (best_v_level + best_p_level) * EPSILON
+            best_max_level = max(best_v_level, best_p_level)
+            print(
+                "  optimal path: "
+                f"center_id={best_center}, "
+                f"v_level={best_v_level}, "
+                f"missed_point_level={best_p_level}, "
+                f"proxy_distance={best_proxy_distance:.6f}, "
+                f"max_level={best_max_level}"
+            )
 
-            print("  method_1 proxy distances:")
-            for proxy_distance, point_id in method_1_sorted:
-                print(f"    point={point_id}, proxy_distance={proxy_distance:.6f}")
+            target_shell = (best_center, best_p_level)
+            print(
+                "  heap trace toward optimal shell: "
+                f"target_shell=(center_id={target_shell[0]}, level_id={target_shell[1]})"
+            )
 
-            print("  method_2 proxy distances:")
-            for proxy_distance, point_id in method_2_sorted:
-                print(f"    point={point_id}, proxy_distance={proxy_distance:.6f}")
+            heap: list[tuple[float, int, int, float]] = []
+            results: set[int] = set()
+            for center_id, v_level in v_shells:
+                delta_c = EPSILON * v_level
+                heapq.heappush(heap, (delta_c, center_id, 0, delta_c))
 
-            print("  method_1_only proxy distances:")
-            for proxy_distance, point_id in method_1_only:
-                print(f"    point={point_id}, proxy_distance={proxy_distance:.6f}")
+            target_shell_popped = False
+            while len(results) < 50 and heap:
+                proxy_distance, center_id, level_id, delta_c = heapq.heappop(heap)
 
-            print("  method_2_only proxy distances:")
-            for proxy_distance, point_id in method_2_only:
-                print(f"    point={point_id}, proxy_distance={proxy_distance:.6f}")
+                if level_id == 0:
+                    if center_id not in results:
+                        results.add(center_id)
+                else:
+                    for point_id in cover_index.get_shell_members(center_id, level_id):
+                        results.add(point_id)
+
+                print(
+                    "    "
+                    f"popped_shell=(center_id={center_id}, level_id={level_id}), "
+                    f"proxy_distance={proxy_distance:.6f}, "
+                    f"results_collected={len(results)}"
+                )
+
+                if (center_id, level_id) == target_shell:
+                    target_shell_popped = True
+                    break
+
+                next_level = level_id + 1
+                if next_level <= cover_index.get_max_level(center_id):
+                    next_proxy = delta_c + EPSILON * next_level
+                    heapq.heappush(heap, (next_proxy, center_id, next_level, delta_c))
+
+            print(
+                "  optimal shell visited before collecting 50 results: "
+                f"{'yes' if target_shell_popped else 'no'}"
+            )
 
     print()
 
@@ -380,12 +465,12 @@ def main() -> None:
     print()
 
     kernel = TiledEuclideanKernel(chunk_size=4096)
-    workspace = kernel.prepare_workspace(dataset)
+    # workspace = kernel.prepare_workspace(dataset)
 
-    run_diagnostic_1(dataset)
-    run_diagnostic_2(dataset, query, kernel, workspace)
-    run_proxy_diagnostics(dataset, cover_index)
-    run_diagnostic_5(dataset, cover_index)
+    # run_diagnostic_1(dataset)
+    # run_diagnostic_2(dataset, query, kernel, workspace)
+    # run_proxy_diagnostics(dataset, cover_index)
+    # run_diagnostic_5(dataset, cover_index)
     run_diagnostic_6(dataset, query, cover_index, kernel)
 
 
