@@ -34,6 +34,7 @@ N_CLUSTERS = 50
 NOISE_STD = 0.5
 EPSILON = 0.01
 K_CLUSTER = 4
+HNSW_M = 16
 PAIR_SAMPLE_COUNT = 50_000
 PROXY_SAMPLE_COUNT = 10_000
 
@@ -61,6 +62,14 @@ NEAREST_NEIGHBOR_RATIO_QUANTILES: list[tuple[float, str]] = [
     (0.99, "p99"),
     (1.00, "p100"),
 ]
+DIAGNOSTIC_7_QUANTILES: list[tuple[float, str]] = [
+    (0.25, "p25"),
+    (0.50, "p50"),
+    (0.75, "p75"),
+    (0.90, "p90"),
+    (0.95, "p95"),
+    (0.99, "p99"),
+]
 
 
 def require_cuda() -> torch.device:
@@ -81,6 +90,14 @@ def generate_dataset_and_query(device: torch.device) -> tuple[torch.Tensor, torc
     dataset = sample_points_from_centroids(centroids, N_POINTS)
     query = sample_points_from_centroids(centroids, 1)
     return dataset, query
+
+
+def build_hnsw_index(dataset: torch.Tensor, m: int) -> hnswlib.Index:
+    dataset_cpu = dataset.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    index = hnswlib.Index(space="l2", dim=dataset_cpu.shape[1])
+    index.init_index(max_elements=dataset_cpu.shape[0], ef_construction=200, M=m)
+    index.add_items(dataset_cpu.numpy())
+    return index
 
 
 def sample_distinct_pairs(n_points: int, n_pairs: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -286,15 +303,12 @@ def run_diagnostic_6(
     query: torch.Tensor,
     cover_index: CoverIndex,
     kernel: TiledEuclideanKernel,
+    index: hnswlib.Index,
 ) -> None:
     print("Diagnostic 6 - Heap vs proxy brute force sanity check")
 
-    dataset_cpu = dataset.detach().to(device="cpu", dtype=torch.float32).contiguous()
     query_cpu = query.detach().to(device="cpu", dtype=torch.float32).contiguous()
 
-    index = hnswlib.Index(space="l2", dim=dataset_cpu.shape[1])
-    index.init_index(max_elements=dataset_cpu.shape[0], ef_construction=200, M=16)
-    index.add_items(dataset_cpu.numpy())
     index.set_ef(1)
 
     labels, _distances = index.knn_query(query_cpu.numpy(), k=1)
@@ -452,6 +466,68 @@ def run_diagnostic_6(
     print()
 
 
+def run_diagnostic_7(
+    dataset: torch.Tensor,
+    query: torch.Tensor,
+    cover_index: CoverIndex,
+    kernel: TiledEuclideanKernel,
+    index: hnswlib.Index,
+) -> None:
+    print("Diagnostic 7 - Per-rank distance approximation ratio: clustering vs brute force")
+
+    query_cpu = query.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    index.set_ef(1)
+    labels, _distances = index.knn_query(query_cpu.numpy(), k=1)
+    point_v = int(labels[0, 0])
+    print(f"  hnsw nearest neighbor seed v: {point_v}")
+
+    true_distances = torch.norm(dataset - query, dim=1)
+    brute_force_distances, _brute_force_indices = torch.sort(true_distances)
+
+    for k in [10, 20, 50, 100]:
+        brute_force_ranked = brute_force_distances[:k].to(dtype=torch.float64, device="cpu")
+        clustering_points = cluster_search(
+            seeds=[point_v],
+            cover_index=cover_index,
+            dataset=dataset,
+            kernel=kernel,
+            k_prime=k,
+            epsilon=EPSILON,
+        )
+        if len(clustering_points) < k:
+            print(
+                "  "
+                f"k={k}, warning: clustering returned only {len(clustering_points)} points; "
+                "using the available points"
+            )
+
+        clustering_ranked = torch.norm(
+            dataset.index_select(0, torch.tensor(clustering_points, device=dataset.device, dtype=torch.long)) - query,
+            dim=1,
+        ).to(dtype=torch.float64, device="cpu")
+
+        k_eff = min(k, brute_force_ranked.numel(), clustering_ranked.numel())
+        ratios = clustering_ranked[:k_eff] / brute_force_ranked[:k_eff]
+        quantile_probs = torch.tensor([prob for prob, _ in DIAGNOSTIC_7_QUANTILES], dtype=torch.float64)
+        quantile_values = torch.quantile(ratios, quantile_probs).tolist()
+
+        print(f"  k={k}")
+        print(f"    mean_ratio: {ratios.mean().item():.6f}")
+        print(f"    max_ratio: {ratios.max().item():.6f}")
+        print("    quantiles:")
+        for label, value in zip((label for _, label in DIAGNOSTIC_7_QUANTILES), quantile_values):
+            print(f"      {label}: {value:.6f}")
+
+        violating_ratio_count = int((ratios > (3.0 + EPSILON)).sum().item())
+        if violating_ratio_count > 0:
+            print(
+                "    warning: "
+                f"{violating_ratio_count} ratio(s) exceed 3 + epsilon ({3.0 + EPSILON:.2f})"
+            )
+
+    print()
+
+
 def main() -> None:
     device = require_cuda()
 
@@ -464,6 +540,10 @@ def main() -> None:
     print(f"Cover index: {cover_index}")
     print()
 
+    print("Preparing HNSW index...")
+    index = build_hnsw_index(dataset, HNSW_M)
+    print()
+
     kernel = TiledEuclideanKernel(chunk_size=4096)
     # workspace = kernel.prepare_workspace(dataset)
 
@@ -471,7 +551,8 @@ def main() -> None:
     # run_diagnostic_2(dataset, query, kernel, workspace)
     # run_proxy_diagnostics(dataset, cover_index)
     # run_diagnostic_5(dataset, cover_index)
-    run_diagnostic_6(dataset, query, cover_index, kernel)
+    run_diagnostic_6(dataset, query, cover_index, kernel, index)
+    run_diagnostic_7(dataset, query, cover_index, kernel, index)
 
 
 if __name__ == "__main__":
