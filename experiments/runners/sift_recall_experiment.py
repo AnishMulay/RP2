@@ -169,7 +169,7 @@ def evaluate(
         query_cpu = queries_cpu[q_idx : q_idx + 1]              # (1, D) CPU numpy
 
         # squared L2 distances from this query to every dataset point
-        distances_sq = kernel.compute_dist_tile(query, workspace).squeeze(0)  # (N,)
+        distances_sq = kernel.compute_dist_tile(query, workspace).squeeze(1)  # (N,)
 
         for k in K_VALUES:
             k_search = k * k_search_multiplier
