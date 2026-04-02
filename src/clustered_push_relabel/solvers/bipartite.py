@@ -356,9 +356,6 @@ class TwoLevelBipartiteSolver:
             # B. Push (Ragged Gather)
             maybe_sync()
             push_batch_size = 5000
-            all_win_b = []
-            all_win_c = []
-            all_win_l_b = []
 
             starts_all = self.blue_offsets[B_free]
             ends_all = self.blue_offsets[B_free + 1]
@@ -393,15 +390,10 @@ class TwoLevelBipartiteSolver:
                 prev_matched_count = self.N - num_free
                 continue
 
-            for i in range(0, num_free, push_batch_size):
-                chunk = B_free[i : i + push_batch_size]
-                starts = self.blue_offsets[chunk]
-                ends = self.blue_offsets[chunk + 1]
-                lengths = ends - starts
-                total_edges = int(lengths.sum().item())
-                if total_edges == 0:
-                    continue
-
+            if num_free <= push_batch_size:
+                chunk = B_free
+                starts = starts_all
+                lengths = lengths_all
                 repeat_starts = torch.repeat_interleave(starts, lengths)
                 cum_len = torch.cumsum(lengths, 0)
                 segment_starts_packed = cum_len - lengths
@@ -448,40 +440,86 @@ class TwoLevelBipartiteSolver:
                 # log_mem("After Push")
 
                 if candidates.any():
-                    all_win_b.append(active_b_ids[candidates])
-                    all_win_c.append(active_c_ids[candidates])
-                    all_win_l_b.append(active_b_levels[candidates])
-
-                del (
-                    repeat_starts,
-                    cum_len,
-                    segment_starts_packed,
-                    global_range,
-                    repeat_packed_starts,
-                    offsets,
-                    active_edge_indices,
-                    active_b_ids,
-                    active_c_ids,
-                    active_b_levels,
-                    slacks_est,
-                    active_max_L_A,
-                    slacks_high,
-                    candidates,
-                    starts,
-                    ends,
-                    lengths,
-                    chunk,
-                )
-
-            if not all_win_b:
-                win_b = torch.empty(0, device=self.device, dtype=B_free.dtype)
-                win_c = torch.empty(0, device=self.device, dtype=self.blue_center_indices.dtype)
-                win_l_b = torch.empty(0, device=self.device, dtype=self.blue_levels.dtype)
+                    win_b = active_b_ids[candidates]
+                    win_c = active_c_ids[candidates]
+                    win_l_b = active_b_levels[candidates]
+                else:
+                    win_b = torch.empty(0, device=self.device, dtype=B_free.dtype)
+                    win_c = torch.empty(0, device=self.device, dtype=self.blue_center_indices.dtype)
+                    win_l_b = torch.empty(0, device=self.device, dtype=self.blue_levels.dtype)
             else:
-                win_b = torch.cat(all_win_b)
-                win_c = torch.cat(all_win_c)
-                win_l_b = torch.cat(all_win_l_b)
-            del all_win_b, all_win_c, all_win_l_b
+                all_win_b = []
+                all_win_c = []
+                all_win_l_b = []
+
+                for i in range(0, num_free, push_batch_size):
+                    chunk = B_free[i : i + push_batch_size]
+                    starts = self.blue_offsets[chunk]
+                    ends = self.blue_offsets[chunk + 1]
+                    lengths = ends - starts
+                    total_edges = int(lengths.sum().item())
+                    if total_edges == 0:
+                        continue
+
+                    repeat_starts = torch.repeat_interleave(starts, lengths)
+                    cum_len = torch.cumsum(lengths, 0)
+                    segment_starts_packed = cum_len - lengths
+                    global_range = _ensure_long_arange(self, "_edge_arange_buf", total_edges, self.device)
+                    repeat_packed_starts = torch.repeat_interleave(segment_starts_packed, lengths)
+                    offsets = global_range - repeat_packed_starts
+                    active_edge_indices = repeat_starts + offsets
+                    # log_mem("Mid-Push (Indices)")
+
+                    # Reconstruct attributes
+                    active_b_ids = torch.repeat_interleave(chunk, lengths)
+                    active_c_ids = self.blue_center_indices[active_edge_indices]
+                    active_b_levels = self.blue_levels[active_edge_indices]
+
+                    # Slack Estimation (Lower Bound)
+                    # Slack = 2 * max(L_b, L_a) - yB - yA
+                    # Lower Bound = 2 * L_b - yB - Max_yA
+                    # If Lower Bound > 0, then Real Slack is definitely > 0 (since L_a >= 0, yA <= Max_yA)
+                    # So we only check where Lower Bound <= 0
+                    slacks_est = (
+                        2 * active_b_levels 
+                        - self.yB[active_b_ids] 
+                        - center_max_yA[active_c_ids]
+                    )
+                    active_max_L_A = center_max_L_A[active_c_ids]
+                    slacks_high = (
+                        2 * torch.maximum(active_b_levels, active_max_L_A)
+                        - self.yB[active_b_ids]
+                        - center_max_yA[active_c_ids]
+                    )
+
+                    if should_dbg:
+                        dbg_eq0 += int((slacks_est == 0).sum().item())
+                        dbg_leq0 += int((slacks_est <= 0).sum().item())
+                        local_min = int(slacks_est.min().item())
+                        local_max = int(slacks_est.max().item())
+                        if dbg_min_slack_est is None or local_min < dbg_min_slack_est:
+                            dbg_min_slack_est = local_min
+                        if dbg_max_slack_est is None or local_max > dbg_max_slack_est:
+                            dbg_max_slack_est = local_max
+
+                    candidates = (slacks_est <= 0) & (slacks_high >= 0)
+                    maybe_sync()
+                    # log_mem("After Push")
+
+                    if candidates.any():
+                        all_win_b.append(active_b_ids[candidates])
+                        all_win_c.append(active_c_ids[candidates])
+                        all_win_l_b.append(active_b_levels[candidates])
+
+                if not all_win_b:
+                    win_b = torch.empty(0, device=self.device, dtype=B_free.dtype)
+                    win_c = torch.empty(0, device=self.device, dtype=self.blue_center_indices.dtype)
+                    win_l_b = torch.empty(0, device=self.device, dtype=self.blue_levels.dtype)
+                else:
+                    win_b = torch.cat(all_win_b)
+                    win_c = torch.cat(all_win_c)
+                    win_l_b = torch.cat(all_win_l_b)
+
             if should_dbg and dbg_min_slack_est is None:
                 dbg_min_slack_est = 0
                 dbg_max_slack_est = 0
@@ -986,9 +1024,6 @@ class KLevelBipartiteSolver:
             
             # We process free Blue points in batches to manage memory
             push_batch_size = 5000 
-            all_win_b = []
-            all_win_c = []
-            all_win_l_b = []
 
             if should_dbg:
                 starts_all = self.blue_offsets[B_free]
@@ -998,42 +1033,35 @@ class KLevelBipartiteSolver:
                 zero_deg = int((lengths_all == 0).sum().item())
                 if zero_deg > 0:
                     print(f"[DBG it={iteration}] zero-degree free points: {zero_deg}/{num_free}")
+            else:
+                starts_all = self.blue_offsets[B_free]
+                ends_all = self.blue_offsets[B_free + 1]
+                lengths_all = ends_all - starts_all
+            total_edges_all = int(lengths_all.sum().item())
 
-            for i in range(0, num_free, push_batch_size):
-                chunk = B_free[i : i + push_batch_size]
-                
-                # Get CSR ranges for these points
-                starts = self.blue_offsets[chunk]
-                ends = self.blue_offsets[chunk + 1]
-                lengths = ends - starts
-                total_edges = int(lengths.sum().item())
-                
-                if total_edges == 0:
-                    self.yB[chunk] += 1 # Relabel disconnected points
-                    continue
+            if total_edges_all == 0:
+                self.yB[B_free] += 1
+                win_b = torch.empty(0, device=self.device, dtype=torch.long)
+                win_c = torch.empty(0, device=self.device, dtype=torch.long)
+                win_l_b = torch.empty(0, device=self.device, dtype=torch.long)
+            elif num_free <= push_batch_size:
+                chunk = B_free
+                starts = starts_all
+                lengths = lengths_all
 
-                # Vectorized ragged access via repeat_interleave
-                # 1. Expand Point IDs to match edges
                 active_b_ids = torch.repeat_interleave(chunk, lengths)
-                
-                # 2. Compute indices into flat CSR arrays
-                # offset within segment = range(len)
                 cum_len = torch.cumsum(lengths, 0)
                 segment_starts_packed = cum_len - lengths
-                global_range = _ensure_long_arange(self, "_edge_arange_buf", total_edges, self.device)
+                global_range = _ensure_long_arange(self, "_edge_arange_buf", total_edges_all, self.device)
                 repeat_packed_starts = torch.repeat_interleave(segment_starts_packed, lengths)
                 offsets = global_range - repeat_packed_starts
-                
+
                 repeat_starts = torch.repeat_interleave(starts, lengths)
                 active_edge_indices = repeat_starts + offsets
-                
-                # 3. Gather Edge Attributes
+
                 active_c_ids = self.blue_center_indices[active_edge_indices]
                 active_b_levels = self.blue_levels[active_edge_indices]
 
-                # 4. Slack Check
-                # Condition: Slack <= 0
-                # Slack_Lower_Bound = 2 * Level - yB - Max_yA
                 slacks_est = (
                     2 * active_b_levels 
                     - self.yB[active_b_ids] 
@@ -1057,21 +1085,92 @@ class KLevelBipartiteSolver:
                         dbg_max_slack_est = local_max
 
                 candidates = (slacks_est <= 0) & (slacks_high >= 0)
-                
                 if candidates.any():
-                    all_win_b.append(active_b_ids[candidates])
-                    all_win_c.append(active_c_ids[candidates])
-                    all_win_l_b.append(active_b_levels[candidates])
-            
-            # Combine candidates from all batches
-            if not all_win_b:
-                win_b = torch.empty(0, device=self.device, dtype=torch.long)
-                win_c = torch.empty(0, device=self.device, dtype=torch.long)
-                win_l_b = torch.empty(0, device=self.device, dtype=torch.long)
+                    win_b = active_b_ids[candidates]
+                    win_c = active_c_ids[candidates]
+                    win_l_b = active_b_levels[candidates]
+                else:
+                    win_b = torch.empty(0, device=self.device, dtype=torch.long)
+                    win_c = torch.empty(0, device=self.device, dtype=torch.long)
+                    win_l_b = torch.empty(0, device=self.device, dtype=torch.long)
             else:
-                win_b = torch.cat(all_win_b)
-                win_c = torch.cat(all_win_c)
-                win_l_b = torch.cat(all_win_l_b)
+                all_win_b = []
+                all_win_c = []
+                all_win_l_b = []
+
+                for i in range(0, num_free, push_batch_size):
+                    chunk = B_free[i : i + push_batch_size]
+                    
+                    # Get CSR ranges for these points
+                    starts = self.blue_offsets[chunk]
+                    ends = self.blue_offsets[chunk + 1]
+                    lengths = ends - starts
+                    total_edges = int(lengths.sum().item())
+                    
+                    if total_edges == 0:
+                        self.yB[chunk] += 1 # Relabel disconnected points
+                        continue
+
+                    # Vectorized ragged access via repeat_interleave
+                    # 1. Expand Point IDs to match edges
+                    active_b_ids = torch.repeat_interleave(chunk, lengths)
+                    
+                    # 2. Compute indices into flat CSR arrays
+                    # offset within segment = range(len)
+                    cum_len = torch.cumsum(lengths, 0)
+                    segment_starts_packed = cum_len - lengths
+                    global_range = _ensure_long_arange(self, "_edge_arange_buf", total_edges, self.device)
+                    repeat_packed_starts = torch.repeat_interleave(segment_starts_packed, lengths)
+                    offsets = global_range - repeat_packed_starts
+                    
+                    repeat_starts = torch.repeat_interleave(starts, lengths)
+                    active_edge_indices = repeat_starts + offsets
+                    
+                    # 3. Gather Edge Attributes
+                    active_c_ids = self.blue_center_indices[active_edge_indices]
+                    active_b_levels = self.blue_levels[active_edge_indices]
+
+                    # 4. Slack Check
+                    # Condition: Slack <= 0
+                    # Slack_Lower_Bound = 2 * Level - yB - Max_yA
+                    slacks_est = (
+                        2 * active_b_levels 
+                        - self.yB[active_b_ids] 
+                        - center_max_yA[active_c_ids]
+                    )
+                    active_max_L_A = center_max_L_A[active_c_ids]
+                    slacks_high = (
+                        2 * torch.maximum(active_b_levels, active_max_L_A)
+                        - self.yB[active_b_ids]
+                        - center_max_yA[active_c_ids]
+                    )
+
+                    if should_dbg:
+                        dbg_eq0 += int((slacks_est == 0).sum().item())
+                        dbg_leq0 += int((slacks_est <= 0).sum().item())
+                        local_min = int(slacks_est.min().item())
+                        local_max = int(slacks_est.max().item())
+                        if dbg_min_slack_est is None or local_min < dbg_min_slack_est:
+                            dbg_min_slack_est = local_min
+                        if dbg_max_slack_est is None or local_max > dbg_max_slack_est:
+                            dbg_max_slack_est = local_max
+
+                    candidates = (slacks_est <= 0) & (slacks_high >= 0)
+                    
+                    if candidates.any():
+                        all_win_b.append(active_b_ids[candidates])
+                        all_win_c.append(active_c_ids[candidates])
+                        all_win_l_b.append(active_b_levels[candidates])
+                
+                # Combine candidates from all batches
+                if not all_win_b:
+                    win_b = torch.empty(0, device=self.device, dtype=torch.long)
+                    win_c = torch.empty(0, device=self.device, dtype=torch.long)
+                    win_l_b = torch.empty(0, device=self.device, dtype=torch.long)
+                else:
+                    win_b = torch.cat(all_win_b)
+                    win_c = torch.cat(all_win_c)
+                    win_l_b = torch.cat(all_win_l_b)
             if should_dbg and dbg_min_slack_est is None:
                 dbg_min_slack_est = 0
                 dbg_max_slack_est = 0
