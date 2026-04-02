@@ -26,6 +26,19 @@ Known issues at baseline:
 - k-Level scales better than 2-Level (67s vs 221s at n=10000)
 
 ## Current Best
+Round 4 accepted (`48043e0`) as current mainline:
+- Added a single-batch push fast path tailored to the target benchmark regime
+- Best measured target-size results so far:
+  - n=1000: 2-Level `52.22s`, k-Level `52.29s`
+  - n=2500: 2-Level `50.01s`, k-Level `47.87s`
+  - n=5000: 2-Level `65.71s`, k-Level `50.56s`
+- Compared with round 3:
+  - 2-Level improved by `4.1%` at n=1000, `3.5%` at n=2500, `4.7%` at n=5000
+  - k-Level improved by `5.1%` at n=1000 and `4.2%` at n=5000, but regressed by `0.9%` at n=2500
+- Compared with the original baseline where directly comparable:
+  - 2-Level improved by `21.6%` at n=1000 and `30.8%` at n=5000
+  - k-Level improved by `10.7%` at n=1000 and `9.1%` at n=5000
+
 Round 3 accepted (`72d9c09`) as current mainline:
 - Cached push/resolve work buffers to reduce allocator churn inside the solver loop
 - Best measured target-size k-Level results so far:
@@ -173,14 +186,41 @@ Results:
 - Local validation:
   - `python -m compileall src/clustered_push_relabel/solvers/bipartite.py experiments/runners/e1_mnist_vs_exact.py`
   - Tiny synthetic smoke test passed for both `TwoLevelBipartiteSolver` and `KLevelBipartiteSolver`.
-- HPC timings: pending.
+- HPC timings on target sizes:
+
+| n    | Exact (s) | 2-Level (s) | k-Level (s) | 2-Level solver (s) | k-Level solver (s) |
+|------|-----------|-------------|-------------|--------------------|--------------------|
+| 1000 | 0.1143    | 52.2152     | 52.2875     | 51.9118            | 52.1617            |
+| 2500 | 0.8462    | 50.0071     | 47.8658     | 49.6810            | 47.6214            |
+| 5000 | 4.2592    | 65.7105     | 50.5640     | 64.8738            | 49.9104            |
 
 What I learned:
 - For the target sizes in this experiment, the push phase is effectively always single-batch, so the general batching/list path is likely paying overhead without benefit.
+- This round delivered the best overall wall-clock results so far despite a small k-Level regression at n=2500.
 
 Current status:
-- Ready for HPC measurement for round 4.
+- Round 4 is the current best committed state.
+- Next target is the repeated reconstruction of the free-blue set via `nonzero(self.MB == -1)` each iteration.
+
+### Round 5 (prepared 2026-04-02)
+What I changed:
+- `src/clustered_push_relabel/solvers/bipartite.py`
+  - Replaced repeated full-array reconstruction of `B_free` with an incremental update from the monotone free-blue set.
+  - Added a reusable boolean keep-mask buffer to filter out newly matched blue vertices without rescanning `MB`.
+  - Applied the same free-set carry-forward logic to both solver variants.
+
+Results:
+- Local validation:
+  - `python -m compileall src/clustered_push_relabel/solvers/bipartite.py experiments/runners/e1_mnist_vs_exact.py`
+  - Tiny synthetic smoke test passed for both `TwoLevelBipartiteSolver` and `KLevelBipartiteSolver`.
+- HPC timings: pending.
+
+What I learned:
+- After round 4, one of the remaining obvious non-algorithmic costs is rebuilding the free-blue index set from scratch every iteration even though matches are monotone.
+
+Current status:
+- Ready for HPC measurement for round 5.
 
 ## Active Hypotheses
-- Round 4 hypothesis: bypassing the general multi-batch candidate aggregation path when the workload already fits in one batch will reduce Python and tensor-concatenation overhead and should help the target-size benchmark directly.
-- Expected gain: small-to-moderate solver-time reduction, most likely at n=1000 and n=2500 and potentially enough to recover the round-3 2-Level regression at n=5000.
+- Round 5 hypothesis: carrying `B_free` forward incrementally instead of rescanning `MB` each iteration will shave off repeated full-vector overhead in the solver loop without affecting matching behavior.
+- Expected gain: modest solver-time reduction, especially if the loop runs many iterations before convergence.

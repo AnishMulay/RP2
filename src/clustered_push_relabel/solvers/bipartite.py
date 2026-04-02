@@ -23,6 +23,14 @@ def _ensure_zero_long_buffer(owner, attr_name, size, device):
     return buf
 
 
+def _ensure_bool_buffer(owner, attr_name, size, device):
+    buf = getattr(owner, attr_name, None)
+    if buf is None or buf.numel() < size:
+        buf = torch.empty(size, device=device, dtype=torch.bool)
+        setattr(owner, attr_name, buf)
+    return buf[:size]
+
+
 class TwoLevelBipartiteSolver:
     """
     Bipartite matching solver using a two-level (flat) cluster decomposition.
@@ -297,9 +305,9 @@ class TwoLevelBipartiteSolver:
         prev_matched_count = None
         center_max_yA = self._center_max_yA
         center_max_L_A = self._center_max_L_A
+        B_free = torch.arange(self.N, device=self.device, dtype=torch.long)
 
         while True:
-            B_free = torch.nonzero(self.MB == -1).squeeze(1)
             num_free = B_free.numel()
             if num_free <= self.epsilon * self.N:
                 # print("[Converged] Free points <= Threshold. Stopping.")
@@ -528,6 +536,7 @@ class TwoLevelBipartiteSolver:
                 dbg_after_free_u = int(win_b.numel())
                 dbg_after_free_v = int(win_b.numel())
 
+            b_match = None
             if win_b.numel() != 0:
                 # C. Resolve
                 maybe_sync()
@@ -639,13 +648,22 @@ class TwoLevelBipartiteSolver:
 
             # D. Relabel
             maybe_sync()
-            still_free = torch.nonzero(self.MB == -1).squeeze(1)
+            if b_match is not None and b_match.numel() != 0:
+                keep_free_mask = _ensure_bool_buffer(
+                    self, "_keep_free_mask_buf", num_free, self.device
+                )
+                keep_free_mask.fill_(True)
+                keep_free_mask[torch.searchsorted(B_free, b_match)] = False
+                still_free = B_free[keep_free_mask]
+            else:
+                still_free = B_free
             self.yB[still_free] += 1
             
             matched_r = torch.nonzero(self.MA != -1).squeeze(1)
             self.yA[matched_r] -= 1
             maybe_sync()
             # log_mem("After Relabel")
+            B_free = still_free
             matched_now = self.N - still_free.numel()
             if should_dbg:
                 delta_matched = 0 if prev_matched_count is None else matched_now - prev_matched_count
@@ -961,10 +979,10 @@ class KLevelBipartiteSolver:
         prev_matched_count = None
         center_max_yA = self._center_max_yA
         center_max_L_A = self._center_max_L_A
+        B_free = torch.arange(self.N, device=self.device, dtype=torch.long)
 
         while True:
             # Check convergence
-            B_free = torch.nonzero(self.MB == -1).squeeze(1)
             num_free = B_free.numel()
             if num_free <= self.epsilon * self.N:
                 # print("[Converged] Free points <= Threshold. Stopping.")
@@ -1182,6 +1200,7 @@ class KLevelBipartiteSolver:
             # ---------------------------------------------------------
             # C. Resolve Phase (Conflict Resolution)
             # ---------------------------------------------------------
+            b_match = None
             if win_b.numel() != 0:
                 # Identify free Red points
                 free_red_mask = self.MA[self.red_indices] == -1
@@ -1273,12 +1292,21 @@ class KLevelBipartiteSolver:
             # D. Relabel Phase
             # ---------------------------------------------------------
             # Increase potential of unmatched Blue points to help them find edges
-            still_free = torch.nonzero(self.MB == -1).squeeze(1)
+            if b_match is not None and b_match.numel() != 0:
+                keep_free_mask = _ensure_bool_buffer(
+                    self, "_keep_free_mask_buf", num_free, self.device
+                )
+                keep_free_mask.fill_(True)
+                keep_free_mask[torch.searchsorted(B_free, b_match)] = False
+                still_free = B_free[keep_free_mask]
+            else:
+                still_free = B_free
             self.yB[still_free] += 1
             
             # Decrease potential of matched Red points to maintain constraints
             matched_r = torch.nonzero(self.MA != -1).squeeze(1)
             self.yA[matched_r] -= 1
+            B_free = still_free
             matched_now = self.N - still_free.numel()
             if should_dbg:
                 delta_matched = 0 if prev_matched_count is None else matched_now - prev_matched_count
