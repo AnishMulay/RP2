@@ -40,7 +40,8 @@ class TwoLevelBipartiteSolver:
             epsilon, batch_size=self.batch_size, micro_batch_size=32, metric=metric
         )
         blue_coo, red_coo, r_mask, b_mask = cluster_engine.run(P_red, P_blue)
-        torch.cuda.synchronize()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
         if self.verbose:
             print(f"         Clustering done in {time.time()-t0:.2f}s")
             print(f"         Raw Blue Shells: {blue_coo[0].numel()}")
@@ -59,14 +60,14 @@ class TwoLevelBipartiteSolver:
         t_setup = time.time()
         del blue_coo, red_coo, cluster_engine
         gc.collect()
-        torch.cuda.empty_cache()
         
         # 3. State Init (Integer Scaling)
         self.yA = torch.zeros(self.N, device=self.device, dtype=torch.int32)
         self.yB = torch.full((self.N,), 1, device=self.device, dtype=torch.int32)
         self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
         self.MB = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
-        torch.cuda.synchronize()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
         if self.verbose:
             print(f"   [Debug] GC & State Init finished in {time.time() - t_setup:.4f}s")
 
@@ -81,6 +82,8 @@ class TwoLevelBipartiteSolver:
             print(f"[Cleanup] Arbitrarily matched {count} remaining pairs.")
 
     def calculate_final_stats(self):
+        if not self.verbose:
+            return
         if self.metric == "L1":
             dists = torch.norm(self.P_blue - self.P_red[self.MB], p=1, dim=1)
             label = "Manhattan"
@@ -89,9 +92,8 @@ class TwoLevelBipartiteSolver:
             label = "Euclidean"
         total_cost = dists.sum()
         avg_cost = total_cost / self.N
-        if self.verbose:
-            print(f"Total {label} Cost: {total_cost.item():.4f}")
-            print(f"Avg {label} Cost: {avg_cost.item():.4f}")
+        print(f"Total {label} Cost: {total_cost.item():.4f}")
+        print(f"Avg {label} Cost: {avg_cost.item():.4f}")
 
     def _build_csr_from_coo_cpu(self, blue_coo, red_coo, red_mask, blue_mask):
         """
@@ -135,38 +137,39 @@ class TwoLevelBipartiteSolver:
                 "mem_mb": mem_mb,
             }
 
-        red_sampled_stats = _category_stats(r_c[r_sampled], r_l[r_sampled])
-        red_local_stats = _category_stats(r_c[~r_sampled], r_l[~r_sampled])
-        blue_sampled_stats = _category_stats(b_c[b_sampled], b_l[b_sampled])
-        blue_local_stats = _category_stats(b_c[~b_sampled], b_l[~b_sampled])
+        if self.verbose:
+            red_sampled_stats = _category_stats(r_c[r_sampled], r_l[r_sampled])
+            red_local_stats = _category_stats(r_c[~r_sampled], r_l[~r_sampled])
+            blue_sampled_stats = _category_stats(b_c[b_sampled], b_l[b_sampled])
+            blue_local_stats = _category_stats(b_c[~b_sampled], b_l[~b_sampled])
 
-        if r_c.numel() == 0 and b_c.numel() == 0:
-            total_stats = {
-                "edges": 0,
-                "clusters": 0,
-                "buckets": 0,
-                "avg_cluster": 0.0,
-                "mem_mb": 0.0,
-            }
-        else:
-            total_centers = torch.cat([r_c, b_c + N])
-            total_levels = torch.cat([r_l, b_l])
-            total_stats = _category_stats(total_centers, total_levels)
+            if r_c.numel() == 0 and b_c.numel() == 0:
+                total_stats = {
+                    "edges": 0,
+                    "clusters": 0,
+                    "buckets": 0,
+                    "avg_cluster": 0.0,
+                    "mem_mb": 0.0,
+                }
+            else:
+                total_centers = torch.cat([r_c, b_c + N])
+                total_levels = torch.cat([r_l, b_l])
+                total_stats = _category_stats(total_centers, total_levels)
 
-        print("    [Cluster Analysis]")
-        print("    Category       | Clusters | Buckets  | Edges        | Avg Clust | Mem (MB)")
-        print("    ------------------------------------------------------------------------")
-        def _print_row(label, stats):
-            print(
-                f"    {label:<14} | {stats['clusters']:>8} | {stats['buckets']:>7} | "
-                f"{stats['edges']:>12,} | {stats['avg_cluster']:>9.1f} | {stats['mem_mb']:>7.1f}"
-            )
-        _print_row("RED (Sampled)", red_sampled_stats)
-        _print_row("RED (Local)", red_local_stats)
-        _print_row("BLUE (Sampled)", blue_sampled_stats)
-        _print_row("BLUE (Local)", blue_local_stats)
-        print("    ------------------------------------------------------------------------")
-        _print_row("TOTAL", total_stats)
+            print("    [Cluster Analysis]")
+            print("    Category       | Clusters | Buckets  | Edges        | Avg Clust | Mem (MB)")
+            print("    ------------------------------------------------------------------------")
+            def _print_row(label, stats):
+                print(
+                    f"    {label:<14} | {stats['clusters']:>8} | {stats['buckets']:>7} | "
+                    f"{stats['edges']:>12,} | {stats['avg_cluster']:>9.1f} | {stats['mem_mb']:>7.1f}"
+                )
+            _print_row("RED (Sampled)", red_sampled_stats)
+            _print_row("RED (Local)", red_local_stats)
+            _print_row("BLUE (Sampled)", blue_sampled_stats)
+            _print_row("BLUE (Local)", blue_local_stats)
+            print("    ------------------------------------------------------------------------")
+            _print_row("TOTAL", total_stats)
 
         # 1. Unify center IDs and merge all triplets on CPU
         b_c_shifted = b_c + N
@@ -185,7 +188,8 @@ class TwoLevelBipartiteSolver:
         if valid_centers.numel() == 0:
             raise ValueError("No valid clusters found (Intersection Empty).")
 
-        print(f"         Active Centers: {valid_centers.numel()}")
+        if self.verbose:
+            print(f"         Active Centers: {valid_centers.numel()}")
 
         # 3. Filter to valid centers only
         mask_valid = torch.isin(all_centers, valid_centers)
@@ -576,8 +580,6 @@ class TwoLevelBipartiteSolver:
             self.yA[matched_r] -= 1
             maybe_sync()
             # log_mem("After Relabel")
-            if use_cuda:
-                torch.cuda.empty_cache()
             matched_now = self.N - still_free.numel()
             if should_dbg:
                 delta_matched = 0 if prev_matched_count is None else matched_now - prev_matched_count
@@ -600,7 +602,8 @@ class TwoLevelBipartiteSolver:
                 break
 
         self.cleanup_remaining_points()
-        print(f"Matched: {(self.MB != -1).sum().item()}/{self.N}")
+        if self.verbose:
+            print(f"Matched: {(self.MB != -1).sum().item()}/{self.N}")
         self.calculate_final_stats()
 
 
@@ -642,7 +645,8 @@ class KLevelBipartiteSolver:
             epsilon, k=k, batch_size=self.batch_size, metric=metric
         )
         blue_coo, red_coo, levels_red, levels_blue = cluster_engine.run(P_red, P_blue)
-        torch.cuda.synchronize()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
         if self.verbose:
             print(f"         Clustering done in {time.time()-t0:.2f}s")
             print(f"         Red Edges:  {red_coo[0].numel()}")
@@ -662,14 +666,14 @@ class KLevelBipartiteSolver:
         t_setup = time.time()
         del blue_coo, red_coo, levels_red, levels_blue, cluster_engine
         gc.collect()
-        torch.cuda.empty_cache()
         
         # 3. State Init (Integer Scaling)
         self.yA = torch.zeros(self.N, device=self.device, dtype=torch.int32)
         self.yB = torch.full((self.N,), 1, device=self.device, dtype=torch.int32)
         self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
         self.MB = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
-        torch.cuda.synchronize()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
         if self.verbose:
             print(f"   [Debug] GC & State Init finished in {time.time() - t_setup:.4f}s")
 
@@ -715,35 +719,36 @@ class KLevelBipartiteSolver:
                 "mem_mb": mem_mb,
             }
 
-        total_stats = {
-            "edges": 0,
-            "clusters": 0,
-            "buckets": 0,
-            "avg_cluster": 0.0,
-            "mem_mb": 0.0,
-        }
-        if r_c.numel() != 0 or b_c.numel() != 0:
-            total_centers = torch.cat([r_c, b_c + N])
-            total_levels = torch.cat([r_l, b_l])
-            total_stats = _category_stats(total_centers, total_levels)
+        if self.verbose:
+            total_stats = {
+                "edges": 0,
+                "clusters": 0,
+                "buckets": 0,
+                "avg_cluster": 0.0,
+                "mem_mb": 0.0,
+            }
+            if r_c.numel() != 0 or b_c.numel() != 0:
+                total_centers = torch.cat([r_c, b_c + N])
+                total_levels = torch.cat([r_l, b_l])
+                total_stats = _category_stats(total_centers, total_levels)
 
-        print("    [Cluster Analysis]")
-        print("    Category       | Clusters | Buckets  | Edges        | Avg Clust | Mem (MB)")
-        print("    ------------------------------------------------------------------------")
-        def _print_row(label, stats):
-            print(
-                f"    {label:<14} | {stats['clusters']:>8} | {stats['buckets']:>7} | "
-                f"{stats['edges']:>12,} | {stats['avg_cluster']:>9.1f} | {stats['mem_mb']:>7.1f}"
-            )
-        for i in range(self.k - 1, -1, -1):
-            red_mask = levels_red[r_c] == i
-            blue_mask = levels_blue[b_c] == i
-            red_stats = _category_stats(r_c[red_mask], r_l[red_mask])
-            blue_stats = _category_stats(b_c[blue_mask], b_l[blue_mask])
-            _print_row(f"RED (Lvl {i})", red_stats)
-            _print_row(f"BLUE (Lvl {i})", blue_stats)
-        print("    ------------------------------------------------------------------------")
-        _print_row("TOTAL", total_stats)
+            print("    [Cluster Analysis]")
+            print("    Category       | Clusters | Buckets  | Edges        | Avg Clust | Mem (MB)")
+            print("    ------------------------------------------------------------------------")
+            def _print_row(label, stats):
+                print(
+                    f"    {label:<14} | {stats['clusters']:>8} | {stats['buckets']:>7} | "
+                    f"{stats['edges']:>12,} | {stats['avg_cluster']:>9.1f} | {stats['mem_mb']:>7.1f}"
+                )
+            for i in range(self.k - 1, -1, -1):
+                red_mask = levels_red[r_c] == i
+                blue_mask = levels_blue[b_c] == i
+                red_stats = _category_stats(r_c[red_mask], r_l[red_mask])
+                blue_stats = _category_stats(b_c[blue_mask], b_l[blue_mask])
+                _print_row(f"RED (Lvl {i})", red_stats)
+                _print_row(f"BLUE (Lvl {i})", blue_stats)
+            print("    ------------------------------------------------------------------------")
+            _print_row("TOTAL", total_stats)
 
         # Shift Blue Center IDs to avoid collision with Red Center IDs
         b_c_shifted = b_c + N
@@ -854,6 +859,8 @@ class KLevelBipartiteSolver:
             print(f"[Cleanup] Arbitrarily matched {count} remaining pairs.")
 
     def calculate_final_stats(self):
+        if not self.verbose:
+            return
         if self.metric == "L1":
             dists = torch.norm(self.P_blue - self.P_red[self.MB], p=1, dim=1)
             label = "Manhattan"
@@ -862,9 +869,8 @@ class KLevelBipartiteSolver:
             label = "Euclidean"
         total_cost = dists.sum()
         avg_cost = total_cost / self.N
-        if self.verbose:
-            print(f"Total {label} Cost: {total_cost.item():.4f}")
-            print(f"Avg {label} Cost: {avg_cost.item():.4f}")
+        print(f"Total {label} Cost: {total_cost.item():.4f}")
+        print(f"Avg {label} Cost: {avg_cost.item():.4f}")
 
     def solve(self):
         if self.verbose:
@@ -1159,7 +1165,8 @@ class KLevelBipartiteSolver:
                 break
 
         self.cleanup_remaining_points()
-        print(f"Matched: {(self.MB != -1).sum().item()}/{self.N}")
+        if self.verbose:
+            print(f"Matched: {(self.MB != -1).sum().item()}/{self.N}")
         self.calculate_final_stats()
 
 

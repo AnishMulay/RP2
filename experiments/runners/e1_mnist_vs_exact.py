@@ -83,15 +83,31 @@ def load_mnist_flat(n_samples, seed=0, data_dir=None):
     return red, blue  # return flat 784-D tensors
 
 def compute_cost_matrix_L1(red, blue):
-    """Compute full L1 distance matrix between two sets of vectors (CPU)."""
-    X = red.astype(np.float64)
-    Y = blue.astype(np.float64)
-    n = X.shape[0]
-    C = np.empty((n, n), dtype=np.float64)
-    for i in range(n):
-        # Using broadcasting: L1 distance of X[i] to all Y
-        C[i, :] = np.abs(X[i] - Y).sum(axis=1)
-    return C
+    """Compute full L1 distance matrix between two sets of vectors."""
+    X = torch.as_tensor(red, dtype=torch.float64).contiguous()
+    Y = torch.as_tensor(blue, dtype=torch.float64).contiguous()
+    return torch.cdist(X, Y, p=1).cpu().numpy()
+
+
+def average_l1_matching_cost(P_red, P_blue, matching):
+    matched_red = P_red[matching.to(torch.long)]
+    return (P_blue - matched_red).abs().sum(dim=1).mean().item()
+
+
+def reset_peak_memory_stats_if_cuda(device):
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+
+def peak_memory_allocated_mb(device):
+    if device.type != "cuda":
+        return 0.0
+    return torch.cuda.max_memory_allocated() / (1024**2)
+
+
+def synchronize_if_cuda(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
 
 
 DEFAULT_N_VALUES = [1000, 5000, 10000, 15000]
@@ -213,27 +229,20 @@ def main():
                 f.flush()
             # 2-Level solver
             try:
-                torch.cuda.empty_cache()
-                torch.cuda.reset_peak_memory_stats()
+                reset_peak_memory_stats_if_cuda(device)
                 t_start = time.time()
                 solver2 = TwoLevelSolver(P_red, P_blue, args.epsilon, metric="L1")
-                torch.cuda.synchronize()
+                synchronize_if_cuda(device)
                 t_mid = time.time()
                 solver2.solve()
-                torch.cuda.synchronize()
+                synchronize_if_cuda(device)
                 t_end = time.time()
                 total_time = t_end - t_start
                 clust_time = t_mid - t_start
                 solve_time = t_end - t_mid
                 # Calculate cost of matching
-                MB = solver2.MB.cpu().numpy()
-                # MB[j] = i matched
-                cost_val = 0.0
-                for j in range(n):
-                    i = MB[j]
-                    cost_val += float(torch.norm(P_blue[j] - P_red[i], p=1).cpu().item())
-                cost_val /= n
-                peak_mem = torch.cuda.max_memory_allocated() / (1024**2)
+                cost_val = average_l1_matching_cost(P_red, P_blue, solver2.MB)
+                peak_mem = peak_memory_allocated_mb(device)
                 status = "success"
             except Exception as e:
                 print(f"[2-Level] Exception: {e}")
@@ -258,25 +267,19 @@ def main():
             f.flush()
             # k-Level solver
             try:
-                torch.cuda.empty_cache()
-                torch.cuda.reset_peak_memory_stats()
+                reset_peak_memory_stats_if_cuda(device)
                 t_start = time.time()
                 solverK = KLevelSolver(P_red, P_blue, args.epsilon, k=args.k, metric="L1")
-                torch.cuda.synchronize()
+                synchronize_if_cuda(device)
                 t_mid = time.time()
                 solverK.solve()
-                torch.cuda.synchronize()
+                synchronize_if_cuda(device)
                 t_end = time.time()
                 total_timeK = t_end - t_start
                 clust_timeK = t_mid - t_start
                 solve_timeK = t_end - t_mid
-                MBk = solverK.MB.cpu().numpy()
-                cost_valK = 0.0
-                for j in range(n):
-                    i = MBk[j]
-                    cost_valK += float(torch.norm(P_blue[j] - P_red[i], p=1).cpu().item())
-                cost_valK /= n
-                peak_memK = torch.cuda.max_memory_allocated() / (1024**2)
+                cost_valK = average_l1_matching_cost(P_red, P_blue, solverK.MB)
+                peak_memK = peak_memory_allocated_mb(device)
                 statusK = "success"
             except Exception as e:
                 print(f"[k-Level] Exception: {e}")
