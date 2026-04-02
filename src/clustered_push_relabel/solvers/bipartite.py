@@ -4,6 +4,25 @@ import gc
 from ..clustering.two_level import FastGPUClustering
 from ..clustering.k_level import FastGPUMultiLevelClustering
 
+
+def _ensure_long_arange(owner, attr_name, size, device):
+    buf = getattr(owner, attr_name, None)
+    if buf is None or buf.numel() < size:
+        buf = torch.arange(size, device=device, dtype=torch.long)
+        setattr(owner, attr_name, buf)
+    return buf[:size]
+
+
+def _ensure_zero_long_buffer(owner, attr_name, size, device):
+    buf = getattr(owner, attr_name, None)
+    if buf is None or buf.numel() < size:
+        buf = torch.empty(size, device=device, dtype=torch.long)
+        setattr(owner, attr_name, buf)
+    buf = buf[:size]
+    buf.zero_()
+    return buf
+
+
 class TwoLevelBipartiteSolver:
     """
     Bipartite matching solver using a two-level (flat) cluster decomposition.
@@ -386,7 +405,7 @@ class TwoLevelBipartiteSolver:
                 repeat_starts = torch.repeat_interleave(starts, lengths)
                 cum_len = torch.cumsum(lengths, 0)
                 segment_starts_packed = cum_len - lengths
-                global_range = torch.arange(total_edges, device=self.device)
+                global_range = _ensure_long_arange(self, "_edge_arange_buf", total_edges, self.device)
                 repeat_packed_starts = torch.repeat_interleave(segment_starts_packed, lengths)
                 offsets = global_range - repeat_packed_starts
                 active_edge_indices = repeat_starts + offsets
@@ -502,13 +521,21 @@ class TwoLevelBipartiteSolver:
                     r_counts = torch.bincount(c_r_sorted, minlength=num_centers)
                     limits = torch.minimum(b_counts, r_counts)
 
-                    b_offsets = torch.zeros(num_centers + 1, device=self.device, dtype=torch.long)
+                    b_offsets = _ensure_zero_long_buffer(
+                        self, "_resolve_b_offsets_buf", num_centers + 1, self.device
+                    )
                     b_offsets[1:] = torch.cumsum(b_counts, 0)
-                    r_offsets = torch.zeros(num_centers + 1, device=self.device, dtype=torch.long)
+                    r_offsets = _ensure_zero_long_buffer(
+                        self, "_resolve_r_offsets_buf", num_centers + 1, self.device
+                    )
                     r_offsets[1:] = torch.cumsum(r_counts, 0)
 
-                    b_rank = torch.arange(c_sorted.numel(), device=self.device) - b_offsets[c_sorted]
-                    r_rank = torch.arange(c_r_sorted.numel(), device=self.device) - r_offsets[c_r_sorted]
+                    b_rank = _ensure_long_arange(
+                        self, "_resolve_b_rank_arange_buf", c_sorted.numel(), self.device
+                    ) - b_offsets[c_sorted]
+                    r_rank = _ensure_long_arange(
+                        self, "_resolve_r_rank_arange_buf", c_r_sorted.numel(), self.device
+                    ) - r_offsets[c_r_sorted]
 
                     b_keep = b_rank < limits[c_sorted]
                     r_keep = r_rank < limits[c_r_sorted]
@@ -993,7 +1020,7 @@ class KLevelBipartiteSolver:
                 # offset within segment = range(len)
                 cum_len = torch.cumsum(lengths, 0)
                 segment_starts_packed = cum_len - lengths
-                global_range = torch.arange(total_edges, device=self.device)
+                global_range = _ensure_long_arange(self, "_edge_arange_buf", total_edges, self.device)
                 repeat_packed_starts = torch.repeat_interleave(segment_starts_packed, lengths)
                 offsets = global_range - repeat_packed_starts
                 
@@ -1084,14 +1111,22 @@ class KLevelBipartiteSolver:
                     limits = torch.minimum(b_counts, r_counts) # Min available
 
                     # Calculate ranks to pair 1-to-1
-                    b_offsets_scan = torch.zeros(num_centers + 1, device=self.device, dtype=torch.long)
+                    b_offsets_scan = _ensure_zero_long_buffer(
+                        self, "_resolve_b_offsets_buf", num_centers + 1, self.device
+                    )
                     b_offsets_scan[1:] = torch.cumsum(b_counts, 0)
                     
-                    r_offsets_scan = torch.zeros(num_centers + 1, device=self.device, dtype=torch.long)
+                    r_offsets_scan = _ensure_zero_long_buffer(
+                        self, "_resolve_r_offsets_buf", num_centers + 1, self.device
+                    )
                     r_offsets_scan[1:] = torch.cumsum(r_counts, 0)
 
-                    b_rank = torch.arange(c_sorted.numel(), device=self.device) - b_offsets_scan[c_sorted]
-                    r_rank = torch.arange(red_c_ids.numel(), device=self.device) - r_offsets_scan[red_c_ids]
+                    b_rank = _ensure_long_arange(
+                        self, "_resolve_b_rank_arange_buf", c_sorted.numel(), self.device
+                    ) - b_offsets_scan[c_sorted]
+                    r_rank = _ensure_long_arange(
+                        self, "_resolve_r_rank_arange_buf", red_c_ids.numel(), self.device
+                    ) - r_offsets_scan[red_c_ids]
 
                     b_keep = b_rank < limits[c_sorted]
                     r_keep = r_rank < limits[red_c_ids]

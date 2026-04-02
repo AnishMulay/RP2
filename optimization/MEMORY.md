@@ -26,6 +26,20 @@ Known issues at baseline:
 - k-Level scales better than 2-Level (67s vs 221s at n=10000)
 
 ## Current Best
+Round 2 accepted (`6f5be97`):
+- Stored CSR/scatter index tensors as `torch.long` once during build
+- Reused per-iteration center reduction workspaces
+- Best measured target-size results so far:
+  - n=1000: 2-Level `56.12s`, k-Level `56.04s`
+  - n=2500: 2-Level `53.38s`, k-Level `51.43s`
+  - n=5000: 2-Level `68.38s`, k-Level `53.86s`
+- Compared with round 1:
+  - 2-Level improved by `1.7%` at n=1000, `5.1%` at n=2500, `5.2%` at n=5000
+  - k-Level improved by `4.7%` at n=1000, `3.0%` at n=2500, `0.7%` at n=5000
+- Compared with the original baseline where directly comparable:
+  - 2-Level improved by `15.7%` at n=1000 and `28.0%` at n=5000
+  - k-Level improved by `4.2%` at n=1000 and `3.2%` at n=5000
+
 Round 1 accepted (`6476894`):
 - Vectorized exact L1 cost-matrix build with `torch.cdist`
 - Vectorized matching-cost evaluation in the runner
@@ -91,14 +105,41 @@ Results:
 - Local validation:
   - `python -m compileall src/clustered_push_relabel/solvers/bipartite.py experiments/runners/e1_mnist_vs_exact.py`
   - Tiny synthetic smoke test passed for both `TwoLevelBipartiteSolver` and `KLevelBipartiteSolver`.
-- HPC timings: pending.
+- HPC timings on target sizes:
+
+| n    | Exact (s) | 2-Level (s) | k-Level (s) | 2-Level solver (s) | k-Level solver (s) |
+|------|-----------|-------------|-------------|--------------------|--------------------|
+| 1000 | 0.1148    | 56.1217     | 56.0393     | 55.8275            | 55.9144            |
+| 2500 | 0.8450    | 53.3835     | 51.4350     | 53.0107            | 51.1595            |
+| 5000 | 4.2527    | 68.3806     | 53.8561     | 67.5453            | 53.1858            |
 
 What I learned:
 - The next safe optimization surface is repeated tensor allocation and dtype conversion inside the push/relabel loop, not clustering or the runner.
+- This round produced consistent gains across all measured target sizes, especially for 2-Level and for k-Level at smaller n.
 
 Current status:
-- Ready for HPC measurement for round 2.
+- Round 2 is the current best committed state.
+- Next target is repeated `arange` and zero-buffer allocation inside the push and resolve phases.
+
+### Round 3 (prepared 2026-04-02)
+What I changed:
+- `src/clustered_push_relabel/solvers/bipartite.py`
+  - Added reusable cached long buffers for `torch.arange(...)` workspaces used in the push and resolve phases.
+  - Added reusable zeroed long buffers for the resolve offset scans, avoiding fresh `torch.zeros(...)` allocations each iteration.
+  - Applied the same allocation caching to both `TwoLevelBipartiteSolver` and `KLevelBipartiteSolver`.
+
+Results:
+- Local validation:
+  - `python -m compileall src/clustered_push_relabel/solvers/bipartite.py experiments/runners/e1_mnist_vs_exact.py`
+  - Tiny synthetic smoke test passed for both `TwoLevelBipartiteSolver` and `KLevelBipartiteSolver`.
+- HPC timings: pending.
+
+What I learned:
+- After round 2, the remaining obvious hot-loop overhead is temporary long-tensor allocation for segment indexing and rank construction.
+
+Current status:
+- Ready for HPC measurement for round 3.
 
 ## Active Hypotheses
-- Round 2 hypothesis: precomputing long-form CSR indices and reusing center-reduction buffers will reduce allocator pressure and per-iteration index-conversion overhead in both solver variants without changing matching behavior.
-- Expected gain: modest runtime reduction, likely more visible in k-Level than round 1 if its hot loop was bottlenecked by repeated small tensor setup costs.
+- Round 3 hypothesis: caching `arange` and offset work buffers will reduce GPU allocator churn in push/resolve and yield another modest solver-time reduction without changing any matching decisions.
+- Expected gain: modest runtime reduction, with the best chance of improvement in the solver-time column rather than clustering time.
