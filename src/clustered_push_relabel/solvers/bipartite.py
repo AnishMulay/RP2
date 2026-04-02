@@ -200,6 +200,7 @@ class TwoLevelBipartiteSolver:
 
         # Map centers to dense IDs 0..K-1 for efficient offsets
         center_map = torch.searchsorted(valid_centers, all_centers)
+        self.num_active_centers = int(valid_centers.numel())
 
         # 4. Build Red CSR (Grouped by Center)
         red_mask = is_red_point
@@ -210,19 +211,19 @@ class TwoLevelBipartiteSolver:
         max_red_level = red_levels.max().to(torch.long)
         r_sort_key = (red_centers.to(torch.long) * (max_red_level + 1)) + red_levels.to(torch.long)
         perm_r = torch.argsort(r_sort_key)
-        self.red_indices = red_points[perm_r].to(device=self.device, dtype=torch.int32)
+        self.red_indices = red_points[perm_r].to(device=self.device, dtype=torch.long)
         self.red_levels = red_levels[perm_r].to(device=self.device, dtype=torch.int32)
         sorted_r_centers = red_centers[perm_r]
 
-        r_counts = torch.bincount(sorted_r_centers, minlength=valid_centers.numel())
-        r_counts_i32 = r_counts.to(device=self.device, dtype=torch.int32)
+        r_counts = torch.bincount(sorted_r_centers, minlength=self.num_active_centers)
+        r_counts_long = r_counts.to(device=self.device, dtype=torch.long)
         self.red_offsets = torch.cat(
-            [torch.zeros(1, device=self.device, dtype=torch.int32), torch.cumsum(r_counts_i32, 0)]
+            [torch.zeros(1, device=self.device, dtype=torch.long), torch.cumsum(r_counts_long, 0)]
         )
 
         # Expand Center IDs for scatter ops
         self.red_expand_center_ids = torch.repeat_interleave(
-            torch.arange(valid_centers.numel(), device=self.device, dtype=torch.int32), r_counts_i32
+            torch.arange(self.num_active_centers, device=self.device, dtype=torch.long), r_counts_long
         )
 
         # 5. Build Blue CSR (Inverted: Blue -> [Centers])
@@ -232,15 +233,17 @@ class TwoLevelBipartiteSolver:
         blue_levels = all_levels[blue_mask]
 
         perm_b = torch.argsort(blue_points)
-        self.blue_center_indices = blue_centers[perm_b].to(device=self.device, dtype=torch.int32)
+        self.blue_center_indices = blue_centers[perm_b].to(device=self.device, dtype=torch.long)
         self.blue_levels = blue_levels[perm_b].to(device=self.device, dtype=torch.int32)
         sorted_b_pts = blue_points[perm_b]
 
         b_counts = torch.bincount(sorted_b_pts, minlength=N)
-        b_counts_i32 = b_counts.to(device=self.device, dtype=torch.int32)
+        b_counts_long = b_counts.to(device=self.device, dtype=torch.long)
         self.blue_offsets = torch.cat(
-            [torch.zeros(1, device=self.device, dtype=torch.int32), torch.cumsum(b_counts_i32, 0)]
+            [torch.zeros(1, device=self.device, dtype=torch.long), torch.cumsum(b_counts_long, 0)]
         )
+        self._center_max_yA = torch.empty(self.num_active_centers, device=self.device, dtype=torch.int32)
+        self._center_max_L_A = torch.empty(self.num_active_centers, device=self.device, dtype=torch.int32)
 
         if self.verbose:
             print(f"         Red Entries: {self.red_indices.numel()} (GPU)")
@@ -273,6 +276,8 @@ class TwoLevelBipartiteSolver:
         prev_num_free = None
         stuck_iters = 0
         prev_matched_count = None
+        center_max_yA = self._center_max_yA
+        center_max_L_A = self._center_max_L_A
 
         while True:
             B_free = torch.nonzero(self.MB == -1).squeeze(1)
@@ -308,24 +313,20 @@ class TwoLevelBipartiteSolver:
             # A. Maintenance: Max yA per Center
             maybe_sync()
             yA_expanded = self.yA[self.red_indices]
-            center_max_yA = torch.zeros(
-                len(self.red_offsets)-1, device=self.device, dtype=torch.int32
-            )
+            center_max_yA.zero_()
             # We want to check: Slack_Est = 2*L_b - yB - Max_yA
             # So we need max(yA) in the center.
             center_max_yA.scatter_reduce_(
                 0,
-                self.red_expand_center_ids.to(torch.long),
+                self.red_expand_center_ids,
                 yA_expanded,
                 reduce="amax",
                 include_self=False,
             )
-            center_max_L_A = torch.zeros(
-                len(self.red_offsets)-1, device=self.device, dtype=torch.int32
-            )
+            center_max_L_A.zero_()
             center_max_L_A.scatter_reduce_(
                 0,
-                self.red_expand_center_ids.to(torch.long),
+                self.red_expand_center_ids,
                 self.red_levels,
                 reduce="amax",
                 include_self=False,
@@ -496,7 +497,7 @@ class TwoLevelBipartiteSolver:
                     c_r_sorted = red_c_ids
                     l_r_sorted = red_levels
 
-                    num_centers = self.red_offsets.numel() - 1
+                    num_centers = self.num_active_centers
                     b_counts = torch.bincount(c_sorted, minlength=num_centers)
                     r_counts = torch.bincount(c_r_sorted, minlength=num_centers)
                     limits = torch.minimum(b_counts, r_counts)
@@ -797,6 +798,7 @@ class KLevelBipartiteSolver:
         # 4. Map Sparse Center IDs to Dense IDs (0..K-1)
         # This is required for CSR offsets
         center_map = torch.searchsorted(valid_centers, all_centers)
+        self.num_active_centers = int(valid_centers.numel())
         
         # 5. Build Red CSR (Points 0..N-1)
         # Group by Center
@@ -810,18 +812,18 @@ class KLevelBipartiteSolver:
         r_sort_key = (red_centers.to(torch.long) * (max_red_level + 1)) + red_levels.to(torch.long)
         perm_r = torch.argsort(r_sort_key)
         
-        self.red_indices = red_points[perm_r].to(device=self.device, dtype=torch.int32)
+        self.red_indices = red_points[perm_r].to(device=self.device, dtype=torch.long)
         self.red_levels = red_levels[perm_r].to(device=self.device, dtype=torch.int32)
         sorted_r_centers = red_centers[perm_r]
-        
-        r_counts = torch.bincount(sorted_r_centers, minlength=valid_centers.numel())
-        r_counts_i32 = r_counts.to(device=self.device, dtype=torch.int32)
+
+        r_counts = torch.bincount(sorted_r_centers, minlength=self.num_active_centers)
+        r_counts_long = r_counts.to(device=self.device, dtype=torch.long)
         self.red_offsets = torch.cat(
-            [torch.zeros(1, device=self.device, dtype=torch.int32), torch.cumsum(r_counts_i32, 0)]
+            [torch.zeros(1, device=self.device, dtype=torch.long), torch.cumsum(r_counts_long, 0)]
         )
         # Expansion array for scatter operations
         self.red_expand_center_ids = torch.repeat_interleave(
-            torch.arange(valid_centers.numel(), device=self.device, dtype=torch.int32), r_counts_i32
+            torch.arange(self.num_active_centers, device=self.device, dtype=torch.long), r_counts_long
         )
         
         # 6. Build Blue CSR (Points N..2N-1 -> Remap to 0..N-1)
@@ -834,15 +836,17 @@ class KLevelBipartiteSolver:
         
         # Sort by Blue Point ID
         perm_b = torch.argsort(blue_points)
-        self.blue_center_indices = blue_centers[perm_b].to(device=self.device, dtype=torch.int32)
+        self.blue_center_indices = blue_centers[perm_b].to(device=self.device, dtype=torch.long)
         self.blue_levels = blue_levels[perm_b].to(device=self.device, dtype=torch.int32)
         sorted_b_pts = blue_points[perm_b]
-        
+
         b_counts = torch.bincount(sorted_b_pts, minlength=N)
-        b_counts_i32 = b_counts.to(device=self.device, dtype=torch.int32)
+        b_counts_long = b_counts.to(device=self.device, dtype=torch.long)
         self.blue_offsets = torch.cat(
-            [torch.zeros(1, device=self.device, dtype=torch.int32), torch.cumsum(b_counts_i32, 0)]
+            [torch.zeros(1, device=self.device, dtype=torch.long), torch.cumsum(b_counts_long, 0)]
         )
+        self._center_max_yA = torch.empty(self.num_active_centers, device=self.device, dtype=torch.int32)
+        self._center_max_L_A = torch.empty(self.num_active_centers, device=self.device, dtype=torch.int32)
         
         if self.verbose:
             print(f"         Red CSR Entries: {self.red_indices.numel()}")
@@ -890,6 +894,8 @@ class KLevelBipartiteSolver:
         prev_num_free = None
         stuck_iters = 0
         prev_matched_count = None
+        center_max_yA = self._center_max_yA
+        center_max_L_A = self._center_max_L_A
 
         while True:
             # Check convergence
@@ -928,23 +934,19 @@ class KLevelBipartiteSolver:
             maybe_sync()
             
             yA_expanded = self.yA[self.red_indices]
-            center_max_yA = torch.zeros(
-                len(self.red_offsets)-1, device=self.device, dtype=torch.int32
-            )
+            center_max_yA.zero_()
             # Scatter max: For each cluster, find highest dual weight of connected Red points
             center_max_yA.scatter_reduce_(
                 0,
-                self.red_expand_center_ids.to(torch.long),
+                self.red_expand_center_ids,
                 yA_expanded,
                 reduce="amax",
                 include_self=False,
             )
-            center_max_L_A = torch.zeros(
-                len(self.red_offsets)-1, device=self.device, dtype=torch.int32
-            )
+            center_max_L_A.zero_()
             center_max_L_A.scatter_reduce_(
                 0,
-                self.red_expand_center_ids.to(torch.long),
+                self.red_expand_center_ids,
                 self.red_levels,
                 reduce="amax",
                 include_self=False,
@@ -1075,7 +1077,7 @@ class KLevelBipartiteSolver:
 
                     # Match available Reds to candidate Blues per Center
                     # Since both arrays are sorted by Center, we can use counts/offsets
-                    num_centers = self.red_offsets.numel() - 1
+                    num_centers = self.num_active_centers
                     
                     b_counts = torch.bincount(c_sorted, minlength=num_centers)
                     r_counts = torch.bincount(red_c_ids, minlength=num_centers)
