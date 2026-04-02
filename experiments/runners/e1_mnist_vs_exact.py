@@ -93,9 +93,12 @@ def compute_cost_matrix_L1(red, blue):
         C[i, :] = np.abs(X[i] - Y).sum(axis=1)
     return C
 
+
+DEFAULT_N_VALUES = [1000, 5000, 10000, 15000]
+
 def main():
     parser = argparse.ArgumentParser(description="E1 MNIST vs Exact")
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group()
     group.add_argument("--n_values", type=int, nargs='+', help="List of N values to test")
     group.add_argument("--min_n", type=int, help="Min N (use with --max_n, --step)")
     parser.add_argument("--max_n", type=int, help="Max N")
@@ -112,6 +115,8 @@ def main():
     # Create list of n values
     if args.n_values:
         n_list = args.n_values
+    elif args.min_n is None and args.max_n is None and args.step is None:
+        n_list = DEFAULT_N_VALUES
     else:
         if args.min_n is None or args.max_n is None or args.step is None:
             parser.error("Specify --n_values or --min_n/--max_n/--step")

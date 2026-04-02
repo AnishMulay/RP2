@@ -18,7 +18,7 @@ class TwoLevelBipartiteSolver:
         batch_size (int, optional): Processing chunk size. Defaults to 1024.
         metric (str, optional): Distance metric ("L2" or "L1"). Defaults to "L2".
     """
-    def __init__(self, P_red, P_blue, epsilon, batch_size=None, metric="L2"):
+    def __init__(self, P_red, P_blue, epsilon, batch_size=None, metric="L2", verbose=False):
         self.device = P_red.device
         self.N = P_red.shape[0]
         self.epsilon = epsilon
@@ -26,29 +26,36 @@ class TwoLevelBipartiteSolver:
         self.P_blue = P_blue
         self.batch_size = 1024 if batch_size is None else batch_size
         self.metric = metric
+        self.verbose = verbose
         
-        print("="*60)
-        print(f"[Init] Configuration: N={self.N}, Eps={epsilon}, Batch={self.batch_size}, Metric={metric}, Device={self.device}")
+        if self.verbose:
+            print("="*60)
+            print(f"[Init] Configuration: N={self.N}, Eps={epsilon}, Batch={self.batch_size}, Metric={metric}, Device={self.device}")
         
         # 1. Clustering
-        print("[Step 1] Running Geometric Clustering...")
+        if self.verbose:
+            print("[Step 1] Running Geometric Clustering...")
         t0 = time.time()
         cluster_engine = FastGPUClustering(
             epsilon, batch_size=self.batch_size, micro_batch_size=32, metric=metric
         )
         blue_coo, red_coo, r_mask, b_mask = cluster_engine.run(P_red, P_blue)
         torch.cuda.synchronize()
-        print(f"         Clustering done in {time.time()-t0:.2f}s")
-        print(f"         Raw Blue Shells: {blue_coo[0].numel()}")
-        print(f"         Raw Red Shells:  {red_coo[0].numel()}")
+        if self.verbose:
+            print(f"         Clustering done in {time.time()-t0:.2f}s")
+            print(f"         Raw Blue Shells: {blue_coo[0].numel()}")
+            print(f"         Raw Red Shells:  {red_coo[0].numel()}")
         
         # 2. Indexing
-        print("[Step 2] Building CSR Index (Group by Center)...")
+        if self.verbose:
+            print("[Step 2] Building CSR Index (Group by Center)...")
         t0 = time.time()
         self._build_csr_from_coo_cpu(blue_coo, red_coo, r_mask, b_mask)
-        print(f"         Indexing done in {time.time()-t0:.2f}s")
+        if self.verbose:
+            print(f"         Indexing done in {time.time()-t0:.2f}s")
         
-        print("   [Debug] Starting GC and State Init...")
+        if self.verbose:
+            print("   [Debug] Starting GC and State Init...")
         t_setup = time.time()
         del blue_coo, red_coo, cluster_engine
         gc.collect()
@@ -60,7 +67,8 @@ class TwoLevelBipartiteSolver:
         self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
         self.MB = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
         torch.cuda.synchronize()
-        print(f"   [Debug] GC & State Init finished in {time.time() - t_setup:.4f}s")
+        if self.verbose:
+            print(f"   [Debug] GC & State Init finished in {time.time() - t_setup:.4f}s")
 
     def cleanup_remaining_points(self):
         free_b = torch.nonzero(self.MB == -1).squeeze(1)
@@ -69,7 +77,8 @@ class TwoLevelBipartiteSolver:
         if count > 0:
             self.MB[free_b[:count]] = free_r[:count].to(self.MB.dtype)
             self.MA[free_r[:count]] = free_b[:count].to(self.MA.dtype)
-        print(f"[Cleanup] Arbitrarily matched {count} remaining pairs.")
+        if self.verbose:
+            print(f"[Cleanup] Arbitrarily matched {count} remaining pairs.")
 
     def calculate_final_stats(self):
         if self.metric == "L1":
@@ -80,8 +89,9 @@ class TwoLevelBipartiteSolver:
             label = "Euclidean"
         total_cost = dists.sum()
         avg_cost = total_cost / self.N
-        print(f"Total {label} Cost: {total_cost.item():.4f}")
-        print(f"Avg {label} Cost: {avg_cost.item():.4f}")
+        if self.verbose:
+            print(f"Total {label} Cost: {total_cost.item():.4f}")
+            print(f"Avg {label} Cost: {avg_cost.item():.4f}")
 
     def _build_csr_from_coo_cpu(self, blue_coo, red_coo, red_mask, blue_mask):
         """
@@ -228,12 +238,14 @@ class TwoLevelBipartiteSolver:
             [torch.zeros(1, device=self.device, dtype=torch.int32), torch.cumsum(b_counts_i32, 0)]
         )
 
-        print(f"         Red Entries: {self.red_indices.numel()} (GPU)")
-        print(f"         Blue Entries: {self.blue_center_indices.numel()} (GPU)")
-        print(f"         Avg Degree: {(self.blue_center_indices.numel() + self.red_indices.numel())/N:.2f}")
+        if self.verbose:
+            print(f"         Red Entries: {self.red_indices.numel()} (GPU)")
+            print(f"         Blue Entries: {self.blue_center_indices.numel()} (GPU)")
+            print(f"         Avg Degree: {(self.blue_center_indices.numel() + self.red_indices.numel())/N:.2f}")
 
     def solve(self):
-        print("[Debug] Entering solve() method...")
+        if self.verbose:
+            print("[Debug] Entering solve() method...")
         # print(f"\n[Step 3] Starting Push-Relabel Loop...")
         iteration = 0
         use_cuda = self.device.type == "cuda"
@@ -286,7 +298,7 @@ class TwoLevelBipartiteSolver:
                 dbg_after_commit = 0
             # log_mem("Start Iter")
 
-            if iteration % 10 == 0:
+            if self.verbose and iteration % 10 == 0:
                 print(f"    [Iter {iteration}] Free: {num_free}")
 
             # A. Maintenance: Max yA per Center
@@ -607,7 +619,7 @@ class KLevelBipartiteSolver:
         batch_size (int, optional): Processing chunk size. Defaults to 2048.
         metric (str, optional): Distance metric ("L2" or "L1"). Defaults to "L2".
     """
-    def __init__(self, P_red, P_blue, epsilon, k=4, batch_size=None, metric="L2"):
+    def __init__(self, P_red, P_blue, epsilon, k=4, batch_size=None, metric="L2", verbose=False):
         self.device = P_red.device
         self.N = P_red.shape[0]
         self.epsilon = epsilon
@@ -616,30 +628,37 @@ class KLevelBipartiteSolver:
         self.P_blue = P_blue
         self.batch_size = 2048 if batch_size is None else batch_size
         self.metric = metric
+        self.verbose = verbose
         
-        print("="*60)
-        print(f"[Init] Config: N={self.N}, Eps={epsilon}, Levels={k}, Batch={self.batch_size}, Metric={metric}, Device={self.device}")
+        if self.verbose:
+            print("="*60)
+            print(f"[Init] Config: N={self.N}, Eps={epsilon}, Levels={k}, Batch={self.batch_size}, Metric={metric}, Device={self.device}")
         
         # 1. Multi-Level Clustering
-        print("[Step 1] Running Multi-Level Hierarchical Clustering...")
+        if self.verbose:
+            print("[Step 1] Running Multi-Level Hierarchical Clustering...")
         t0 = time.time()
         cluster_engine = FastGPUMultiLevelClustering(
             epsilon, k=k, batch_size=self.batch_size, metric=metric
         )
         blue_coo, red_coo, levels_red, levels_blue = cluster_engine.run(P_red, P_blue)
         torch.cuda.synchronize()
-        print(f"         Clustering done in {time.time()-t0:.2f}s")
-        print(f"         Red Edges:  {red_coo[0].numel()}")
-        print(f"         Blue Edges: {blue_coo[0].numel()}")
+        if self.verbose:
+            print(f"         Clustering done in {time.time()-t0:.2f}s")
+            print(f"         Red Edges:  {red_coo[0].numel()}")
+            print(f"         Blue Edges: {blue_coo[0].numel()}")
         
         # 2. Indexing
-        print("[Step 2] Building CSR Index (Unified Center Space)...")
+        if self.verbose:
+            print("[Step 2] Building CSR Index (Unified Center Space)...")
         t0 = time.time()
         self._build_csr_from_coo_cpu(blue_coo, red_coo, levels_red, levels_blue)
-        print(f"         Indexing done in {time.time()-t0:.2f}s")
+        if self.verbose:
+            print(f"         Indexing done in {time.time()-t0:.2f}s")
         
         # Cleanup
-        print("   [Debug] Starting GC and State Init...")
+        if self.verbose:
+            print("   [Debug] Starting GC and State Init...")
         t_setup = time.time()
         del blue_coo, red_coo, levels_red, levels_blue, cluster_engine
         gc.collect()
@@ -651,7 +670,8 @@ class KLevelBipartiteSolver:
         self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
         self.MB = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
         torch.cuda.synchronize()
-        print(f"   [Debug] GC & State Init finished in {time.time() - t_setup:.4f}s")
+        if self.verbose:
+            print(f"   [Debug] GC & State Init finished in {time.time() - t_setup:.4f}s")
 
     def _build_csr_from_coo_cpu(self, blue_coo, red_coo, levels_red, levels_blue):
         """
@@ -759,7 +779,8 @@ class KLevelBipartiteSolver:
         if valid_centers.numel() == 0:
             raise ValueError("No valid clusters found (Intersection Empty).")
             
-        print(f"         Active Centers: {valid_centers.numel()}")
+        if self.verbose:
+            print(f"         Active Centers: {valid_centers.numel()}")
         
         # 3. Filter Edges to Valid Centers Only
         mask_valid = torch.isin(all_centers, valid_centers)
@@ -818,8 +839,9 @@ class KLevelBipartiteSolver:
             [torch.zeros(1, device=self.device, dtype=torch.int32), torch.cumsum(b_counts_i32, 0)]
         )
         
-        print(f"         Red CSR Entries: {self.red_indices.numel()}")
-        print(f"         Blue CSR Entries: {self.blue_center_indices.numel()}")
+        if self.verbose:
+            print(f"         Red CSR Entries: {self.red_indices.numel()}")
+            print(f"         Blue CSR Entries: {self.blue_center_indices.numel()}")
 
     def cleanup_remaining_points(self):
         free_b = torch.nonzero(self.MB == -1).squeeze(1)
@@ -828,7 +850,8 @@ class KLevelBipartiteSolver:
         if count > 0:
             self.MB[free_b[:count]] = free_r[:count].to(self.MB.dtype)
             self.MA[free_r[:count]] = free_b[:count].to(self.MA.dtype)
-        print(f"[Cleanup] Arbitrarily matched {count} remaining pairs.")
+        if self.verbose:
+            print(f"[Cleanup] Arbitrarily matched {count} remaining pairs.")
 
     def calculate_final_stats(self):
         if self.metric == "L1":
@@ -839,11 +862,13 @@ class KLevelBipartiteSolver:
             label = "Euclidean"
         total_cost = dists.sum()
         avg_cost = total_cost / self.N
-        print(f"Total {label} Cost: {total_cost.item():.4f}")
-        print(f"Avg {label} Cost: {avg_cost.item():.4f}")
+        if self.verbose:
+            print(f"Total {label} Cost: {total_cost.item():.4f}")
+            print(f"Avg {label} Cost: {avg_cost.item():.4f}")
 
     def solve(self):
-        print("[Debug] Entering solve() method...")
+        if self.verbose:
+            print("[Debug] Entering solve() method...")
         # print(f"\n[Step 3] Starting Push-Relabel Loop...")
         iteration = 0
         use_cuda = self.device.type == "cuda"
@@ -887,7 +912,7 @@ class KLevelBipartiteSolver:
                 dbg_after_free_v = 0
                 dbg_after_conflict = 0
                 dbg_after_commit = 0
-            if iteration % 10 == 0:
+            if self.verbose and iteration % 10 == 0:
                 print(f"    [Iter {iteration}] Free: {num_free}")
 
             # ---------------------------------------------------------
