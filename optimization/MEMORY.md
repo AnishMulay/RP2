@@ -26,6 +26,22 @@ Known issues at baseline:
 - k-Level scales better than 2-Level (67s vs 221s at n=10000)
 
 ## Current Best
+Round 5 accepted (`27c646b`) as final best state:
+- Carried the free-blue set forward incrementally instead of rebuilding it from `MB` each iteration
+- Best measured target-size results so far:
+  - n=1000: 2-Level `48.23s`, k-Level `50.14s`
+  - n=2500: 2-Level `47.86s`, k-Level `46.18s`
+  - n=5000: 2-Level `66.04s`, k-Level `46.08s`
+- Compared with round 4:
+  - 2-Level improved by `7.6%` at n=1000, `4.3%` at n=2500, and regressed by `0.5%` at n=5000
+  - k-Level improved by `4.1%` at n=1000, `3.5%` at n=2500, and `8.9%` at n=5000
+- Compared with the original baseline where directly comparable:
+  - 2-Level improved by `27.6%` at n=1000 and `30.4%` at n=5000
+  - k-Level improved by `14.3%` at n=1000 and `17.2%` at n=5000
+- Final recommendation:
+  - Use round 5 / commit `27c646b` as the default mainline state.
+  - If a workload is specifically dominated by 2-Level at n around 5000, round 4 remains slightly faster for that one slice (`65.71s` vs `66.04s`).
+
 Round 4 accepted (`48043e0`) as current mainline:
 - Added a single-batch push fast path tailored to the target benchmark regime
 - Best measured target-size results so far:
@@ -213,14 +229,22 @@ Results:
 - Local validation:
   - `python -m compileall src/clustered_push_relabel/solvers/bipartite.py experiments/runners/e1_mnist_vs_exact.py`
   - Tiny synthetic smoke test passed for both `TwoLevelBipartiteSolver` and `KLevelBipartiteSolver`.
-- HPC timings: pending.
+- HPC timings on target sizes:
+
+| n    | Exact (s) | 2-Level (s) | k-Level (s) | 2-Level solver (s) | k-Level solver (s) |
+|------|-----------|-------------|-------------|--------------------|--------------------|
+| 1000 | 0.1149    | 48.2260     | 50.1448     | 47.8066            | 50.0216            |
+| 2500 | 0.8457    | 47.8582     | 46.1776     | 47.5227            | 45.9263            |
+| 5000 | 4.2575    | 66.0440     | 46.0758     | 65.1596            | 45.4324            |
 
 What I learned:
 - After round 4, one of the remaining obvious non-algorithmic costs is rebuilding the free-blue index set from scratch every iteration even though matches are monotone.
+- That cost mattered: round 5 produced the best k-Level times at all measured target sizes and the best 2-Level times at n=1000 and n=2500.
+- The only measured regression relative to round 4 is 2-Level at n=5000, and it is small (`66.04s` vs `65.71s`).
 
 Current status:
-- Ready for HPC measurement for round 5.
+- Optimization work concluded at the user's request after round 5 benchmarking.
+- Final best overall commit is `27c646b`.
 
 ## Active Hypotheses
-- Round 5 hypothesis: carrying `B_free` forward incrementally instead of rescanning `MB` each iteration will shave off repeated full-vector overhead in the solver loop without affecting matching behavior.
-- Expected gain: modest solver-time reduction, especially if the loop runs many iterations before convergence.
+- No further optimization planned.
