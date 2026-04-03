@@ -247,4 +247,37 @@ Current status:
 - Final best overall commit is `27c646b`.
 
 ## Active Hypotheses
-- No further optimization planned.
+- Round 6 hypothesis: the bottleneck is inside a single phase of the push-relabel loop.
+  Sub-phases A (scatter_reduce maintenance), B (ragged index + slack computation),
+  C (argsort/bincount/rank resolve), and D (relabel + free-set update) have never been
+  individually timed.  We do not yet know which sub-phase dominates.
+
+### Round 6 (prepared 2026-04-03) — PROFILING ROUND, no algorithmic changes
+What changed:
+- `src/clustered_push_relabel/solvers/bipartite.py`
+  - Added module-level `PROFILING = False` flag.
+  - Instrumented both `TwoLevelBipartiteSolver.solve()` and
+    `KLevelBipartiteSolver.solve()` with `time.perf_counter()` checkpoints behind
+    `if PROFILING:` guards.  Zero overhead when flag is False.
+  - Sub-phases timed per iteration:
+      A  – scatter_reduce to build center_max_yA / center_max_L_A
+      B1 – ragged index construction (repeat_interleave / cumsum)
+      B2 – CSR gather (blue_center_indices / blue_levels lookup)
+      B3 – slack arithmetic and candidate filter
+      C1 – free-red mask filter (MA == -1)
+      C2 – argsort / bincount / cumsum / rank computation
+      C3 – final slack==0 check + MB/MA write
+      D  – B_free update, yB increment, yA decrement
+  - At end of solve(), profiling dict stored as `solver._prof` for retrieval.
+- `experiments/runners/e1_mnist_profile.py` (new file)
+  - Profiling variant of e1_mnist_vs_exact.py.
+  - Sets `_bip_module.PROFILING = True` before running solvers.
+  - Runs only n=1000 and n=5000 (reduced to limit profiling overhead).
+  - Prints a clean table: operation | total(s) | % solver time | avg per iter (ms).
+  - Still writes the standard CSV and prints correctness output.
+  - Run with:
+      python -u experiments/runners/e1_mnist_profile.py --epsilon 0.01 --k 4 --trials 1 --seed 42
+
+Results: pending HPC run.
+
+Next action: paste the profiling table output back to determine which sub-phase to target in round 7.

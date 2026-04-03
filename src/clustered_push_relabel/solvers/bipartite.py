@@ -31,6 +31,15 @@ def _ensure_bool_buffer(owner, attr_name, size, device):
     return buf[:size]
 
 
+# ---------------------------------------------------------------------------
+# Phase-level profiling flag.
+# Set to True (from the outside, e.g. the profile runner) to enable
+# per-phase timing inside solve().  When False every `if PROFILING:` branch
+# is skipped at the Python byte-code level — zero runtime overhead.
+# ---------------------------------------------------------------------------
+PROFILING = False
+
+
 class TwoLevelBipartiteSolver:
     """
     Bipartite matching solver using a two-level (flat) cluster decomposition.
@@ -307,13 +316,31 @@ class TwoLevelBipartiteSolver:
         center_max_L_A = self._center_max_L_A
         B_free = torch.arange(self.N, device=self.device, dtype=torch.long)
 
+        if PROFILING:
+            _prof = {
+                'A_maint':     0.0,  # scatter_reduce for center_max_yA / center_max_L_A
+                'B_index':     0.0,  # ragged index construction (fast path)
+                'B_gather':    0.0,  # CSR lookups for c_ids / b_levels (fast path)
+                'B_slack':     0.0,  # slack arithmetic + candidate filter (fast path)
+                'C_free_reds': 0.0,  # MA mask filter to get free red points
+                'C_sort_rank': 0.0,  # argsort + bincount + cumsum + rank ops
+                'C_commit':    0.0,  # final slack check + MB/MA writes
+                'D_relabel':   0.0,  # B_free update + yB/yA increments
+                'iterations':  0,
+            }
+            def _psync():
+                if use_cuda:
+                    torch.cuda.synchronize()
+
         while True:
             num_free = B_free.numel()
             if num_free <= self.epsilon * self.N:
                 # print("[Converged] Free points <= Threshold. Stopping.")
                 break
-            
+
             iteration += 1
+            if PROFILING:
+                _prof['iterations'] += 1
             if prev_num_free is not None and num_free == prev_num_free:
                 stuck_iters += 1
             else:
@@ -339,6 +366,7 @@ class TwoLevelBipartiteSolver:
 
             # A. Maintenance: Max yA per Center
             maybe_sync()
+            if PROFILING: _psync(); _t = time.perf_counter()
             yA_expanded = self.yA[self.red_indices]
             center_max_yA.zero_()
             # We want to check: Slack_Est = 2*L_b - yB - Max_yA
@@ -359,10 +387,12 @@ class TwoLevelBipartiteSolver:
                 include_self=False,
             )
             maybe_sync()
+            if PROFILING: _psync(); _prof['A_maint'] += time.perf_counter() - _t
             # log_mem("After Maint")
-            
+
             # B. Push (Ragged Gather)
             maybe_sync()
+            if PROFILING: _psync(); _t_b_index = time.perf_counter()
             push_batch_size = 5000
 
             starts_all = self.blue_offsets[B_free]
@@ -410,11 +440,13 @@ class TwoLevelBipartiteSolver:
                 offsets = global_range - repeat_packed_starts
                 active_edge_indices = repeat_starts + offsets
                 # log_mem("Mid-Push (Indices)")
+                if PROFILING: _psync(); _prof['B_index'] += time.perf_counter() - _t_b_index; _t_b_gather = time.perf_counter()
 
                 # Reconstruct attributes
                 active_b_ids = torch.repeat_interleave(chunk, lengths)
                 active_c_ids = self.blue_center_indices[active_edge_indices]
                 active_b_levels = self.blue_levels[active_edge_indices]
+                if PROFILING: _psync(); _prof['B_gather'] += time.perf_counter() - _t_b_gather; _t_b_slack = time.perf_counter()
 
                 # Slack Estimation (Lower Bound)
                 # Slack = 2 * max(L_b, L_a) - yB - yA
@@ -422,8 +454,8 @@ class TwoLevelBipartiteSolver:
                 # If Lower Bound > 0, then Real Slack is definitely > 0 (since L_a >= 0, yA <= Max_yA)
                 # So we only check where Lower Bound <= 0
                 slacks_est = (
-                    2 * active_b_levels 
-                    - self.yB[active_b_ids] 
+                    2 * active_b_levels
+                    - self.yB[active_b_ids]
                     - center_max_yA[active_c_ids]
                 )
                 active_max_L_A = center_max_L_A[active_c_ids]
@@ -444,6 +476,7 @@ class TwoLevelBipartiteSolver:
                         dbg_max_slack_est = local_max
 
                 candidates = (slacks_est <= 0) & (slacks_high >= 0)
+                if PROFILING: _psync(); _prof['B_slack'] += time.perf_counter() - _t_b_slack
                 maybe_sync()
                 # log_mem("After Push")
 
@@ -540,6 +573,7 @@ class TwoLevelBipartiteSolver:
             if win_b.numel() != 0:
                 # C. Resolve
                 maybe_sync()
+                if PROFILING: _psync(); _t_c = time.perf_counter()
                 # We have (Blue, Center) pairs that MIGHT have a match.
 
                 free_red_mask = self.MA[self.red_indices] == -1
@@ -547,6 +581,7 @@ class TwoLevelBipartiteSolver:
                 red_ids = self.red_indices[free_red_mask]
                 red_levels = self.red_levels[free_red_mask]
                 red_c_ids = self.red_expand_center_ids[free_red_mask]
+                if PROFILING: _psync(); _prof['C_free_reds'] += time.perf_counter() - _t_c; _t_c_sr = time.perf_counter()
 
                 if win_b.numel() != 0 and red_ids.numel() != 0:
                     max_level = torch.maximum(win_l_b.max(), red_levels.max()).to(torch.long)
@@ -586,6 +621,7 @@ class TwoLevelBipartiteSolver:
 
                     b_keep = b_rank < limits[c_sorted]
                     r_keep = r_rank < limits[c_r_sorted]
+                    if PROFILING: _psync(); _prof['C_sort_rank'] += time.perf_counter() - _t_c_sr; _t_c_commit = time.perf_counter()
 
                     b_final = b_sorted[b_keep]
                     l_b_final = l_b_sorted[b_keep]
@@ -619,6 +655,7 @@ class TwoLevelBipartiteSolver:
                         if DEBUG_PIPE:
                             new_count = int((self.MA != -1).sum().item())
                             dbg_after_commit = new_count - prev_match_count
+                    if PROFILING: _psync(); _prof['C_commit'] += time.perf_counter() - _t_c_commit
                     del (
                         b_sort_key,
                         b_perm,
@@ -648,6 +685,7 @@ class TwoLevelBipartiteSolver:
 
             # D. Relabel
             maybe_sync()
+            if PROFILING: _psync(); _t_d = time.perf_counter()
             if b_match is not None and b_match.numel() != 0:
                 keep_free_mask = _ensure_bool_buffer(
                     self, "_keep_free_mask_buf", num_free, self.device
@@ -664,6 +702,7 @@ class TwoLevelBipartiteSolver:
             maybe_sync()
             # log_mem("After Relabel")
             B_free = still_free
+            if PROFILING: _psync(); _prof['D_relabel'] += time.perf_counter() - _t_d
             matched_now = self.N - still_free.numel()
             if should_dbg:
                 delta_matched = 0 if prev_matched_count is None else matched_now - prev_matched_count
@@ -680,11 +719,13 @@ class TwoLevelBipartiteSolver:
                     f"committed={dbg_after_commit}"
                 )
             prev_matched_count = matched_now
-            
+
             if iteration > 50000:
                 # print("Max Iterations Reached.")
                 break
 
+        if PROFILING:
+            self._prof = _prof
         self.cleanup_remaining_points()
         if self.verbose:
             print(f"Matched: {(self.MB != -1).sum().item()}/{self.N}")
@@ -981,14 +1022,32 @@ class KLevelBipartiteSolver:
         center_max_L_A = self._center_max_L_A
         B_free = torch.arange(self.N, device=self.device, dtype=torch.long)
 
+        if PROFILING:
+            _prof = {
+                'A_maint':     0.0,
+                'B_index':     0.0,
+                'B_gather':    0.0,
+                'B_slack':     0.0,
+                'C_free_reds': 0.0,
+                'C_sort_rank': 0.0,
+                'C_commit':    0.0,
+                'D_relabel':   0.0,
+                'iterations':  0,
+            }
+            def _psync():
+                if use_cuda:
+                    torch.cuda.synchronize()
+
         while True:
             # Check convergence
             num_free = B_free.numel()
             if num_free <= self.epsilon * self.N:
                 # print("[Converged] Free points <= Threshold. Stopping.")
                 break
-            
+
             iteration += 1
+            if PROFILING:
+                _prof['iterations'] += 1
             if prev_num_free is not None and num_free == prev_num_free:
                 stuck_iters += 1
             else:
@@ -1015,7 +1074,8 @@ class KLevelBipartiteSolver:
             # ---------------------------------------------------------
             # Calculate max(yA) per cluster
             maybe_sync()
-            
+            if PROFILING: _psync(); _t = time.perf_counter()
+
             yA_expanded = self.yA[self.red_indices]
             center_max_yA.zero_()
             # Scatter max: For each cluster, find highest dual weight of connected Red points
@@ -1034,12 +1094,14 @@ class KLevelBipartiteSolver:
                 reduce="amax",
                 include_self=False,
             )
-            
+            if PROFILING: _psync(); _prof['A_maint'] += time.perf_counter() - _t
+
             # ---------------------------------------------------------
             # B. Push Phase (Ragged Gather)
             # ---------------------------------------------------------
             maybe_sync()
-            
+            if PROFILING: _psync(); _t_b_index = time.perf_counter()
+
             # We process free Blue points in batches to manage memory
             push_batch_size = 5000 
 
@@ -1076,13 +1138,15 @@ class KLevelBipartiteSolver:
 
                 repeat_starts = torch.repeat_interleave(starts, lengths)
                 active_edge_indices = repeat_starts + offsets
+                if PROFILING: _psync(); _prof['B_index'] += time.perf_counter() - _t_b_index; _t_b_gather = time.perf_counter()
 
                 active_c_ids = self.blue_center_indices[active_edge_indices]
                 active_b_levels = self.blue_levels[active_edge_indices]
+                if PROFILING: _psync(); _prof['B_gather'] += time.perf_counter() - _t_b_gather; _t_b_slack = time.perf_counter()
 
                 slacks_est = (
-                    2 * active_b_levels 
-                    - self.yB[active_b_ids] 
+                    2 * active_b_levels
+                    - self.yB[active_b_ids]
                     - center_max_yA[active_c_ids]
                 )
                 active_max_L_A = center_max_L_A[active_c_ids]
@@ -1103,6 +1167,7 @@ class KLevelBipartiteSolver:
                         dbg_max_slack_est = local_max
 
                 candidates = (slacks_est <= 0) & (slacks_high >= 0)
+                if PROFILING: _psync(); _prof['B_slack'] += time.perf_counter() - _t_b_slack
                 if candidates.any():
                     win_b = active_b_ids[candidates]
                     win_c = active_c_ids[candidates]
@@ -1203,10 +1268,12 @@ class KLevelBipartiteSolver:
             b_match = None
             if win_b.numel() != 0:
                 # Identify free Red points
+                if PROFILING: _psync(); _t_c = time.perf_counter()
                 free_red_mask = self.MA[self.red_indices] == -1
                 red_ids = self.red_indices[free_red_mask]
                 red_levels = self.red_levels[free_red_mask]
                 red_c_ids = self.red_expand_center_ids[free_red_mask]
+                if PROFILING: _psync(); _prof['C_free_reds'] += time.perf_counter() - _t_c; _t_c_sr = time.perf_counter()
 
                 if red_ids.numel() != 0:
                     # Sort candidates by (Center, Level) to match Red's sorting
@@ -1215,7 +1282,7 @@ class KLevelBipartiteSolver:
 
                     b_sort_key = (win_c.to(torch.long) * key_scale) + win_l_b.to(torch.long)
                     b_perm = torch.argsort(b_sort_key)
-                    
+
                     b_sorted = win_b[b_perm]
                     c_sorted = win_c[b_perm]
                     l_b_sorted = win_l_b[b_perm]
@@ -1223,7 +1290,7 @@ class KLevelBipartiteSolver:
                     # Match available Reds to candidate Blues per Center
                     # Since both arrays are sorted by Center, we can use counts/offsets
                     num_centers = self.num_active_centers
-                    
+
                     b_counts = torch.bincount(c_sorted, minlength=num_centers)
                     r_counts = torch.bincount(red_c_ids, minlength=num_centers)
                     limits = torch.minimum(b_counts, r_counts) # Min available
@@ -1233,7 +1300,7 @@ class KLevelBipartiteSolver:
                         self, "_resolve_b_offsets_buf", num_centers + 1, self.device
                     )
                     b_offsets_scan[1:] = torch.cumsum(b_counts, 0)
-                    
+
                     r_offsets_scan = _ensure_zero_long_buffer(
                         self, "_resolve_r_offsets_buf", num_centers + 1, self.device
                     )
@@ -1248,6 +1315,7 @@ class KLevelBipartiteSolver:
 
                     b_keep = b_rank < limits[c_sorted]
                     r_keep = r_rank < limits[red_c_ids]
+                    if PROFILING: _psync(); _prof['C_sort_rank'] += time.perf_counter() - _t_c_sr; _t_c_commit = time.perf_counter()
 
                     b_final = b_sorted[b_keep]
                     l_b_final = l_b_sorted[b_keep]
@@ -1259,7 +1327,7 @@ class KLevelBipartiteSolver:
                     # Note: We must pair them 1-to-1. The filtering above ensures equal counts per center.
                     # However, strictly speaking, we need to ensure the *ordering* aligns the lowest slack pairs.
                     # Since we sorted by level, we are pairing lowest levels first.
-                    
+
                     pair_count = min(b_final.numel(), r_final.numel())
                     if pair_count > 0:
                         b_final = b_final[:pair_count]
@@ -1274,24 +1342,26 @@ class KLevelBipartiteSolver:
                             prev_match_count = int((self.MA != -1).sum().item())
                         y_b = self.yB[b_final]
                         y_a = self.yA[r_final]
-                        
+
                         slack = 2 * torch.maximum(l_b_final, l_r_final) - y_b - y_a
                         valid = slack == 0
 
                         b_match = b_final[valid]
                         r_match = r_final[valid]
-                        
+
                         if b_match.numel() != 0:
                             self.MB[b_match] = r_match.to(self.MB.dtype)
                             self.MA[r_match] = b_match.to(self.MA.dtype)
                         if DEBUG_PIPE:
                             new_count = int((self.MA != -1).sum().item())
                             dbg_after_commit = new_count - prev_match_count
+                    if PROFILING: _psync(); _prof['C_commit'] += time.perf_counter() - _t_c_commit
 
             # ---------------------------------------------------------
             # D. Relabel Phase
             # ---------------------------------------------------------
             # Increase potential of unmatched Blue points to help them find edges
+            if PROFILING: _psync(); _t_d = time.perf_counter()
             if b_match is not None and b_match.numel() != 0:
                 keep_free_mask = _ensure_bool_buffer(
                     self, "_keep_free_mask_buf", num_free, self.device
@@ -1307,6 +1377,7 @@ class KLevelBipartiteSolver:
             matched_r = torch.nonzero(self.MA != -1).squeeze(1)
             self.yA[matched_r] -= 1
             B_free = still_free
+            if PROFILING: _psync(); _prof['D_relabel'] += time.perf_counter() - _t_d
             matched_now = self.N - still_free.numel()
             if should_dbg:
                 delta_matched = 0 if prev_matched_count is None else matched_now - prev_matched_count
@@ -1323,11 +1394,13 @@ class KLevelBipartiteSolver:
                     f"committed={dbg_after_commit}"
                 )
             prev_matched_count = matched_now
-            
+
             if iteration > 50000:
                 # print("Max Iterations Reached.")
                 break
 
+        if PROFILING:
+            self._prof = _prof
         self.cleanup_remaining_points()
         if self.verbose:
             print(f"Matched: {(self.MB != -1).sum().item()}/{self.N}")
