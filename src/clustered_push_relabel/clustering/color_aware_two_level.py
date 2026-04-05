@@ -1,0 +1,94 @@
+import math
+import torch
+from ..utils.distance import TiledEuclideanKernel, TiledManhattanKernel
+
+
+class ColorAwareClustering:
+    def __init__(self, epsilon, batch_size=256, metric='L2'):
+        self.epsilon = epsilon
+        self.batch_size = batch_size
+        self.metric = metric
+
+    def run(self, P_red_norm, P_blue_norm):
+        if self.metric == 'L1':
+            kernel = TiledManhattanKernel(chunk_size=self.batch_size)
+        else:
+            kernel = TiledEuclideanKernel(chunk_size=self.batch_size)
+
+        def get_dists(query, ws_all):
+            if self.metric == 'L1':
+                return kernel.compute_dist_tile(query, ws_all)
+            return torch.sqrt(kernel.compute_dist_tile(query, ws_all))
+
+        device = P_red_norm.device
+        N = P_red_norm.shape[0]
+        n_total = 2 * N
+        P_all = torch.cat([P_red_norm, P_blue_norm], dim=0)
+        ws_all = kernel.prepare_workspace(P_all)
+
+        p_sample = 1.0 / math.sqrt(n_total)
+        sampled_mask = torch.bernoulli(torch.full((n_total,), p_sample, device=device)).bool()
+        P1_red_mask = sampled_mask[:N]
+        P1_blue_mask = sampled_mask[N:]
+        if P1_red_mask.sum() == 0:
+            P1_red_mask[0] = True
+        if P1_blue_mask.sum() == 0:
+            P1_blue_mask[0] = True
+
+        sampled_red_pts = P_red_norm[P1_red_mask]
+        sampled_blue_pts = P_blue_norm[P1_blue_mask]
+        d_min_red = get_dists(sampled_red_pts, ws_all).min(dim=1).values
+        d_min_blue = get_dists(sampled_blue_pts, ws_all).min(dim=1).values
+
+        red_c_list, red_l_list, red_p_list = [], [], []
+        for batch_start in range(0, N, self.batch_size):
+            batch_end = min(batch_start + self.batch_size, N)
+            c_ids = torch.arange(batch_start, batch_end, device=device, dtype=torch.long)
+            c_pts = P_red_norm[c_ids]
+            dists = get_dists(c_pts, ws_all)
+
+            is_sampled = P1_red_mask[c_ids]
+            non_sampled_member = dists < d_min_red.unsqueeze(1)
+            sampled_member = is_sampled.unsqueeze(0).expand(n_total, -1)
+            member = sampled_member | non_sampled_member
+
+            levels = (dists / self.epsilon).long()
+
+            p_idx, c_local = torch.where(member)
+            if p_idx.numel() > 0:
+                red_c_list.append(c_ids[c_local])
+                red_l_list.append(levels[p_idx, c_local])
+                red_p_list.append(p_idx)
+
+        blue_c_list, blue_l_list, blue_p_list = [], [], []
+        for batch_start in range(0, N, self.batch_size):
+            batch_end = min(batch_start + self.batch_size, N)
+            c_ids = torch.arange(batch_start, batch_end, device=device, dtype=torch.long)
+            c_pts = P_blue_norm[c_ids]
+            dists = get_dists(c_pts, ws_all)
+
+            is_sampled = P1_blue_mask[c_ids]
+            non_sampled_member = dists < d_min_blue.unsqueeze(1)
+            sampled_member = is_sampled.unsqueeze(0).expand(n_total, -1)
+            member = sampled_member | non_sampled_member
+
+            levels = (dists / self.epsilon).long()
+
+            p_idx, c_local = torch.where(member)
+            if p_idx.numel() > 0:
+                blue_c_list.append(c_ids[c_local])
+                blue_l_list.append(levels[p_idx, c_local])
+                blue_p_list.append(p_idx)
+
+        def _cat_or_empty(lst, device):
+            if not lst:
+                return torch.empty(0, dtype=torch.long, device=device)
+            return torch.cat(lst)
+
+        r_c = _cat_or_empty(red_c_list, device)
+        r_l = _cat_or_empty(red_l_list, device)
+        r_p = _cat_or_empty(red_p_list, device)
+        b_c = _cat_or_empty(blue_c_list, device)
+        b_l = _cat_or_empty(blue_l_list, device)
+        b_p = _cat_or_empty(blue_p_list, device)
+        return (b_c, b_l, b_p), (r_c, r_l, r_p)
