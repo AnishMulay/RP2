@@ -309,7 +309,7 @@ class ColorAwareTwoLevelSolver:
             ml_starts = self.max_list_offsets[chosen_bkt]
             ml_lens = ml_lens_raw.clamp(min=1)
             rand_idx = (torch.rand(num_b_cand, device=device) * ml_lens.float()).long()
-            rand_idx = rand_idx.clamp(min=0, max=ml_lens - 1)
+            rand_idx = torch.minimum(rand_idx.clamp_min(0), ml_lens - 1)
             proposal_a = self.max_list_values[ml_starts + rand_idx]
             proposal_b = b_with_cand
             # Guard: filter any invalid proposals (should not happen after Change 1+2,
