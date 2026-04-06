@@ -184,46 +184,61 @@ class ColorAwareTwoLevelSolver:
         )
         self.max_list_count = torch.zeros(num_buckets, device=self.device, dtype=torch.long)
 
-        # Populate max_list_values vectorized.
-        # Shell entry at global position i has:
-        #   center q  = shell_red_expand_bucket_ids[i] // L
-        #   level k_a = shell_red_expand_bucket_ids[i] % L
-        #   local pos p within center = i - shell_red_offsets[q*L]
-        # It writes into balls (q, k_a), (q, k_a+1), ..., (q, max_level[q]):
-        #   write position = max_list_offsets[q*L + k] + p
+        # Populate max_list_values incrementally in GPU-sized chunks.
+        # This preserves the same final structure as the fully vectorized build,
+        # but avoids materializing the full shell-to-ball expansion at once.
         num_shell = self.shell_red_indices.numel()
         if num_shell > 0:
-            s_bkt = self.shell_red_expand_bucket_ids
-            s_center = s_bkt // L
-            s_ka = s_bkt % L
-            s_cstart = self.shell_red_offsets[s_center * L]
-            s_local = (
-                torch.arange(num_shell, device=self.device, dtype=torch.long) - s_cstart
-            )
-            s_maxlv = self.max_level_per_center[s_center]
-            num_balls_each = (s_maxlv - s_ka + 1).clamp(min=0)
+            max_init_writes = 4_000_000
+            shell_chunk_size = max(self.batch_size * 64, 16_384)
+            shell_start = 0
 
-            total_writes = int(num_balls_each.sum().item())
-            if total_writes > 0:
-                cum_nb = torch.cumsum(num_balls_each, 0)
-                seg_nb = cum_nb - num_balls_each
-                gr = torch.arange(total_writes, device=self.device, dtype=torch.long)
-                ball_off = gr - torch.repeat_interleave(seg_nb, num_balls_each)
+            while shell_start < num_shell:
+                shell_end = min(shell_start + shell_chunk_size, num_shell)
 
-                exp_center = torch.repeat_interleave(s_center, num_balls_each)
-                exp_ka = torch.repeat_interleave(s_ka, num_balls_each)
-                exp_local = torch.repeat_interleave(s_local, num_balls_each)
-                exp_a_id = torch.repeat_interleave(self.shell_red_indices, num_balls_each)
+                while True:
+                    s_bkt = self.shell_red_expand_bucket_ids[shell_start:shell_end]
+                    s_center = s_bkt // L
+                    s_ka = s_bkt % L
+                    s_cstart = self.shell_red_offsets[s_center * L]
+                    s_local = (
+                        torch.arange(shell_start, shell_end, device=self.device, dtype=torch.long)
+                        - s_cstart
+                    )
+                    s_maxlv = self.max_level_per_center[s_center]
+                    num_balls_each = (s_maxlv - s_ka + 1).clamp(min=0)
 
-                target_bkt = exp_center * L + exp_ka + ball_off
-                write_pos = self.max_list_offsets[target_bkt] + exp_local
-                self.max_list_values[write_pos] = exp_a_id
-                # Compute actual write counts per ball from the writes just done
-                self.max_list_count.scatter_add_(
-                    0,
-                    target_bkt,
-                    torch.ones(total_writes, device=self.device, dtype=torch.long)
-                )
+                    total_writes = int(num_balls_each.sum().item())
+                    chunk_len = shell_end - shell_start
+                    if total_writes <= max_init_writes or chunk_len <= 1:
+                        break
+
+                    reduced_len = max(1, int(chunk_len * max_init_writes / max(total_writes, 1)))
+                    shell_end = shell_start + reduced_len
+
+                if total_writes > 0:
+                    cum_nb = torch.cumsum(num_balls_each, 0)
+                    seg_nb = cum_nb - num_balls_each
+                    gr = _ensure_long_arange(self, '_ml_init_arange', total_writes, self.device)
+                    ball_off = gr - torch.repeat_interleave(seg_nb, num_balls_each)
+
+                    exp_center = torch.repeat_interleave(s_center, num_balls_each)
+                    exp_ka = torch.repeat_interleave(s_ka, num_balls_each)
+                    exp_local = torch.repeat_interleave(s_local, num_balls_each)
+                    exp_a_id = torch.repeat_interleave(
+                        self.shell_red_indices[shell_start:shell_end], num_balls_each
+                    )
+
+                    target_bkt = exp_center * L + exp_ka + ball_off
+                    write_pos = self.max_list_offsets[target_bkt] + exp_local
+                    self.max_list_values[write_pos] = exp_a_id
+                    self.max_list_count.scatter_add_(
+                        0,
+                        target_bkt,
+                        torch.ones(total_writes, device=self.device, dtype=torch.long)
+                    )
+
+                shell_start = shell_end
 
     def solve(self):
         N = self.N
