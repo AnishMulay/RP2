@@ -1,7 +1,6 @@
 import torch
 import math
 import gc
-import time
 from ..clustering.color_aware_two_level import ColorAwareClustering
 
 
@@ -234,51 +233,40 @@ class ColorAwareTwoLevelSolver:
         B_free = torch.arange(N, device=device, dtype=torch.long)
         iteration = 0
 
-        def _sync_if_needed():
-            if self.verbose and device.type == "cuda":
-                torch.cuda.synchronize()
+        print("[ColorAware-2L] solve() start", flush=True)
 
         while True:
             num_free = B_free.numel()
             if num_free <= self.epsilon * N:
+                print(f"[ColorAware-2L] stopping: num_free={num_free}", flush=True)
                 break
             if iteration > 50000:
+                print(f"[ColorAware-2L] stopping: iteration={iteration}", flush=True)
                 break
             iteration += 1
-            if self.verbose:
-                _sync_if_needed()
-                iter_t0 = time.perf_counter()
+            print(f"[Iter {iteration}] start free_B={num_free}", flush=True)
 
             # ── STEP 1: Find zero-slack candidate buckets ─────────────────
+            print(f"[Iter {iteration}] Step 1a: offsets", flush=True)
             starts_b = self.inv_b_offsets[B_free]
             ends_b = self.inv_b_offsets[B_free + 1]
             lengths_b = ends_b - starts_b
             total_inv = int(lengths_b.sum().item())
-            if self.verbose:
-                _sync_if_needed()
-                t_step1 = time.perf_counter()
+            print(f"[Iter {iteration}] Step 1b: total_inv={total_inv}", flush=True)
 
             if total_inv == 0:
+                print(f"[Iter {iteration}] early exit: total_inv == 0", flush=True)
                 self.yB[B_free] += 1
-                if self.verbose:
-                    _sync_if_needed()
-                    t_end = time.perf_counter()
-                    print(
-                        f"[Iter {iteration}] free={num_free} "
-                        f"s1={t_step1 - iter_t0:.4f}s "
-                        f"early=total_inv==0 "
-                        f"dual={t_end - t_step1:.4f}s "
-                        f"total={t_end - iter_t0:.4f}s",
-                        flush=True,
-                    )
                 continue
 
+            print(f"[Iter {iteration}] Step 1c: expand INV_B", flush=True)
             cum_b = torch.cumsum(lengths_b, 0)
             seg_b = cum_b - lengths_b
             g_range = _ensure_long_arange(self, '_inv_arange', total_inv, device)
             rep_st = torch.repeat_interleave(starts_b, lengths_b)
             off_b = g_range - torch.repeat_interleave(seg_b, lengths_b)
             inv_idx = rep_st + off_b
+            print(f"[Iter {iteration}] Step 1d: gather active buckets", flush=True)
 
             active_b = torch.repeat_interleave(B_free, lengths_b)
             active_bkt = self.inv_b_bucket_ids[inv_idx]
@@ -287,23 +275,14 @@ class ColorAwareTwoLevelSolver:
             target = 2 * active_kb - self.yB[active_b].long()
             dmax_vals = self.d_max[active_bkt].long()
             is_cand = (dmax_vals == target) & (dmax_vals >= 0)
-            if self.verbose:
-                _sync_if_needed()
-                t_step1b = time.perf_counter()
+            print(
+                f"[Iter {iteration}] Step 1e: candidate scan done, num_candidates={int(is_cand.sum().item())}",
+                flush=True,
+            )
 
             if not is_cand.any():
+                print(f"[Iter {iteration}] early exit: no candidates", flush=True)
                 self.yB[B_free] += 1
-                if self.verbose:
-                    _sync_if_needed()
-                    t_end = time.perf_counter()
-                    print(
-                        f"[Iter {iteration}] free={num_free} total_inv={total_inv} "
-                        f"s1={t_step1b - iter_t0:.4f}s "
-                        f"early=no_candidates "
-                        f"dual={t_end - t_step1b:.4f}s "
-                        f"total={t_end - iter_t0:.4f}s",
-                        flush=True,
-                    )
                 continue
 
             cand_b = active_b[is_cand]
@@ -311,6 +290,7 @@ class ColorAwareTwoLevelSolver:
             cand_kb = active_kb[is_cand]
 
             # ── STEP 2: Weighted bucket selection — Gumbel-max trick ──────
+            print(f"[Iter {iteration}] Step 2: weighted bucket selection", flush=True)
             ml_counts_f = self.max_list_count[cand_bkt].float().clamp(min=1.0)
             gumbel = -torch.log(
                 -torch.log(torch.rand(cand_bkt.numel(), device=device).clamp(min=1e-10))
@@ -325,28 +305,15 @@ class ColorAwareTwoLevelSolver:
             b_with_cand = cand_b[is_chosen]
             chosen_bkt = cand_bkt[is_chosen]
             num_b_cand = b_with_cand.numel()
-            if self.verbose:
-                _sync_if_needed()
-                t_step2 = time.perf_counter()
+            print(f"[Iter {iteration}] Step 2 done: chosen_b={num_b_cand}", flush=True)
 
             if num_b_cand == 0:
+                print(f"[Iter {iteration}] early exit: no chosen buckets", flush=True)
                 self.yB[B_free] += 1
-                if self.verbose:
-                    _sync_if_needed()
-                    t_end = time.perf_counter()
-                    print(
-                        f"[Iter {iteration}] free={num_free} total_inv={total_inv} "
-                        f"cand={cand_b.numel()} chosen=0 "
-                        f"s1={t_step1b - iter_t0:.4f}s "
-                        f"s2={t_step2 - t_step1b:.4f}s "
-                        f"early=no_chosen "
-                        f"dual={t_end - t_step2:.4f}s "
-                        f"total={t_end - iter_t0:.4f}s",
-                        flush=True,
-                    )
                 continue
 
             # ── STEP 3: Proposal — each b draws one a from max_list ───────
+            print(f"[Iter {iteration}] Step 3: proposal from max_list", flush=True)
             ml_lens_raw = self.max_list_count[chosen_bkt]
             has_entries = ml_lens_raw > 0
             if not has_entries.all():
@@ -355,21 +322,9 @@ class ColorAwareTwoLevelSolver:
                 ml_lens_raw = ml_lens_raw[has_entries]
                 num_b_cand = b_with_cand.numel()
                 if num_b_cand == 0:
+                    print(f"[Iter {iteration}] early exit: no max_list entries", flush=True)
                     self.yB[F_B_new if 'F_B_new' in dir() else B_free] += 1
                     B_free = B_free  # no change yet
-                    if self.verbose:
-                        _sync_if_needed()
-                        t_end = time.perf_counter()
-                        print(
-                            f"[Iter {iteration}] free={num_free} total_inv={total_inv} "
-                            f"cand={cand_b.numel()} chosen_after_filter=0 "
-                            f"s1={t_step1b - iter_t0:.4f}s "
-                            f"s2={t_step2 - t_step1b:.4f}s "
-                            f"early=no_max_list_entries "
-                            f"tail={t_end - t_step2:.4f}s "
-                            f"total={t_end - iter_t0:.4f}s",
-                            flush=True,
-                        )
                     continue
             ml_starts = self.max_list_offsets[chosen_bkt]
             ml_lens = ml_lens_raw.clamp(min=1)
@@ -385,37 +340,23 @@ class ColorAwareTwoLevelSolver:
                 proposal_b = proposal_b[valid_prop]
                 num_b_cand = proposal_a.numel()
             if num_b_cand == 0:
+                print(f"[Iter {iteration}] early exit: no valid proposals", flush=True)
                 self.yB[B_free] += 1
-                if self.verbose:
-                    _sync_if_needed()
-                    t_end = time.perf_counter()
-                    print(
-                        f"[Iter {iteration}] free={num_free} total_inv={total_inv} "
-                        f"cand={cand_b.numel()} chosen={chosen_bkt.numel()} proposals=0 "
-                        f"s1={t_step1b - iter_t0:.4f}s "
-                        f"s2={t_step2 - t_step1b:.4f}s "
-                        f"s3={t_end - t_step2:.4f}s "
-                        f"early=no_valid_proposals "
-                        f"total={t_end - iter_t0:.4f}s",
-                        flush=True,
-                    )
                 continue
-            if self.verbose:
-                _sync_if_needed()
-                t_step3 = time.perf_counter()
+            print(f"[Iter {iteration}] Step 3 done: proposals={num_b_cand}", flush=True)
 
             # ── STEP 4: Conflict resolution — each a accepts one proposal ─
+            print(f"[Iter {iteration}] Step 4: conflict resolution", flush=True)
             rand_prio = torch.rand(num_b_cand, device=device)
             min_prio = torch.full((N,), float('inf'), device=device)
             min_prio.scatter_reduce_(0, proposal_a, rand_prio, reduce="amin", include_self=True)
             accepted = rand_prio == min_prio[proposal_a]
             r_new = proposal_a[accepted]
             b_new = proposal_b[accepted]
-            if self.verbose:
-                _sync_if_needed()
-                t_step4 = time.perf_counter()
+            print(f"[Iter {iteration}] Step 4 done: accepted={r_new.numel()}", flush=True)
 
             # ── STEP 5: Matching update + F_B update ──────────────────────
+            print(f"[Iter {iteration}] Step 5: matching update", flush=True)
             if r_new.numel() > 0:
                 was_matched = self.MA[r_new] != -1
                 evicted_b = self.MA[r_new[was_matched]].to(torch.long).clone()
@@ -434,19 +375,16 @@ class ColorAwareTwoLevelSolver:
                     F_B_new = still_free
             else:
                 F_B_new = B_free
-            if self.verbose:
-                _sync_if_needed()
-                t_step5 = time.perf_counter()
+            print(f"[Iter {iteration}] Step 5 done: next_free_B={F_B_new.numel()}", flush=True)
 
             # ── STEP 6: Dual update ───────────────────────────────────────
+            print(f"[Iter {iteration}] Step 6: dual update", flush=True)
             self.yB[F_B_new] += 1
             if r_new.numel() > 0:
                 self.yA[r_new] += 1
-            if self.verbose:
-                _sync_if_needed()
-                t_step6 = time.perf_counter()
 
             # ── STEP 7: Incremental pre-processing update (vectorized) ────
+            print(f"[Iter {iteration}] Step 7: incremental update", flush=True)
             if r_new.numel() > 0:
                 inv_st = self.inv_a_offsets[r_new]
                 inv_en = self.inv_a_offsets[r_new + 1]
@@ -532,24 +470,7 @@ class ColorAwareTwoLevelSolver:
                             wpos = self.max_list_offsets[ml_bkt_s] + rank_ml
                             self.max_list_values[wpos] = ml_a_s
                             self.max_list_count[aff_bkts] = cnt_new
-            if self.verbose:
-                _sync_if_needed()
-                t_step7 = time.perf_counter()
-                print(
-                    f"[Iter {iteration}] free={num_free} total_inv={total_inv} "
-                    f"cand={cand_b.numel()} chosen={chosen_bkt.numel()} "
-                    f"proposals={proposal_a.numel()} accepted={r_new.numel()} "
-                    f"next_free={F_B_new.numel()} "
-                    f"s1={t_step1b - iter_t0:.4f}s "
-                    f"s2={t_step2 - t_step1b:.4f}s "
-                    f"s3={t_step3 - t_step2:.4f}s "
-                    f"s4={t_step4 - t_step3:.4f}s "
-                    f"s5={t_step5 - t_step4:.4f}s "
-                    f"s6={t_step6 - t_step5:.4f}s "
-                    f"s7={t_step7 - t_step6:.4f}s "
-                    f"total={t_step7 - iter_t0:.4f}s",
-                    flush=True,
-                )
+            print(f"[Iter {iteration}] Step 7 done", flush=True)
 
             B_free = F_B_new
 
