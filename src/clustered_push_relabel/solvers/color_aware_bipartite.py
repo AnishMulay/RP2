@@ -309,16 +309,42 @@ class ColorAwareTwoLevelSolver:
             cand_kb = active_kb[is_cand]
 
             # ── STEP 2: Weighted bucket selection — Gumbel-max trick ──────
-            ml_counts_f = self.max_list_count[cand_bkt].float().clamp(min=1.0)
+            ml_counts_f = self.max_list_count[cand_bkt].float()
+            has_weight = ml_counts_f > 0
+            if not has_weight.any():
+                self.yB[B_free] += 1
+                _print_dual_debug(
+                    iteration,
+                    num_free,
+                    B_free,
+                    torch.empty(0, device=device, dtype=torch.long),
+                )
+                continue
+            if not has_weight.all():
+                cand_b = cand_b[has_weight]
+                cand_bkt = cand_bkt[has_weight]
+                cand_kb = cand_kb[has_weight]
+                ml_counts_f = ml_counts_f[has_weight]
+
             gumbel = -torch.log(
                 -torch.log(torch.rand(cand_bkt.numel(), device=device).clamp(min=1e-10))
                 + 1e-10
             )
             scores = torch.log(ml_counts_f) + gumbel
+            cand_edge_idx = _ensure_long_arange(self, '_cand_edge_arange', cand_bkt.numel(), device)
 
             best_per_b = torch.full((N,), float('-inf'), device=device)
             best_per_b.scatter_reduce_(0, cand_b, scores, reduce="amax", include_self=True)
-            is_chosen = scores == best_per_b[cand_b]
+            is_best = scores == best_per_b[cand_b]
+            best_edge_per_b = torch.full((N,), cand_bkt.numel(), device=device, dtype=torch.long)
+            best_edge_per_b.scatter_reduce_(
+                0,
+                cand_b[is_best],
+                cand_edge_idx[is_best],
+                reduce="amin",
+                include_self=True,
+            )
+            is_chosen = cand_edge_idx == best_edge_per_b[cand_b]
 
             b_with_cand = cand_b[is_chosen]
             chosen_bkt = cand_bkt[is_chosen]
@@ -343,8 +369,7 @@ class ColorAwareTwoLevelSolver:
                 ml_lens_raw = ml_lens_raw[has_entries]
                 num_b_cand = b_with_cand.numel()
                 if num_b_cand == 0:
-                    self.yB[F_B_new if 'F_B_new' in dir() else B_free] += 1
-                    B_free = B_free  # no change yet
+                    self.yB[B_free] += 1
                     _print_dual_debug(
                         iteration,
                         num_free,
@@ -377,9 +402,19 @@ class ColorAwareTwoLevelSolver:
 
             # ── STEP 4: Conflict resolution — each a accepts one proposal ─
             rand_prio = torch.rand(num_b_cand, device=device)
+            prop_edge_idx = _ensure_long_arange(self, '_prop_edge_arange', num_b_cand, device)
             min_prio = torch.full((N,), float('inf'), device=device)
             min_prio.scatter_reduce_(0, proposal_a, rand_prio, reduce="amin", include_self=True)
-            accepted = rand_prio == min_prio[proposal_a]
+            is_min = rand_prio == min_prio[proposal_a]
+            accepted_edge_per_a = torch.full((N,), num_b_cand, device=device, dtype=torch.long)
+            accepted_edge_per_a.scatter_reduce_(
+                0,
+                proposal_a[is_min],
+                prop_edge_idx[is_min],
+                reduce="amin",
+                include_self=True,
+            )
+            accepted = prop_edge_idx == accepted_edge_per_a[proposal_a]
             r_new = proposal_a[accepted]
             b_new = proposal_b[accepted]
 
@@ -406,7 +441,7 @@ class ColorAwareTwoLevelSolver:
             # ── STEP 6: Dual update ───────────────────────────────────────
             self.yB[F_B_new] += 1
             if r_new.numel() > 0:
-                self.yA[r_new] += 1
+                self.yA[r_new] -= 1
             _print_dual_debug(iteration, num_free, F_B_new, r_new)
 
             # ── STEP 7: Incremental pre-processing update (vectorized) ────

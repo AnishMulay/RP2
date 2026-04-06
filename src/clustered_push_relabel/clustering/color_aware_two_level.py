@@ -28,17 +28,11 @@ class ColorAwareClustering:
 
         p_sample = 1.0 / math.sqrt(n_total)
         sampled_mask = torch.bernoulli(torch.full((n_total,), p_sample, device=device)).bool()
-        P1_red_mask = sampled_mask[:N]
-        P1_blue_mask = sampled_mask[N:]
-        if P1_red_mask.sum() == 0:
-            P1_red_mask[0] = True
-        if P1_blue_mask.sum() == 0:
-            P1_blue_mask[0] = True
-
-        sampled_red_pts = P_red_norm[P1_red_mask]
-        sampled_blue_pts = P_blue_norm[P1_blue_mask]
-        d_min_red = get_dists(sampled_red_pts, ws_all).min(dim=1).values
-        d_min_blue = get_dists(sampled_blue_pts, ws_all).min(dim=1).values
+        sampled_pts = P_all[sampled_mask]
+        if sampled_pts.numel() > 0:
+            d_min_all = get_dists(sampled_pts, ws_all).min(dim=1).values
+        else:
+            d_min_all = torch.full((n_total,), float('inf'), device=device)
 
         red_c_list, red_l_list, red_p_list = [], [], []
         for batch_start in range(0, N, self.batch_size):
@@ -47,8 +41,8 @@ class ColorAwareClustering:
             c_pts = P_red_norm[c_ids]
             dists = get_dists(c_pts, ws_all)
 
-            is_sampled = P1_red_mask[c_ids]
-            non_sampled_member = dists < d_min_red.unsqueeze(1)
+            is_sampled = sampled_mask[c_ids]
+            non_sampled_member = dists < d_min_all.unsqueeze(1)
             sampled_member = is_sampled.unsqueeze(0).expand(n_total, -1)
             member = sampled_member | non_sampled_member
 
@@ -67,8 +61,8 @@ class ColorAwareClustering:
             c_pts = P_blue_norm[c_ids]
             dists = get_dists(c_pts, ws_all)
 
-            is_sampled = P1_blue_mask[c_ids]
-            non_sampled_member = dists < d_min_blue.unsqueeze(1)
+            is_sampled = sampled_mask[c_ids + N]
+            non_sampled_member = dists < d_min_all.unsqueeze(1)
             sampled_member = is_sampled.unsqueeze(0).expand(n_total, -1)
             member = sampled_member | non_sampled_member
 
