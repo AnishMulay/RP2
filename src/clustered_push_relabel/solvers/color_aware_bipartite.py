@@ -240,8 +240,13 @@ class ColorAwareTwoLevelSolver:
             if iteration > 50000:
                 break
             iteration += 1
-            if iteration % 100 == 0:
-                print(f"[Iter {iteration}] Free B: {num_free}", flush=True)
+            do_print = iteration % 100 == 0
+            cand_edges = 0
+            cand_b_count = 0
+            chosen_count = 0
+            accepted_count = 0
+            evicted_count = 0
+            next_free_count = int(num_free)
 
             # ── STEP 1: Find zero-slack candidate buckets ─────────────────
             starts_b = self.inv_b_offsets[B_free]
@@ -251,6 +256,14 @@ class ColorAwareTwoLevelSolver:
 
             if total_inv == 0:
                 self.yB[B_free] += 1
+                if do_print:
+                    print(
+                        f"[Iter {iteration}] free={num_free} cand_edges={cand_edges} "
+                        f"cand_b={cand_b_count} chosen={chosen_count} "
+                        f"accepted={accepted_count} evicted={evicted_count} "
+                        f"next_free={next_free_count}",
+                        flush=True,
+                    )
                 continue
 
             cum_b = torch.cumsum(lengths_b, 0)
@@ -270,11 +283,22 @@ class ColorAwareTwoLevelSolver:
 
             if not is_cand.any():
                 self.yB[B_free] += 1
+                if do_print:
+                    print(
+                        f"[Iter {iteration}] free={num_free} cand_edges={cand_edges} "
+                        f"cand_b={cand_b_count} chosen={chosen_count} "
+                        f"accepted={accepted_count} evicted={evicted_count} "
+                        f"next_free={next_free_count}",
+                        flush=True,
+                    )
                 continue
 
             cand_b = active_b[is_cand]
             cand_bkt = active_bkt[is_cand]
             cand_kb = active_kb[is_cand]
+            cand_edges = int(cand_b.numel())
+            if do_print:
+                cand_b_count = int(torch.unique(cand_b).numel())
 
             # ── STEP 2: Weighted bucket selection — Gumbel-max trick ──────
             ml_counts_f = self.max_list_count[cand_bkt].float().clamp(min=1.0)
@@ -291,9 +315,18 @@ class ColorAwareTwoLevelSolver:
             b_with_cand = cand_b[is_chosen]
             chosen_bkt = cand_bkt[is_chosen]
             num_b_cand = b_with_cand.numel()
+            chosen_count = int(num_b_cand)
 
             if num_b_cand == 0:
                 self.yB[B_free] += 1
+                if do_print:
+                    print(
+                        f"[Iter {iteration}] free={num_free} cand_edges={cand_edges} "
+                        f"cand_b={cand_b_count} chosen={chosen_count} "
+                        f"accepted={accepted_count} evicted={evicted_count} "
+                        f"next_free={next_free_count}",
+                        flush=True,
+                    )
                 continue
 
             # ── STEP 3: Proposal — each b draws one a from max_list ───────
@@ -304,9 +337,18 @@ class ColorAwareTwoLevelSolver:
                 b_with_cand = b_with_cand[has_entries]
                 ml_lens_raw = ml_lens_raw[has_entries]
                 num_b_cand = b_with_cand.numel()
+                chosen_count = int(num_b_cand)
                 if num_b_cand == 0:
                     self.yB[F_B_new if 'F_B_new' in dir() else B_free] += 1
                     B_free = B_free  # no change yet
+                    if do_print:
+                        print(
+                            f"[Iter {iteration}] free={num_free} cand_edges={cand_edges} "
+                            f"cand_b={cand_b_count} chosen={chosen_count} "
+                            f"accepted={accepted_count} evicted={evicted_count} "
+                            f"next_free={next_free_count}",
+                            flush=True,
+                        )
                     continue
             ml_starts = self.max_list_offsets[chosen_bkt]
             ml_lens = ml_lens_raw.clamp(min=1)
@@ -321,8 +363,17 @@ class ColorAwareTwoLevelSolver:
                 proposal_a = proposal_a[valid_prop]
                 proposal_b = proposal_b[valid_prop]
                 num_b_cand = proposal_a.numel()
+                chosen_count = int(num_b_cand)
             if num_b_cand == 0:
                 self.yB[B_free] += 1
+                if do_print:
+                    print(
+                        f"[Iter {iteration}] free={num_free} cand_edges={cand_edges} "
+                        f"cand_b={cand_b_count} chosen={chosen_count} "
+                        f"accepted={accepted_count} evicted={evicted_count} "
+                        f"next_free={next_free_count}",
+                        flush=True,
+                    )
                 continue
 
             # ── STEP 4: Conflict resolution — each a accepts one proposal ─
@@ -332,11 +383,13 @@ class ColorAwareTwoLevelSolver:
             accepted = rand_prio == min_prio[proposal_a]
             r_new = proposal_a[accepted]
             b_new = proposal_b[accepted]
+            accepted_count = int(r_new.numel())
 
             # ── STEP 5: Matching update + F_B update ──────────────────────
             if r_new.numel() > 0:
                 was_matched = self.MA[r_new] != -1
                 evicted_b = self.MA[r_new[was_matched]].to(torch.long).clone()
+                evicted_count = int(evicted_b.numel())
                 if evicted_b.numel() > 0:
                     self.MB[evicted_b] = -1
                 self.MA[r_new] = b_new.to(self.MA.dtype)
@@ -352,6 +405,7 @@ class ColorAwareTwoLevelSolver:
                     F_B_new = still_free
             else:
                 F_B_new = B_free
+            next_free_count = int(F_B_new.numel())
 
             # ── STEP 6: Dual update ───────────────────────────────────────
             self.yB[F_B_new] += 1
@@ -444,6 +498,15 @@ class ColorAwareTwoLevelSolver:
                             wpos = self.max_list_offsets[ml_bkt_s] + rank_ml
                             self.max_list_values[wpos] = ml_a_s
                             self.max_list_count[aff_bkts] = cnt_new
+
+            if do_print:
+                print(
+                    f"[Iter {iteration}] free={num_free} cand_edges={cand_edges} "
+                    f"cand_b={cand_b_count} chosen={chosen_count} "
+                    f"accepted={accepted_count} evicted={evicted_count} "
+                    f"next_free={next_free_count}",
+                    flush=True,
+                )
 
             B_free = F_B_new
 
