@@ -1,6 +1,7 @@
 import torch
 import math
 import gc
+import time
 from ..clustering.color_aware_two_level import ColorAwareClustering
 
 
@@ -294,6 +295,10 @@ class ColorAwareTwoLevelSolver:
         B_free = torch.arange(N, device=device, dtype=torch.long)
         iteration = 0
 
+        def _sync_if_cuda():
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+
         def _print_dual_debug(iteration, free_before, free_after, updated_red):
             if iteration % 100 != 0:
                 return
@@ -316,6 +321,17 @@ class ColorAwareTwoLevelSolver:
                 flush=True,
             )
 
+        def _print_phase_timing(iteration, free_before, timings, status):
+            if iteration % 100 != 0:
+                return
+            print(
+                f"[Iter {iteration} timing] free={free_before} status={status} "
+                f"s1={timings['s1']:.4f}s s2={timings['s2']:.4f}s s3={timings['s3']:.4f}s "
+                f"s4={timings['s4']:.4f}s s5={timings['s5']:.4f}s s6={timings['s6']:.4f}s "
+                f"s7={timings['s7']:.4f}s total={timings['total']:.4f}s",
+                flush=True,
+            )
+
         while True:
             num_free = B_free.numel()
             if num_free <= self.epsilon * N:
@@ -323,8 +339,19 @@ class ColorAwareTwoLevelSolver:
             if iteration > 50000:
                 break
             iteration += 1
+            timing_enabled = (iteration % 100 == 0)
+            timings = {
+                's1': 0.0, 's2': 0.0, 's3': 0.0, 's4': 0.0,
+                's5': 0.0, 's6': 0.0, 's7': 0.0, 'total': 0.0,
+            }
+            if timing_enabled:
+                _sync_if_cuda()
+                iter_t0 = time.perf_counter()
 
             # ── STEP 1: Find zero-slack candidate buckets (batched over free B) ─────
+            if timing_enabled:
+                _sync_if_cuda()
+                phase_t0 = time.perf_counter()
             push_batch_size = max(self.batch_size * 8, 2048)
             cand_b_parts = []
             cand_bkt_parts = []
@@ -359,6 +386,9 @@ class ColorAwareTwoLevelSolver:
                     cand_b_parts.append(active_b[is_cand])
                     cand_bkt_parts.append(active_bkt[is_cand])
                     cand_kb_parts.append(active_kb[is_cand])
+            if timing_enabled:
+                _sync_if_cuda()
+                timings['s1'] = time.perf_counter() - phase_t0
 
             if not cand_b_parts:
                 self.yB[B_free] += 1
@@ -368,6 +398,10 @@ class ColorAwareTwoLevelSolver:
                     B_free,
                     torch.empty(0, device=device, dtype=torch.long),
                 )
+                if timing_enabled:
+                    _sync_if_cuda()
+                    timings['total'] = time.perf_counter() - iter_t0
+                    _print_phase_timing(iteration, num_free, timings, "no_candidates")
                 continue
 
             cand_b = torch.cat(cand_b_parts)
@@ -375,6 +409,9 @@ class ColorAwareTwoLevelSolver:
             cand_kb = torch.cat(cand_kb_parts)
 
             # ── STEP 2: Weighted bucket selection — Gumbel-max trick ──────
+            if timing_enabled:
+                _sync_if_cuda()
+                phase_t0 = time.perf_counter()
             ml_counts_f = self.max_list_count[cand_bkt].float()
             has_weight = ml_counts_f > 0
             if not has_weight.any():
@@ -385,6 +422,11 @@ class ColorAwareTwoLevelSolver:
                     B_free,
                     torch.empty(0, device=device, dtype=torch.long),
                 )
+                if timing_enabled:
+                    _sync_if_cuda()
+                    timings['s2'] = time.perf_counter() - phase_t0
+                    timings['total'] = time.perf_counter() - iter_t0
+                    _print_phase_timing(iteration, num_free, timings, "no_weight")
                 continue
             if not has_weight.all():
                 cand_b = cand_b[has_weight]
@@ -411,6 +453,9 @@ class ColorAwareTwoLevelSolver:
                 include_self=True,
             )
             is_chosen = cand_edge_idx == best_edge_per_b[cand_b]
+            if timing_enabled:
+                _sync_if_cuda()
+                timings['s2'] = time.perf_counter() - phase_t0
 
             b_with_cand = cand_b[is_chosen]
             chosen_bkt = cand_bkt[is_chosen]
@@ -424,9 +469,16 @@ class ColorAwareTwoLevelSolver:
                     B_free,
                     torch.empty(0, device=device, dtype=torch.long),
                 )
+                if timing_enabled:
+                    _sync_if_cuda()
+                    timings['total'] = time.perf_counter() - iter_t0
+                    _print_phase_timing(iteration, num_free, timings, "no_chosen")
                 continue
 
             # ── STEP 3: Proposal — each b draws one a from max_list ───────
+            if timing_enabled:
+                _sync_if_cuda()
+                phase_t0 = time.perf_counter()
             ml_lens_raw = self.max_list_count[chosen_bkt].long()
             has_entries = ml_lens_raw > 0
             if not has_entries.all():
@@ -442,6 +494,11 @@ class ColorAwareTwoLevelSolver:
                         B_free,
                         torch.empty(0, device=device, dtype=torch.long),
                     )
+                    if timing_enabled:
+                        _sync_if_cuda()
+                        timings['s3'] = time.perf_counter() - phase_t0
+                        timings['total'] = time.perf_counter() - iter_t0
+                        _print_phase_timing(iteration, num_free, timings, "no_entries")
                     continue
 
             ml_starts = self.max_list_offsets[chosen_bkt]
@@ -465,9 +522,20 @@ class ColorAwareTwoLevelSolver:
                     B_free,
                     torch.empty(0, device=device, dtype=torch.long),
                 )
+                if timing_enabled:
+                    _sync_if_cuda()
+                    timings['s3'] = time.perf_counter() - phase_t0
+                    timings['total'] = time.perf_counter() - iter_t0
+                    _print_phase_timing(iteration, num_free, timings, "no_valid_proposals")
                 continue
+            if timing_enabled:
+                _sync_if_cuda()
+                timings['s3'] = time.perf_counter() - phase_t0
 
             # ── STEP 4: Conflict resolution — each a accepts one proposal ─
+            if timing_enabled:
+                _sync_if_cuda()
+                phase_t0 = time.perf_counter()
             rand_prio = torch.rand(num_b_cand, device=device)
             prop_edge_idx = _ensure_long_arange(self, '_prop_edge_arange', num_b_cand, device)
             min_prio = torch.full((N,), float('inf'), device=device)
@@ -484,8 +552,14 @@ class ColorAwareTwoLevelSolver:
             accepted = prop_edge_idx == accepted_edge_per_a[proposal_a]
             r_new = proposal_a[accepted]
             b_new = proposal_b[accepted]
+            if timing_enabled:
+                _sync_if_cuda()
+                timings['s4'] = time.perf_counter() - phase_t0
 
             # ── STEP 5: Matching update + F_B update ──────────────────────
+            if timing_enabled:
+                _sync_if_cuda()
+                phase_t0 = time.perf_counter()
             if r_new.numel() > 0:
                 was_matched = self.MA[r_new] != -1
                 evicted_b = self.MA[r_new[was_matched]].to(torch.long).clone()
@@ -504,14 +578,26 @@ class ColorAwareTwoLevelSolver:
                     F_B_new = still_free
             else:
                 F_B_new = B_free
+            if timing_enabled:
+                _sync_if_cuda()
+                timings['s5'] = time.perf_counter() - phase_t0
 
             # ── STEP 6: Dual update ───────────────────────────────────────
+            if timing_enabled:
+                _sync_if_cuda()
+                phase_t0 = time.perf_counter()
             self.yB[F_B_new] += 1
             if r_new.numel() > 0:
                 self.yA[r_new] -= 1
+            if timing_enabled:
+                _sync_if_cuda()
+                timings['s6'] = time.perf_counter() - phase_t0
             _print_dual_debug(iteration, num_free, F_B_new, r_new)
 
             # ── STEP 7: Incremental pre-processing update (vectorized) ────
+            if timing_enabled:
+                _sync_if_cuda()
+                phase_t0 = time.perf_counter()
             if r_new.numel() > 0:
                 inv_st = self.inv_a_offsets[r_new]
                 inv_en = self.inv_a_offsets[r_new + 1]
@@ -590,6 +676,11 @@ class ColorAwareTwoLevelSolver:
                                 self.max_list_count[chunk_bkts] = cnt_chunk
                             else:
                                 self.max_list_count[chunk_bkts] = 0
+            if timing_enabled:
+                _sync_if_cuda()
+                timings['s7'] = time.perf_counter() - phase_t0
+                timings['total'] = time.perf_counter() - iter_t0
+                _print_phase_timing(iteration, num_free, timings, "ok")
 
             B_free = F_B_new
 
