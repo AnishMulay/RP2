@@ -111,6 +111,12 @@ def synchronize_if_cuda(device):
         torch.cuda.synchronize()
 
 
+def average_or_na(values):
+    if not values:
+        return "n/a"
+    return f"{sum(values) / len(values):.6f}"
+
+
 DEFAULT_N_VALUES = [500, 1000, 2000]
 
 
@@ -148,6 +154,15 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dataset_label = "MNIST"
     base_seed = args.seed
+    summary = {
+        n: {
+            "exact_cost": [],
+            "exact_time": [],
+            "color_cost": [],
+            "color_time": [],
+        }
+        for n in n_list
+    }
     for n in n_list:
         for t in range(args.trials):
             trial_seed = base_seed + t
@@ -172,6 +187,8 @@ def main():
                     total_cost = float((P_plan * C).sum())
                     exact_cost = total_cost
                     print(f"Exact cost = {exact_cost:.4f} (time {exact_time:.2f}s)")
+                    summary[n]["exact_cost"].append(exact_cost)
+                    summary[n]["exact_time"].append(exact_time)
                     writer.writerow([dataset_label, n, dim, args.epsilon, 2, t+1,
                                      "POT-Exact", "success", f"{exact_time:.6f}",
                                      0.0, 0.0, 0.0,
@@ -210,6 +227,8 @@ def main():
             abs_err = (cost_val - exact_cost) if (exact_cost is not None and not math.isnan(cost_val)) else ""
             rel_err = ((cost_val/(exact_cost if exact_cost else 1) - 1)*100) if (exact_cost is not None and not math.isnan(cost_val)) else ""
             if status == "success":
+                summary[n]["color_cost"].append(cost_val)
+                summary[n]["color_time"].append(total_time)
                 abs_err_str = f"{abs_err:.6f}" if abs_err != "" else "n/a"
                 rel_err_str = f"{rel_err:.2f}%" if rel_err != "" else "n/a"
                 print(
@@ -232,6 +251,23 @@ def main():
                              f"{abs_err:.6f}" if abs_err != "" else "",
                              f"{rel_err:.2f}" if rel_err != "" else ""])
             f.flush()
+    print("\nSummary")
+    print(
+        f"{'n':>8}  {'Exact Cost':>12}  {'Exact Time (s)':>14}  "
+        f"{'Color Cost':>12}  {'Color Time (s)':>14}",
+        flush=True,
+    )
+    print("-" * 68, flush=True)
+    for n in n_list:
+        row = summary[n]
+        print(
+            f"{n:>8}  "
+            f"{average_or_na(row['exact_cost']):>12}  "
+            f"{average_or_na(row['exact_time']):>14}  "
+            f"{average_or_na(row['color_cost']):>12}  "
+            f"{average_or_na(row['color_time']):>14}",
+            flush=True,
+        )
     f.close()
 
 
