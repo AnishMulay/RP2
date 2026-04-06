@@ -157,55 +157,67 @@ class ColorAwareTwoLevelSolver:
             torch.cumsum(a_counts_long, 0)
         ])
 
+        # ── Structures 5+6: ball_sizes, d_max, max_list (fully vectorized) ────
         num_buckets = K * L
-        self.d_max = torch.full((num_buckets,), -1, device=self.device, dtype=torch.int32)
 
-        nonempty_mask = r_counts_long > 0
-        self.d_max[nonempty_mask] = 0
-
-        for center in range(K):
-            for lv in range(1, L):
-                bid = center * L + lv
-                bid_prev = center * L + (lv - 1)
-                if self.d_max[bid_prev].item() >= 0 and self.d_max[bid].item() < 0:
-                    self.d_max[bid] = self.d_max[bid_prev]
-
-        ball_sizes = torch.zeros(num_buckets, device=self.device, dtype=torch.long)
-        for center in range(K):
-            cumulative = 0
-            for lv in range(L):
-                bid = center * L + lv
-                cumulative += r_counts_long[bid].item()
-                ball_sizes[bid] = cumulative
-
+        # ball_sizes[q*L+k] = A-points in shells 0..k of center q
+        shell_counts_2d = r_counts_long.view(K, L)
+        ball_sizes_2d = torch.cumsum(shell_counts_2d, dim=1)
+        ball_sizes = ball_sizes_2d.reshape(num_buckets)
         self.ball_sizes = ball_sizes
 
+        # d_max: 0 for non-empty balls, -1 for empty (y(a)=0 everywhere initially)
+        self.d_max = torch.where(
+            ball_sizes > 0,
+            torch.zeros(num_buckets, device=self.device, dtype=torch.int32),
+            torch.full((num_buckets,), -1, device=self.device, dtype=torch.int32)
+        )
+
+        # max_list CSR preallocated to ball capacity
         self.max_list_offsets = torch.cat([
             torch.zeros(1, device=self.device, dtype=torch.long),
             torch.cumsum(ball_sizes, 0)
-        ])
-
-        total_max_list_capacity = int(ball_sizes.sum().item())
+        ])   # (K*L + 1,)
+        total_ml_cap = int(ball_sizes.sum().item())
         self.max_list_values = torch.full(
-            (total_max_list_capacity,), -1, device=self.device, dtype=torch.long
+            (total_ml_cap,), -1, device=self.device, dtype=torch.long
         )
-        self.max_list_count = torch.zeros(num_buckets, device=self.device, dtype=torch.long)
+        self.max_list_count = ball_sizes.clone()   # initially entire ball is max_list
 
-        for center in range(K):
-            for lv in range(L):
-                bid = center * L + lv
-                start = int(self.shell_red_offsets[bid].item())
-                ball_start_shell = center * L + 0
-                ball_end_shell = center * L + lv
-                ball_a_pts = self.shell_red_indices[
-                    self.shell_red_offsets[center * L]:
-                    self.shell_red_offsets[center * L + lv + 1]
-                ]
-                count = ball_a_pts.numel()
-                if count > 0:
-                    ml_start = int(self.max_list_offsets[bid].item())
-                    self.max_list_values[ml_start: ml_start + count] = ball_a_pts
-                    self.max_list_count[bid] = count
+        # Populate max_list_values vectorized.
+        # Shell entry at global position i has:
+        #   center q  = shell_red_expand_bucket_ids[i] // L
+        #   level k_a = shell_red_expand_bucket_ids[i] % L
+        #   local pos p within center = i - shell_red_offsets[q*L]
+        # It writes into balls (q, k_a), (q, k_a+1), ..., (q, max_level[q]):
+        #   write position = max_list_offsets[q*L + k] + p
+        num_shell = self.shell_red_indices.numel()
+        if num_shell > 0:
+            s_bkt = self.shell_red_expand_bucket_ids
+            s_center = s_bkt // L
+            s_ka = s_bkt % L
+            s_cstart = self.shell_red_offsets[s_center * L]
+            s_local = (
+                torch.arange(num_shell, device=self.device, dtype=torch.long) - s_cstart
+            )
+            s_maxlv = self.max_level_per_center[s_center]
+            num_balls_each = (s_maxlv - s_ka + 1).clamp(min=0)
+
+            total_writes = int(num_balls_each.sum().item())
+            if total_writes > 0:
+                cum_nb = torch.cumsum(num_balls_each, 0)
+                seg_nb = cum_nb - num_balls_each
+                gr = torch.arange(total_writes, device=self.device, dtype=torch.long)
+                ball_off = gr - torch.repeat_interleave(seg_nb, num_balls_each)
+
+                exp_center = torch.repeat_interleave(s_center, num_balls_each)
+                exp_ka = torch.repeat_interleave(s_ka, num_balls_each)
+                exp_local = torch.repeat_interleave(s_local, num_balls_each)
+                exp_a_id = torch.repeat_interleave(self.shell_red_indices, num_balls_each)
+
+                target_bkt = exp_center * L + exp_ka + ball_off
+                write_pos = self.max_list_offsets[target_bkt] + exp_local
+                self.max_list_values[write_pos] = exp_a_id
 
     def solve(self):
         N = self.N
@@ -222,9 +234,8 @@ class ColorAwareTwoLevelSolver:
             if iteration > 50000:
                 break
             iteration += 1
-            if iteration % 100 == 0:
-                print(f"    [Iter {iteration}] Free B: {num_free}", flush=True)
 
+            # ── STEP 1: Find zero-slack candidate buckets ─────────────────
             starts_b = self.inv_b_offsets[B_free]
             ends_b = self.inv_b_offsets[B_free + 1]
             lengths_b = ends_b - starts_b
@@ -236,97 +247,76 @@ class ColorAwareTwoLevelSolver:
 
             cum_b = torch.cumsum(lengths_b, 0)
             seg_b = cum_b - lengths_b
-            g_range = _ensure_long_arange(self, "_inv_arange", total_inv, device)
-            rep_starts_b = torch.repeat_interleave(starts_b, lengths_b)
-            offsets_b = g_range - torch.repeat_interleave(seg_b, lengths_b)
-            inv_edge_idx = rep_starts_b + offsets_b
+            g_range = _ensure_long_arange(self, '_inv_arange', total_inv, device)
+            rep_st = torch.repeat_interleave(starts_b, lengths_b)
+            off_b = g_range - torch.repeat_interleave(seg_b, lengths_b)
+            inv_idx = rep_st + off_b
 
-            active_b_ids = torch.repeat_interleave(B_free, lengths_b)
-            active_bkt_ids = self.inv_b_bucket_ids[inv_edge_idx]
-            active_kb = self.inv_b_levels[inv_edge_idx]
+            active_b = torch.repeat_interleave(B_free, lengths_b)
+            active_bkt = self.inv_b_bucket_ids[inv_idx]
+            active_kb = self.inv_b_levels[inv_idx]
 
-            target = 2 * active_kb - self.yB[active_b_ids].long()
-            dmax_vals = self.d_max[active_bkt_ids].long()
-            is_candidate = (dmax_vals == target) & (dmax_vals >= 0)
+            target = 2 * active_kb - self.yB[active_b].long()
+            dmax_vals = self.d_max[active_bkt].long()
+            is_cand = (dmax_vals == target) & (dmax_vals >= 0)
 
-            if not is_candidate.any():
+            if not is_cand.any():
                 self.yB[B_free] += 1
                 continue
 
-            cand_b = active_b_ids[is_candidate]
-            cand_bkt = active_bkt_ids[is_candidate]
-            cand_kb = active_kb[is_candidate]
+            cand_b = active_b[is_cand]
+            cand_bkt = active_bkt[is_cand]
+            cand_kb = active_kb[is_cand]
 
-            ml_counts = self.max_list_count[cand_bkt]
+            # ── STEP 2: Weighted bucket selection — Gumbel-max trick ──────
+            ml_counts_f = self.max_list_count[cand_bkt].float().clamp(min=1.0)
+            gumbel = -torch.log(
+                -torch.log(torch.rand(cand_bkt.numel(), device=device).clamp(min=1e-10))
+                + 1e-10
+            )
+            scores = torch.log(ml_counts_f) + gumbel
 
-            perm_c = torch.argsort(cand_b)
-            cand_b_s = cand_b[perm_c]
-            cand_bkt_s = cand_bkt[perm_c]
-            cand_kb_s = cand_kb[perm_c]
-            ml_counts_s = ml_counts[perm_c]
+            best_per_b = torch.full((N,), float('-inf'), device=device)
+            best_per_b.scatter_reduce_(0, cand_b, scores, reduce="amax", include_self=True)
+            is_chosen = scores == best_per_b[cand_b]
 
-            cand_counts_per_b = torch.bincount(cand_b_s, minlength=N)
-            has_cand = cand_counts_per_b[B_free] > 0
-            b_with_cand = B_free[has_cand]
-
-            b_cand_offsets = torch.cat([
-                torch.zeros(1, device=device, dtype=torch.long),
-                torch.cumsum(cand_counts_per_b[b_with_cand], 0)
-            ])
-
+            b_with_cand = cand_b[is_chosen]
+            chosen_bkt = cand_bkt[is_chosen]
             num_b_cand = b_with_cand.numel()
-            chosen_bkt = torch.empty(num_b_cand, device=device, dtype=torch.long)
-            chosen_kb = torch.empty(num_b_cand, device=device, dtype=torch.long)
 
-            for i in range(num_b_cand):
-                s = int(b_cand_offsets[i].item())
-                e = int(b_cand_offsets[i + 1].item())
-                weights = ml_counts_s[s:e].float()
-                total_w = weights.sum()
-                if total_w <= 0:
-                    chosen_bkt[i] = cand_bkt_s[s]
-                    chosen_kb[i] = cand_kb_s[s]
-                else:
-                    probs = weights / total_w
-                    idx = int(torch.multinomial(probs, 1).item())
-                    chosen_bkt[i] = cand_bkt_s[s + idx]
-                    chosen_kb[i] = cand_kb_s[s + idx]
+            if num_b_cand == 0:
+                self.yB[B_free] += 1
+                continue
 
+            # ── STEP 3: Proposal — each b draws one a from max_list ───────
             ml_starts = self.max_list_offsets[chosen_bkt]
-            ml_lens = self.max_list_count[chosen_bkt]
+            ml_lens = self.max_list_count[chosen_bkt].clamp(min=1)
             rand_idx = (torch.rand(num_b_cand, device=device) * ml_lens.float()).long()
             rand_idx = rand_idx.clamp(max=ml_lens - 1)
             proposal_a = self.max_list_values[ml_starts + rand_idx]
-
-            num_props = num_b_cand
-            rand_prio = torch.rand(num_props, device=device)
-
             proposal_b = b_with_cand
 
-            min_prio_per_a = torch.full((N,), float('inf'), device=device)
-            min_prio_per_a.scatter_reduce_(
-                0, proposal_a, rand_prio, reduce="amin", include_self=True
-            )
+            # ── STEP 4: Conflict resolution — each a accepts one proposal ─
+            rand_prio = torch.rand(num_b_cand, device=device)
+            min_prio = torch.full((N,), float('inf'), device=device)
+            min_prio.scatter_reduce_(0, proposal_a, rand_prio, reduce="amin", include_self=True)
+            accepted = rand_prio == min_prio[proposal_a]
+            r_new = proposal_a[accepted]
+            b_new = proposal_b[accepted]
 
-            accepted_mask = rand_prio == min_prio_per_a[proposal_a]
-
-            r_new = proposal_a[accepted_mask]
-            b_new = proposal_b[accepted_mask]
-
+            # ── STEP 5: Matching update + F_B update ──────────────────────
             if r_new.numel() > 0:
                 was_matched = self.MA[r_new] != -1
                 evicted_b = self.MA[r_new[was_matched]].to(torch.long).clone()
-
                 if evicted_b.numel() > 0:
                     self.MB[evicted_b] = -1
-
                 self.MA[r_new] = b_new.to(self.MA.dtype)
                 self.MB[b_new] = r_new.to(self.MB.dtype)
 
-                keep_mask = _ensure_bool_buffer(self, "_keep_free_mask", num_free, device)
-                keep_mask.fill_(True)
-                keep_mask[torch.searchsorted(B_free, b_new)] = False
-                still_free = B_free[keep_mask]
+                keep = _ensure_bool_buffer(self, '_keep_free', num_free, device)
+                keep.fill_(True)
+                keep[torch.searchsorted(B_free, b_new)] = False
+                still_free = B_free[keep]
                 if evicted_b.numel() > 0:
                     F_B_new, _ = torch.sort(torch.cat([still_free, evicted_b]))
                 else:
@@ -334,37 +324,97 @@ class ColorAwareTwoLevelSolver:
             else:
                 F_B_new = B_free
 
+            # ── STEP 6: Dual update ───────────────────────────────────────
             self.yB[F_B_new] += 1
             if r_new.numel() > 0:
                 self.yA[r_new] += 1
 
+            # ── STEP 7: Incremental pre-processing update (vectorized) ────
             if r_new.numel() > 0:
-                changed_a_list = r_new.cpu().tolist()
-                for a in changed_a_list:
-                    ya_new = int(self.yA[a].item())
-                    ya_old = ya_new - 1
-                    inv_start = int(self.inv_a_offsets[a].item())
-                    inv_end = int(self.inv_a_offsets[a + 1].item())
-                    for idx in range(inv_start, inv_end):
-                        bkt_shell = int(self.inv_a_bucket_ids[idx].item())
-                        center_q = bkt_shell // L
-                        k_a = bkt_shell % L
-                        max_lv = int(self.max_level_per_center[center_q].item())
-                        for k in range(k_a, max_lv + 1):
-                            bid = center_q * L + k
-                            dm = int(self.d_max[bid].item())
-                            if dm < 0:
-                                continue
-                            if ya_old == dm:
-                                self.d_max[bid] = ya_new
-                                ml_start = int(self.max_list_offsets[bid].item())
-                                self.max_list_values[ml_start] = a
-                                self.max_list_count[bid] = 1
-                            elif ya_new == dm:
-                                ml_start = int(self.max_list_offsets[bid].item())
-                                cur_cnt = int(self.max_list_count[bid].item())
-                                self.max_list_values[ml_start + cur_cnt] = a
-                                self.max_list_count[bid] = cur_cnt + 1
+                inv_st = self.inv_a_offsets[r_new]
+                inv_en = self.inv_a_offsets[r_new + 1]
+                inv_ln = inv_en - inv_st
+                total_ia = int(inv_ln.sum().item())
+
+                if total_ia > 0:
+                    cum_ia = torch.cumsum(inv_ln, 0)
+                    seg_ia = cum_ia - inv_ln
+                    gr_ia = _ensure_long_arange(self, '_s7_ia', total_ia, device)
+                    rep_ia = torch.repeat_interleave(inv_st, inv_ln)
+                    off_ia = gr_ia - torch.repeat_interleave(seg_ia, inv_ln)
+                    idx_ia = rep_ia + off_ia
+
+                    rep_a = torch.repeat_interleave(r_new, inv_ln)
+                    bkt_sh = self.inv_a_bucket_ids[idx_ia]
+                    cq = bkt_sh // L
+                    ka = bkt_sh % L
+
+                    maxlv = self.max_level_per_center[cq]
+                    nballs = (maxlv - ka + 1).clamp(min=0)
+                    total_bup = int(nballs.sum().item())
+
+                    if total_bup > 0:
+                        cum_nb = torch.cumsum(nballs, 0)
+                        seg_nb = cum_nb - nballs
+                        gr_nb = _ensure_long_arange(self, '_s7_nb', total_bup, device)
+                        boff = gr_nb - torch.repeat_interleave(seg_nb, nballs)
+                        exp_cq = torch.repeat_interleave(cq, nballs)
+                        exp_ka = torch.repeat_interleave(ka, nballs)
+                        aff_bkts = (exp_cq * L + exp_ka + boff).unique()
+
+                        aff_c = aff_bkts // L
+                        aff_k = aff_bkts % L
+                        ball_st = self.shell_red_offsets[aff_c * L]
+                        ball_en = self.shell_red_offsets[aff_c * L + aff_k + 1]
+                        ball_ln = ball_en - ball_st
+                        total_ba = int(ball_ln.sum().item())
+
+                        if total_ba > 0:
+                            cum_ba = torch.cumsum(ball_ln, 0)
+                            seg_ba = cum_ba - ball_ln
+                            gr_ba = _ensure_long_arange(self, '_s7_ba', total_ba, device)
+                            rep_sba = torch.repeat_interleave(ball_st, ball_ln)
+                            off_ba = gr_ba - torch.repeat_interleave(seg_ba, ball_ln)
+                            sh_idx = rep_sba + off_ba
+
+                            exp_a_ba = self.shell_red_indices[sh_idx]
+                            exp_bk_ba = torch.repeat_interleave(aff_bkts, ball_ln)
+                            exp_ya_ba = self.yA[exp_a_ba].long()
+
+                            loc_idx = torch.searchsorted(aff_bkts, exp_bk_ba)
+
+                            # New d_max per affected ball
+                            new_dm = torch.zeros(aff_bkts.numel(), device=device, dtype=torch.long)
+                            new_dm.scatter_reduce_(0, loc_idx, exp_ya_ba,
+                                                   reduce="amax", include_self=True)
+                            self.d_max[aff_bkts] = new_dm.to(torch.int32)
+
+                            # New max_list members
+                            in_ml = exp_ya_ba == new_dm[loc_idx]
+                            ml_a = exp_a_ba[in_ml]
+                            ml_bkt = exp_bk_ba[in_ml]
+
+                            perm_ml = torch.argsort(ml_bkt)
+                            ml_bkt_s = ml_bkt[perm_ml]
+                            ml_a_s = ml_a[perm_ml]
+
+                            loc_ml = torch.searchsorted(aff_bkts, ml_bkt_s)
+                            cnt_new = torch.zeros(aff_bkts.numel(), device=device,
+                                                  dtype=torch.long)
+                            cnt_new.scatter_add_(
+                                0, loc_ml,
+                                torch.ones(ml_bkt_s.numel(), device=device, dtype=torch.long)
+                            )
+                            ml_off_l = torch.cat([
+                                torch.zeros(1, device=device, dtype=torch.long),
+                                torch.cumsum(cnt_new, 0)
+                            ])
+                            rank_ml = (torch.arange(ml_bkt_s.numel(), device=device,
+                                                    dtype=torch.long)
+                                       - ml_off_l[loc_ml])
+                            wpos = self.max_list_offsets[ml_bkt_s] + rank_ml
+                            self.max_list_values[wpos] = ml_a_s
+                            self.max_list_count[aff_bkts] = cnt_new
 
             B_free = F_B_new
 

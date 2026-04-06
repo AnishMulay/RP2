@@ -429,93 +429,24 @@ self.inv_a_offsets = torch.cat([
 # Each entry is the bucket at a's OWN shell level k_a.
 ```
 
-#### 3.4.8 Structure 5 — d_max per ball (K*L scalars)
+#### 3.4.8 Structures 5+6 — ball_sizes, d_max, max_list (vectorized GPU init)
 
-`d_max[bucket_id]` = max y(a) over all A-points in the BALL (shells 0..k) of center q.
-Built by computing prefix maxima over shells for each center.
-Initial y(a) = 0 for all a, so initially d_max is everywhere 0 for non-empty balls
-and -1 for empty balls (to distinguish).
+All three are built with vectorized GPU ops. No Python loops.
 
-```python
-num_buckets = K * L
-self.d_max = torch.full((num_buckets,), -1, device=self.device, dtype=torch.int32)
+ball_sizes[q*L+k] = number of A-points in shells 0..k of center q.
+Computed as prefix sum of shell sizes per center via reshape + cumsum.
 
-# For each shell bucket that has at least one A-point, d_max for that ball is at least 0.
-# Since all y(a) start at 0, d_max(q, k) = 0 for all non-empty balls initially.
-# We mark non-empty balls:
-nonempty_mask = r_counts_long > 0   # shape (K*L,)
-self.d_max[nonempty_mask] = 0
+d_max[q*L+k] = 0 if ball non-empty, -1 if empty. Initially all y(a)=0
+so every non-empty ball has d_max=0 and max_list = entire ball.
 
-# Now propagate: d_max(q, k) = max(d_max(q, k-1), d_max of shell k of center q).
-# Since all y(a)=0 initially, any non-empty ball has d_max=0.
-# We propagate non-emptiness: if ball (q, k-1) is non-empty, so is ball (q, k).
-for center in range(K):
-    for lv in range(1, L):
-        bid      = center * L + lv
-        bid_prev = center * L + (lv - 1)
-        if self.d_max[bid_prev].item() >= 0 and self.d_max[bid].item() < 0:
-            self.d_max[bid] = self.d_max[bid_prev]
-```
+max_list_offsets/values/count form a second CSR preallocated to ball_sizes.
+Initially populated vectorized: each shell entry (a, center q, level k_a)
+writes a into balls (q, k_a), (q, k_a+1), ..., (q, max_level[q]).
+Position in max_list for ball (q,k) = max_list_offsets[q*L+k] + local_pos,
+where local_pos = position of a within center q's shell CSR entries.
 
-**Important:** The CPU loop above is only done once during initialisation and is
-acceptable. At runtime, `d_max` is updated in-place on GPU via Step 7.
-
-#### 3.4.9 Structure 6 — max_list per ball (second CSR)
-
-`max_list` stores, for each ball (q, k), the list of A-points with y(a) == d_max(q,k).
-Preallocated to ball size (upper bound) so no reallocation is ever needed.
-
-Since all y(a) = 0 initially and d_max = 0 for non-empty balls, max_list initially
-contains every A-point in the ball.
-
-```python
-# Compute ball sizes: ball_size(q, k) = number of A-points in shells 0..k of center q.
-# This equals prefix sum of shell sizes per center.
-ball_sizes = torch.zeros(num_buckets, device=self.device, dtype=torch.long)
-for center in range(K):
-    cumulative = 0
-    for lv in range(L):
-        bid        = center * L + lv
-        cumulative += r_counts_long[bid].item()
-        ball_sizes[bid] = cumulative
-
-self.ball_sizes = ball_sizes   # shape (K*L,), max_list will never exceed this
-
-self.max_list_offsets = torch.cat([
-    torch.zeros(1, device=self.device, dtype=torch.long),
-    torch.cumsum(ball_sizes, 0)
-])   # shape (K*L + 1,)
-
-total_max_list_capacity = int(ball_sizes.sum().item())
-self.max_list_values = torch.full(
-    (total_max_list_capacity,), -1, device=self.device, dtype=torch.long
-)
-self.max_list_count = torch.zeros(num_buckets, device=self.device, dtype=torch.long)
-
-# Populate initial max_list: all A-points in each ball (since d_max=0 and y(a)=0).
-for center in range(K):
-    for lv in range(L):
-        bid   = center * L + lv
-        start = int(self.shell_red_offsets[bid].item())
-        # Ball = shells 0..lv of center
-        ball_start_shell = center * L + 0
-        ball_end_shell   = center * L + lv
-        # Collect all A-points in shells 0..lv
-        ball_a_pts = self.shell_red_indices[
-            self.shell_red_offsets[center * L] :
-            self.shell_red_offsets[center * L + lv + 1]
-        ]
-        count = ball_a_pts.numel()
-        if count > 0:
-            ml_start = int(self.max_list_offsets[bid].item())
-            self.max_list_values[ml_start : ml_start + count] = ball_a_pts
-            self.max_list_count[bid] = count
-```
-
-**Important note on the CPU loop:** This initialisation loop is O(K * L * avg_ball_size)
-and runs once. It is acceptable. The shell CSR already ensures the data is contiguous
-per (center, level), so the slicing `shell_red_offsets[center*L] : shell_red_offsets[center*L + lv + 1]`
-is correct because shells within a center are stored contiguously in sorted bucket order.
+ZERO Python loops in init. Only .item() calls allowed in __init__ are for
+determining allocation sizes (torch.empty requires Python int).
 
 ---
 
@@ -582,58 +513,8 @@ def solve(self):
         cand_bkt = active_bkt_ids[is_candidate]  # ball bucket_id
         cand_kb  = active_kb[is_candidate]        # k_b (proxy = 2*k_b)
 
-        # ── STEP 2: Weighted bucket selection per b ───────────────────────
-        # Weight = max_list_count[bucket_id]. Each b picks one bucket
-        # proportional to counts. For b with no candidates, skip (yB += 1 later).
-        #
-        # Strategy: for each b, among its candidate entries, pick one
-        # proportional to max_list_count. Use per-b prefix sums + random draw.
-
-        ml_counts = self.max_list_count[cand_bkt]   # (C,) weights
-
-        # Group candidate entries by b, then weighted-sample one per b.
-        # Sort candidates by b_id so we can segment per b.
-        perm_c    = torch.argsort(cand_b)
-        cand_b_s  = cand_b[perm_c]
-        cand_bkt_s = cand_bkt[perm_c]
-        cand_kb_s  = cand_kb[perm_c]
-        ml_counts_s = ml_counts[perm_c]
-
-        # For each b in B_free, count how many candidates it has.
-        cand_counts_per_b = torch.bincount(cand_b_s, minlength=N)   # (N,)
-        has_cand = cand_counts_per_b[B_free] > 0                     # (num_free,)
-        b_with_cand = B_free[has_cand]                               # subset of B_free
-
-        # Compute per-b offsets into the sorted candidate list
-        b_cand_offsets = torch.cat([
-            torch.zeros(1, device=device, dtype=torch.long),
-            torch.cumsum(cand_counts_per_b[b_with_cand], 0)
-        ])  # (|b_with_cand|+1,)
-
-        # For each b with candidates, do a weighted draw:
-        # prefix sum of ml_counts within the b's segment, then random.
-        # This is done with a scatter-based approach per b segment.
-
-        # Build prefix sums within each b's candidate segment
-        # Then draw uniform random and find the chosen index via searchsorted.
-        num_b_cand = b_with_cand.numel()
-        chosen_bkt  = torch.empty(num_b_cand, device=device, dtype=torch.long)
-        chosen_kb   = torch.empty(num_b_cand, device=device, dtype=torch.long)
-
-        for i in range(num_b_cand):
-            s = int(b_cand_offsets[i].item())
-            e = int(b_cand_offsets[i + 1].item())
-            weights = ml_counts_s[s:e].float()
-            total_w = weights.sum()
-            if total_w <= 0:
-                # no valid candidates — shouldn't happen since we filtered by d_max match
-                chosen_bkt[i] = cand_bkt_s[s]
-                chosen_kb[i]  = cand_kb_s[s]
-            else:
-                probs = weights / total_w
-                idx   = int(torch.multinomial(probs, 1).item())
-                chosen_bkt[i] = cand_bkt_s[s + idx]
-                chosen_kb[i]  = cand_kb_s[s + idx]
+        Step 2 uses the Gumbel-max trick for vectorized weighted sampling.
+        No Python loop over b. One scatter_reduce amax over all candidates.
 
         # ── STEP 3: Proposal — each b draws one a from max_list ──────────
         # For each b_with_cand[i], pick uniformly from
@@ -702,54 +583,17 @@ def solve(self):
         if r_new.numel() > 0:
             self.yA[r_new] += 1   # INCREMENT, not decrement
 
-        # ── STEP 7: Incremental pre-processing update ─────────────────────
-        # Only recompute d_max and max_list for balls containing changed A-points.
-        # changed_A = r_new (the newly matched A-points, whose y(a) just increased).
-        #
-        # For each a in changed_A:
-        #   For each (q, k_a) in INV_A(a):
-        #     For k from k_a to max_level_per_center[q]:
-        #       Recompute d_max(q, k) and max_list(q, k).
-        #
-        # Three cases for ball (q, k) when a's y increases by 1:
-        #   Case 1: ya_old == d_max(q,k)  →  new d_max = ya_old+1, max_list = {a} only
-        #   Case 2: ya_old+1 == d_max(q,k) →  d_max unchanged, a joins max_list
-        #   Case 3: otherwise              →  no change to this ball
-        #
-        # Since the set of changed A-points is small per phase, we iterate on CPU
-        # for correctness; this can be parallelised in a future optimisation.
+        Step 7 is fully vectorized on GPU:
+        1. Expand INV_A for r_new → all shell entries for changed A-points.
+        2. Expand each shell entry to all balls k_a..max_level[q] → affected ball IDs.
+        3. Deduplicate affected ball IDs with .unique().
+        4. For each affected ball, expand its shell CSR range to get all A-points in the ball.
+        5. scatter_reduce amax over y(a) → new d_max per affected ball.
+        6. Filter for A-points with y(a)==new_d_max → new max_list members.
+        7. Compute write positions via searchsorted + rank, scatter write.
 
-        if r_new.numel() > 0:
-            changed_a_list = r_new.cpu().tolist()
-            for a in changed_a_list:
-                ya_new = int(self.yA[a].item())   # after increment
-                ya_old = ya_new - 1
-                inv_start = int(self.inv_a_offsets[a].item())
-                inv_end   = int(self.inv_a_offsets[a + 1].item())
-                for idx in range(inv_start, inv_end):
-                    bkt_shell = int(self.inv_a_bucket_ids[idx].item())
-                    center_q  = bkt_shell // L
-                    k_a       = bkt_shell  % L
-                    max_lv    = int(self.max_level_per_center[center_q].item())
-                    for k in range(k_a, max_lv + 1):
-                        bid = center_q * L + k
-                        dm  = int(self.d_max[bid].item())
-                        if dm < 0:
-                            continue  # empty ball, skip
-                        if ya_old == dm:
-                            # Case 1: a was at the top, now moves higher
-                            # new d_max = ya_new; max_list = {a}
-                            self.d_max[bid] = ya_new
-                            ml_start = int(self.max_list_offsets[bid].item())
-                            self.max_list_values[ml_start] = a
-                            self.max_list_count[bid]       = 1
-                        elif ya_new == dm:
-                            # Case 2: a rises to join the current top
-                            ml_start = int(self.max_list_offsets[bid].item())
-                            cur_cnt  = int(self.max_list_count[bid].item())
-                            self.max_list_values[ml_start + cur_cnt] = a
-                            self.max_list_count[bid] = cur_cnt + 1
-                        # Case 3: no change
+        ZERO Python loops in solve(). Only .item() calls allowed are three per phase
+        for _ensure_long_arange buffer sizing (inv expansion, ball expansion, ball entries).
 
         B_free = F_B_new
 
