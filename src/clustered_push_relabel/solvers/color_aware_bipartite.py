@@ -500,51 +500,143 @@ class ColorAwareTwoLevelSolver:
                         total_ba = int(ball_ln.sum().item())
 
                         if total_ba > 0:
-                            cum_ba = torch.cumsum(ball_ln, 0)
-                            seg_ba = cum_ba - ball_ln
-                            gr_ba = _ensure_long_arange(self, '_s7_ba', total_ba, device)
-                            rep_sba = torch.repeat_interleave(ball_st, ball_ln)
-                            off_ba = gr_ba - torch.repeat_interleave(seg_ba, ball_ln)
-                            sh_idx = rep_sba + off_ba
+                            max_s7_ball_entries = 4_000_000
+                            cum_ball_ln = torch.cumsum(ball_ln, 0)
+                            num_aff = aff_bkts.numel()
+                            min_long = torch.iinfo(torch.long).min
+                            new_dm = torch.full((num_aff,), min_long, device=device, dtype=torch.long)
 
-                            exp_a_ba = self.shell_red_indices[sh_idx]
-                            exp_bk_ba = torch.repeat_interleave(aff_bkts, ball_ln)
-                            exp_ya_ba = self.yA[exp_a_ba].long()
+                            # Pass 1: recompute d_max in bounded chunks of affected balls.
+                            chunk_start = 0
+                            while chunk_start < num_aff:
+                                base_entries = int(cum_ball_ln[chunk_start - 1].item()) if chunk_start > 0 else 0
+                                limit_entries = base_entries + max_s7_ball_entries
+                                chunk_end = int(
+                                    torch.searchsorted(
+                                        cum_ball_ln,
+                                        torch.tensor(limit_entries, device=device, dtype=torch.long),
+                                        right=True,
+                                    ).item()
+                                )
+                                if chunk_end <= chunk_start:
+                                    chunk_end = chunk_start + 1
 
-                            loc_idx = torch.searchsorted(aff_bkts, exp_bk_ba)
+                                chunk_st = ball_st[chunk_start:chunk_end]
+                                chunk_ln = ball_ln[chunk_start:chunk_end]
+                                total_chunk_entries = int(chunk_ln.sum().item())
 
-                            # New d_max per affected ball
-                            new_dm = torch.zeros(aff_bkts.numel(), device=device, dtype=torch.long)
-                            new_dm.scatter_reduce_(0, loc_idx, exp_ya_ba,
-                                                   reduce="amax", include_self=True)
+                                if total_chunk_entries > 0:
+                                    cum_chunk = torch.cumsum(chunk_ln, 0)
+                                    seg_chunk = cum_chunk - chunk_ln
+                                    gr_chunk = _ensure_long_arange(
+                                        self, '_s7_ba', total_chunk_entries, device
+                                    )
+                                    rep_st_chunk = torch.repeat_interleave(chunk_st, chunk_ln)
+                                    off_chunk = gr_chunk - torch.repeat_interleave(seg_chunk, chunk_ln)
+                                    sh_idx = rep_st_chunk + off_chunk
+
+                                    exp_a_chunk = self.shell_red_indices[sh_idx]
+                                    exp_ya_chunk = self.yA[exp_a_chunk].long()
+                                    local_ball_idx = torch.repeat_interleave(
+                                        torch.arange(
+                                            chunk_end - chunk_start,
+                                            device=device,
+                                            dtype=torch.long,
+                                        ),
+                                        chunk_ln,
+                                    )
+                                    dm_chunk = torch.full(
+                                        (chunk_end - chunk_start,),
+                                        min_long,
+                                        device=device,
+                                        dtype=torch.long,
+                                    )
+                                    dm_chunk.scatter_reduce_(
+                                        0,
+                                        local_ball_idx,
+                                        exp_ya_chunk,
+                                        reduce="amax",
+                                        include_self=True,
+                                    )
+                                    new_dm[chunk_start:chunk_end] = dm_chunk
+
+                                chunk_start = chunk_end
+
                             self.d_max[aff_bkts] = new_dm.to(torch.int32)
 
-                            # New max_list members
-                            in_ml = exp_ya_ba == new_dm[loc_idx]
-                            ml_a = exp_a_ba[in_ml]
-                            ml_bkt = exp_bk_ba[in_ml]
+                            # Pass 2: rebuild max_list for affected balls in the same bounded chunks.
+                            self.max_list_count[aff_bkts] = 0
+                            chunk_start = 0
+                            while chunk_start < num_aff:
+                                base_entries = int(cum_ball_ln[chunk_start - 1].item()) if chunk_start > 0 else 0
+                                limit_entries = base_entries + max_s7_ball_entries
+                                chunk_end = int(
+                                    torch.searchsorted(
+                                        cum_ball_ln,
+                                        torch.tensor(limit_entries, device=device, dtype=torch.long),
+                                        right=True,
+                                    ).item()
+                                )
+                                if chunk_end <= chunk_start:
+                                    chunk_end = chunk_start + 1
 
-                            perm_ml = torch.argsort(ml_bkt)
-                            ml_bkt_s = ml_bkt[perm_ml]
-                            ml_a_s = ml_a[perm_ml]
+                                chunk_bkts = aff_bkts[chunk_start:chunk_end]
+                                chunk_st = ball_st[chunk_start:chunk_end]
+                                chunk_ln = ball_ln[chunk_start:chunk_end]
+                                total_chunk_entries = int(chunk_ln.sum().item())
 
-                            loc_ml = torch.searchsorted(aff_bkts, ml_bkt_s)
-                            cnt_new = torch.zeros(aff_bkts.numel(), device=device,
-                                                  dtype=torch.long)
-                            cnt_new.scatter_add_(
-                                0, loc_ml,
-                                torch.ones(ml_bkt_s.numel(), device=device, dtype=torch.long)
-                            )
-                            ml_off_l = torch.cat([
-                                torch.zeros(1, device=device, dtype=torch.long),
-                                torch.cumsum(cnt_new, 0)
-                            ])
-                            rank_ml = (torch.arange(ml_bkt_s.numel(), device=device,
-                                                    dtype=torch.long)
-                                       - ml_off_l[loc_ml])
-                            wpos = self.max_list_offsets[ml_bkt_s] + rank_ml
-                            self.max_list_values[wpos] = ml_a_s
-                            self.max_list_count[aff_bkts] = cnt_new
+                                if total_chunk_entries > 0:
+                                    cum_chunk = torch.cumsum(chunk_ln, 0)
+                                    seg_chunk = cum_chunk - chunk_ln
+                                    gr_chunk = _ensure_long_arange(
+                                        self, '_s7_ba', total_chunk_entries, device
+                                    )
+                                    rep_st_chunk = torch.repeat_interleave(chunk_st, chunk_ln)
+                                    off_chunk = gr_chunk - torch.repeat_interleave(seg_chunk, chunk_ln)
+                                    sh_idx = rep_st_chunk + off_chunk
+
+                                    exp_a_chunk = self.shell_red_indices[sh_idx]
+                                    exp_ya_chunk = self.yA[exp_a_chunk].long()
+                                    local_ball_idx = torch.repeat_interleave(
+                                        torch.arange(
+                                            chunk_end - chunk_start,
+                                            device=device,
+                                            dtype=torch.long,
+                                        ),
+                                        chunk_ln,
+                                    )
+
+                                    in_ml = exp_ya_chunk == new_dm[chunk_start:chunk_end][local_ball_idx]
+                                    ml_a = exp_a_chunk[in_ml]
+                                    ml_local = local_ball_idx[in_ml]
+
+                                    if ml_a.numel() > 0:
+                                        cnt_chunk = torch.zeros(
+                                            chunk_end - chunk_start,
+                                            device=device,
+                                            dtype=torch.long,
+                                        )
+                                        cnt_chunk.scatter_add_(
+                                            0,
+                                            ml_local,
+                                            torch.ones(ml_a.numel(), device=device, dtype=torch.long),
+                                        )
+                                        ml_off = torch.cat([
+                                            torch.zeros(1, device=device, dtype=torch.long),
+                                            torch.cumsum(cnt_chunk, 0),
+                                        ])
+                                        rank_ml = (
+                                            torch.arange(ml_a.numel(), device=device, dtype=torch.long)
+                                            - ml_off[ml_local]
+                                        )
+                                        target_bkts = chunk_bkts[ml_local]
+                                        wpos = self.max_list_offsets[target_bkts] + rank_ml
+                                        self.max_list_values[wpos] = ml_a
+                                        self.max_list_count[chunk_bkts] = cnt_chunk
+                                    else:
+                                        self.max_list_count[chunk_bkts] = 0
+
+                                chunk_start = chunk_end
 
             B_free = F_B_new
 
