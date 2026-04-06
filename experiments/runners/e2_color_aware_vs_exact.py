@@ -209,6 +209,19 @@ def main():
                 except: pass
             abs_err = (cost_val - exact_cost) if (exact_cost is not None and not math.isnan(cost_val)) else ""
             rel_err = ((cost_val/(exact_cost if exact_cost else 1) - 1)*100) if (exact_cost is not None and not math.isnan(cost_val)) else ""
+            if status == "success":
+                abs_err_str = f"{abs_err:.6f}" if abs_err != "" else "n/a"
+                rel_err_str = f"{rel_err:.2f}%" if rel_err != "" else "n/a"
+                print(
+                    "[ColorAware-2L]\n"
+                    f"  cost        : {cost_val:.6f}\n"
+                    f"  total time  : {total_time:.4f}s\n"
+                    f"  cluster time: {clust_time:.4f}s\n"
+                    f"  solve time  : {solve_time:.4f}s\n"
+                    f"  abs error   : {abs_err_str}\n"
+                    f"  rel error   : {rel_err_str}",
+                    flush=True,
+                )
             writer.writerow([dataset_label, n, dim, args.epsilon, 2, t+1,
                              "ColorAware-2L", status,
                              f"{total_time:.6f}" if not math.isnan(total_time) else "",
