@@ -240,7 +240,8 @@ class ColorAwareTwoLevelSolver:
             if iteration > 50000:
                 break
             iteration += 1
-            print(f"[Iter {iteration}] Free B: {num_free}", flush=True)
+            if iteration % 100 == 0:
+                print(f"[Iter {iteration}] Free B: {num_free}", flush=True)
 
             # ── STEP 1: Find zero-slack candidate buckets ─────────────────
             starts_b = self.inv_b_offsets[B_free]
