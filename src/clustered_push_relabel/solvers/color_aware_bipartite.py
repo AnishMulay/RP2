@@ -182,7 +182,7 @@ class ColorAwareTwoLevelSolver:
         self.max_list_values = torch.full(
             (total_ml_cap,), -1, device=self.device, dtype=torch.long
         )
-        self.max_list_count = ball_sizes.clone()   # initially entire ball is max_list
+        self.max_list_count = torch.zeros(num_buckets, device=self.device, dtype=torch.long)
 
         # Populate max_list_values vectorized.
         # Shell entry at global position i has:
@@ -218,6 +218,12 @@ class ColorAwareTwoLevelSolver:
                 target_bkt = exp_center * L + exp_ka + ball_off
                 write_pos = self.max_list_offsets[target_bkt] + exp_local
                 self.max_list_values[write_pos] = exp_a_id
+                # Compute actual write counts per ball from the writes just done
+                self.max_list_count.scatter_add_(
+                    0,
+                    target_bkt,
+                    torch.ones(total_writes, device=self.device, dtype=torch.long)
+                )
 
     def solve(self):
         N = self.N
@@ -289,12 +295,33 @@ class ColorAwareTwoLevelSolver:
                 continue
 
             # ── STEP 3: Proposal — each b draws one a from max_list ───────
+            ml_lens_raw = self.max_list_count[chosen_bkt]
+            has_entries = ml_lens_raw > 0
+            if not has_entries.all():
+                chosen_bkt = chosen_bkt[has_entries]
+                b_with_cand = b_with_cand[has_entries]
+                ml_lens_raw = ml_lens_raw[has_entries]
+                num_b_cand = b_with_cand.numel()
+                if num_b_cand == 0:
+                    self.yB[F_B_new if 'F_B_new' in dir() else B_free] += 1
+                    B_free = B_free  # no change yet
+                    continue
             ml_starts = self.max_list_offsets[chosen_bkt]
-            ml_lens = self.max_list_count[chosen_bkt].clamp(min=1)
+            ml_lens = ml_lens_raw.clamp(min=1)
             rand_idx = (torch.rand(num_b_cand, device=device) * ml_lens.float()).long()
-            rand_idx = rand_idx.clamp(max=ml_lens - 1)
+            rand_idx = rand_idx.clamp(min=0, max=ml_lens - 1)
             proposal_a = self.max_list_values[ml_starts + rand_idx]
             proposal_b = b_with_cand
+            # Guard: filter any invalid proposals (should not happen after Change 1+2,
+            # but kept as a safety net)
+            valid_prop = (proposal_a >= 0) & (proposal_a < self.N)
+            if not valid_prop.all():
+                proposal_a = proposal_a[valid_prop]
+                proposal_b = proposal_b[valid_prop]
+                num_b_cand = proposal_a.numel()
+            if num_b_cand == 0:
+                self.yB[B_free] += 1
+                continue
 
             # ── STEP 4: Conflict resolution — each a accepts one proposal ─
             rand_prio = torch.rand(num_b_cand, device=device)
