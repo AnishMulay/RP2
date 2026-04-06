@@ -222,6 +222,8 @@ class ColorAwareTwoLevelSolver:
             if iteration > 50000:
                 break
             iteration += 1
+            if iteration % 100 == 0:
+                print(f"    [Iter {iteration}] Free B: {num_free}", flush=True)
 
             starts_b = self.inv_b_offsets[B_free]
             ends_b = self.inv_b_offsets[B_free + 1]
