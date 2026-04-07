@@ -1,4 +1,5 @@
 import math
+import time
 import torch
 from ..utils.distance import TiledEuclideanKernel, TiledManhattanKernel
 
@@ -36,23 +37,39 @@ class ColorAwareClustering:
         sampled_red_pts = P_red_norm[sampled_red_mask]
         sampled_blue_pts = P_blue_norm[sampled_blue_mask]
 
+        torch.cuda.synchronize(device)
+        t0 = time.perf_counter()
         if sampled_red_pts.numel() > 0:
             d_min_red = get_dists(sampled_red_pts, ws_all).min(dim=1).values
         else:
             d_min_red = torch.full((n_total,), float('inf'), device=device)
+        torch.cuda.synchronize(device)
+        t_voronoi_red = time.perf_counter() - t0
 
+        torch.cuda.synchronize(device)
+        t0 = time.perf_counter()
         if sampled_blue_pts.numel() > 0:
             d_min_blue = get_dists(sampled_blue_pts, ws_all).min(dim=1).values
         else:
             d_min_blue = torch.full((n_total,), float('inf'), device=device)
+        torch.cuda.synchronize(device)
+        t_voronoi_blue = time.perf_counter() - t0
 
         red_c_list, red_l_list, red_p_list = [], [], []
+        t_red_dist = 0.0
+        t_red_member = 0.0
         for batch_start in range(0, N, self.batch_size):
             batch_end = min(batch_start + self.batch_size, N)
             c_ids = torch.arange(batch_start, batch_end, device=device, dtype=torch.long)
             c_pts = P_red_norm[c_ids]
+            torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
             dists = get_dists(c_pts, ws_all)
+            torch.cuda.synchronize(device)
+            t_red_dist += time.perf_counter() - t0
 
+            torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
             is_sampled = sampled_red_mask[c_ids]
             non_sampled_member = dists < d_min_red.unsqueeze(1)
             sampled_member = is_sampled.unsqueeze(0).expand(n_total, -1)
@@ -61,6 +78,8 @@ class ColorAwareClustering:
             levels = (dists / self.epsilon).long()
 
             p_idx, c_local = torch.where(member)
+            torch.cuda.synchronize(device)
+            t_red_member += time.perf_counter() - t0
             if p_idx.numel() > 0:
                 red_c_list.append(c_ids[c_local])
                 red_l_list.append(levels[p_idx, c_local])
@@ -68,12 +87,20 @@ class ColorAwareClustering:
             del dists, member, levels
 
         blue_c_list, blue_l_list, blue_p_list = [], [], []
+        t_blue_dist = 0.0
+        t_blue_member = 0.0
         for batch_start in range(0, N, self.batch_size):
             batch_end = min(batch_start + self.batch_size, N)
             c_ids = torch.arange(batch_start, batch_end, device=device, dtype=torch.long)
             c_pts = P_blue_norm[c_ids]
+            torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
             dists = get_dists(c_pts, ws_all)
+            torch.cuda.synchronize(device)
+            t_blue_dist += time.perf_counter() - t0
 
+            torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
             is_sampled = sampled_blue_mask[c_ids]
             non_sampled_member = dists < d_min_blue.unsqueeze(1)
             sampled_member = is_sampled.unsqueeze(0).expand(n_total, -1)
@@ -82,6 +109,8 @@ class ColorAwareClustering:
             levels = (dists / self.epsilon).long()
 
             p_idx, c_local = torch.where(member)
+            torch.cuda.synchronize(device)
+            t_blue_member += time.perf_counter() - t0
             if p_idx.numel() > 0:
                 blue_c_list.append(c_ids[c_local])
                 blue_l_list.append(levels[p_idx, c_local])
@@ -99,4 +128,17 @@ class ColorAwareClustering:
         b_c = _cat_or_empty(blue_c_list, device)
         b_l = _cat_or_empty(blue_l_list, device)
         b_p = _cat_or_empty(blue_p_list, device)
+        torch.cuda.synchronize(device)
+        print(
+            f"[Clustering timing | n={N} metric={self.metric} eps={self.epsilon} bs={self.batch_size}]\n"
+            f"  voronoi_red   : {t_voronoi_red:.4f}s\n"
+            f"  voronoi_blue  : {t_voronoi_blue:.4f}s\n"
+            f"  dist_red      : {t_red_dist:.4f}s\n"
+            f"  member_red    : {t_red_member:.4f}s\n"
+            f"  dist_blue     : {t_blue_dist:.4f}s\n"
+            f"  member_blue   : {t_blue_member:.4f}s\n"
+            f"  dist_total    : {t_red_dist + t_blue_dist:.4f}s\n"
+            f"  member_total  : {t_red_member + t_blue_member:.4f}s",
+            flush=True,
+        )
         return (b_c, b_l, b_p), (r_c, r_l, r_p)
