@@ -156,15 +156,13 @@ class ColorAwareTwoLevelSolver:
             torch.cumsum(a_counts_long, 0)
         ])
 
-        # ── Structure 5: d_max (per ball, initialized to 0 for non-empty balls) ────
-        shell_counts_2d = r_counts_long.view(K, L)
-        ball_sizes = torch.cumsum(shell_counts_2d, dim=1).reshape(K * L)
-        self.d_max = torch.where(
-            ball_sizes > 0,
+        # ── Structure 5: shell_max and d_max (prefix max over shells) ────
+        self.shell_max = torch.where(
+            r_counts_long > 0,
             torch.zeros(K * L, device=self.device, dtype=torch.int32),
             torch.full((K * L,), -1, device=self.device, dtype=torch.int32),
         )
-        del ball_sizes, shell_counts_2d
+        self.d_max = torch.cummax(self.shell_max.view(K, L), dim=1).values.reshape(K * L)
 
     def _iter_ball_chunks(self, bucket_ids, L, max_ball_entries):
         if bucket_ids.numel() == 0:
@@ -267,10 +265,11 @@ class ColorAwareTwoLevelSolver:
             )
 
         # Step 7 sub-timing accumulators (accumulated across all phases)
-        _s7_t_inv    = 0.0   # INV collection: offsets lookup + repeat_interleave for cq/ka/nballs
-        _s7_t_unique = 0.0   # torch.unique to compute aff_bkts
-        _s7_t_expand = 0.0   # ball expansion: repeat_interleave for exp_a and b_local
-        _s7_t_amax   = 0.0   # scatter_reduce amax for new d_max
+        _s7_t_inv    = 0.0   # INV collection: offsets lookup + repeat_interleave for affected shells
+        _s7_t_unique = 0.0   # torch.unique to compute affected shells
+        _s7_t_expand = 0.0   # shell expansion: repeat_interleave for exp_a and b_local
+        _s7_t_amax   = 0.0   # scatter_reduce amax for new shell_max
+        _s7_t_prop   = 0.0   # prefix propagation from shell_max to d_max
         _s7_phases   = 0     # number of phases where r_new.numel() > 0
 
         while True:
@@ -668,7 +667,7 @@ class ColorAwareTwoLevelSolver:
             if r_new.numel() > 0:
                 _s7_phases += 1
                 S7_CHANGED_CHUNK = 128
-                S7_MAX_BALL_ENTRIES = 2_000_000
+                S7_MAX_SHELL_ENTRIES = 2_000_000
 
                 for r_chunk_start in range(0, r_new.numel(), S7_CHANGED_CHUNK):
                     r_chunk = r_new[r_chunk_start: r_chunk_start + S7_CHANGED_CHUNK]
@@ -692,89 +691,69 @@ class ColorAwareTwoLevelSolver:
                         + gr_inv
                         - torch.repeat_interleave(seg_inv, inv_ln)
                     )
-                    bkt_sh = self.inv_a_bucket_ids[idx_ia]
-                    cq = bkt_sh // L
-                    ka = bkt_sh % L
-                    maxlv = self.max_level_per_center[cq]
+                    aff_shell_input = self.inv_a_bucket_ids[idx_ia]
 
-                    nballs = (maxlv - ka + 1).clamp(min=0)
-                    total_bup = int(nballs.sum().item())
-                    if total_bup == 0:
-                        del inv_st, inv_en, inv_ln, bkt_sh, cq, ka, maxlv, nballs
-                        _sync_if_cuda()
-                        _s7_t_inv += time.perf_counter() - _s7_t0
-                        continue
-
-                    cum_nb = torch.cumsum(nballs, 0)
-                    seg_nb = cum_nb - nballs
-                    gr_nb = _ensure_long_arange(self, '_s7_boff', total_bup, device)
-                    boff = gr_nb - torch.repeat_interleave(seg_nb, nballs)
-                    exp_cq = torch.repeat_interleave(cq, nballs)
-                    exp_ka = torch.repeat_interleave(ka, nballs)
-                    aff_bkt_input = exp_cq * L + exp_ka + boff
-
-                    del exp_cq, exp_ka, boff, cq, ka, maxlv, nballs, cum_nb, seg_nb
-                    del inv_st, inv_en, inv_ln, bkt_sh, gr_inv, idx_ia, gr_nb
+                    del inv_st, inv_en, inv_ln, gr_inv, idx_ia
                     _sync_if_cuda()
                     _s7_t_inv += time.perf_counter() - _s7_t0
 
                     _sync_if_cuda()
                     _s7_t0 = time.perf_counter()
-                    aff_bkts = torch.unique(aff_bkt_input)
+                    aff_shells = torch.unique(aff_shell_input)
                     _sync_if_cuda()
                     _s7_t_unique += time.perf_counter() - _s7_t0
-                    del aff_bkt_input
+                    del aff_shell_input
 
-                    if aff_bkts.numel() == 0:
+                    if aff_shells.numel() == 0:
                         continue
 
-                    ball_st = self.shell_red_offsets[(aff_bkts // L) * L]
-                    ball_en = self.shell_red_offsets[(aff_bkts // L) * L + (aff_bkts % L) + 1]
-                    ball_ln = ball_en - ball_st
-                    cum_ball = torch.cumsum(ball_ln, 0)
+                    shell_st = self.shell_red_offsets[aff_shells]
+                    shell_en = self.shell_red_offsets[aff_shells + 1]
+                    shell_ln = shell_en - shell_st
+                    cum_shell = torch.cumsum(shell_ln, 0)
 
-                    bkt_chunk_start = 0
-                    while bkt_chunk_start < aff_bkts.numel():
+                    shell_chunk_start = 0
+                    while shell_chunk_start < aff_shells.numel():
                         base = (
-                            int(cum_ball[bkt_chunk_start - 1].item())
-                            if bkt_chunk_start > 0
+                            int(cum_shell[shell_chunk_start - 1].item())
+                            if shell_chunk_start > 0
                             else 0
                         )
-                        bkt_chunk_end = int(
+                        shell_chunk_end = int(
                             torch.searchsorted(
-                                cum_ball,
+                                cum_shell,
                                 torch.tensor(
-                                    base + S7_MAX_BALL_ENTRIES,
+                                    base + S7_MAX_SHELL_ENTRIES,
                                     device=device,
                                     dtype=torch.long,
                                 ),
                                 right=True,
                             ).item()
                         )
-                        if bkt_chunk_end <= bkt_chunk_start:
-                            bkt_chunk_end = bkt_chunk_start + 1
+                        if shell_chunk_end <= shell_chunk_start:
+                            shell_chunk_end = shell_chunk_start + 1
 
-                        chunk_bkts = aff_bkts[bkt_chunk_start:bkt_chunk_end]
-                        chunk_ball_st = ball_st[bkt_chunk_start:bkt_chunk_end]
-                        chunk_ball_ln = ball_ln[bkt_chunk_start:bkt_chunk_end]
-                        chunk_size = chunk_bkts.numel()
-                        total_chunk = int(chunk_ball_ln.sum().item())
+                        chunk_shells = aff_shells[shell_chunk_start:shell_chunk_end]
+                        chunk_shell_st = shell_st[shell_chunk_start:shell_chunk_end]
+                        chunk_shell_ln = shell_ln[shell_chunk_start:shell_chunk_end]
+                        chunk_size = chunk_shells.numel()
+                        total_chunk = int(chunk_shell_ln.sum().item())
 
                         if total_chunk > 0:
                             _sync_if_cuda()
                             _s7_t0 = time.perf_counter()
-                            cum_cl = torch.cumsum(chunk_ball_ln, 0)
-                            seg_cl = cum_cl - chunk_ball_ln
+                            cum_cl = torch.cumsum(chunk_shell_ln, 0)
+                            seg_cl = cum_cl - chunk_shell_ln
                             gr_cl = _ensure_long_arange(self, '_s7_exp', total_chunk, device)
                             sh_idx = (
-                                torch.repeat_interleave(chunk_ball_st, chunk_ball_ln)
+                                torch.repeat_interleave(chunk_shell_st, chunk_shell_ln)
                                 + gr_cl
-                                - torch.repeat_interleave(seg_cl, chunk_ball_ln)
+                                - torch.repeat_interleave(seg_cl, chunk_shell_ln)
                             )
                             exp_a = self.shell_red_indices[sh_idx]
                             b_local = torch.repeat_interleave(
                                 torch.arange(chunk_size, device=device, dtype=torch.long),
-                                chunk_ball_ln,
+                                chunk_shell_ln,
                             )
                             _sync_if_cuda()
                             _s7_t_expand += time.perf_counter() - _s7_t0
@@ -782,21 +761,55 @@ class ColorAwareTwoLevelSolver:
                             _sync_if_cuda()
                             _s7_t0 = time.perf_counter()
                             ya_vals = self.yA[exp_a].long()
-                            new_dm = torch.full((chunk_size,), -1, device=device, dtype=torch.long)
-                            new_dm.scatter_reduce_(
+                            new_sm = torch.full((chunk_size,), -1, device=device, dtype=torch.long)
+                            new_sm.scatter_reduce_(
                                 0, b_local, ya_vals, reduce='amax', include_self=True
                             )
+                            self.shell_max[chunk_shells] = new_sm.to(torch.int32)
                             _sync_if_cuda()
                             _s7_t_amax += time.perf_counter() - _s7_t0
 
-                            self.d_max[chunk_bkts] = new_dm.to(torch.int32)
-
-                            del exp_a, b_local, ya_vals, new_dm
+                            del exp_a, b_local, ya_vals, new_sm
                             del sh_idx, cum_cl, seg_cl, gr_cl
 
-                        bkt_chunk_start = bkt_chunk_end
+                        shell_chunk_start = shell_chunk_end
 
-                    del aff_bkts, ball_st, ball_en, ball_ln, cum_ball
+                    _sync_if_cuda()
+                    _s7_t0 = time.perf_counter()
+                    aff_centers = aff_shells // L
+                    aff_levels = aff_shells % L
+                    min_level_per_center = torch.full(
+                        (self.num_active_centers,), L, device=device, dtype=torch.long
+                    )
+                    min_level_per_center.scatter_reduce_(
+                        0, aff_centers, aff_levels, reduce='amin', include_self=True
+                    )
+                    prop_centers = torch.nonzero(min_level_per_center < L).squeeze(1)
+                    if prop_centers.numel() > 0:
+                        prop_min = int(min_level_per_center[prop_centers].min().item())
+                        prop_max = int(self.max_level_per_center[prop_centers].max().item())
+                        prop_max = min(prop_max, L - 1)
+                        for k_lvl in range(prop_min, prop_max + 1):
+                            active_centers = prop_centers[
+                                (min_level_per_center[prop_centers] <= k_lvl)
+                                & (self.max_level_per_center[prop_centers] >= k_lvl)
+                            ]
+                            if active_centers.numel() == 0:
+                                continue
+                            active_bkts = active_centers * L + k_lvl
+                            if k_lvl == 0:
+                                self.d_max[active_bkts] = self.shell_max[active_bkts]
+                            else:
+                                self.d_max[active_bkts] = torch.maximum(
+                                    self.d_max[active_bkts - 1],
+                                    self.shell_max[active_bkts],
+                                )
+                            del active_centers, active_bkts
+                    _sync_if_cuda()
+                    _s7_t_prop += time.perf_counter() - _s7_t0
+
+                    del aff_shells, shell_st, shell_en, shell_ln, cum_shell
+                    del aff_centers, aff_levels, min_level_per_center, prop_centers
 
             if timing_enabled:
                 _sync_if_cuda()
@@ -807,13 +820,14 @@ class ColorAwareTwoLevelSolver:
             B_free = F_B_new
 
         _sync_if_cuda()
-        s7_total = _s7_t_inv + _s7_t_unique + _s7_t_expand + _s7_t_amax
+        s7_total = _s7_t_inv + _s7_t_unique + _s7_t_expand + _s7_t_amax + _s7_t_prop
         print(
             f"[Step 7 sub-timing | N={N} phases_with_updates={_s7_phases}]\n"
             f"  inv_collection : {_s7_t_inv:.4f}s\n"
             f"  unique_bkts    : {_s7_t_unique:.4f}s\n"
-            f"  ball_expand    : {_s7_t_expand:.4f}s\n"
+            f"  shell_expand   : {_s7_t_expand:.4f}s\n"
             f"  scatter_amax   : {_s7_t_amax:.4f}s\n"
+            f"  prefix_prop    : {_s7_t_prop:.4f}s\n"
             f"  total_accounted: {s7_total:.4f}s",
             flush=True,
         )
