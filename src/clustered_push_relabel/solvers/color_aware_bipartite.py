@@ -156,88 +156,15 @@ class ColorAwareTwoLevelSolver:
             torch.cumsum(a_counts_long, 0)
         ])
 
-        # ── Structures 5+6: ball_sizes, d_max, max_list (chunked persistent build) ────
-        num_buckets = K * L
-
+        # ── Structure 5: d_max (per ball, initialized to 0 for non-empty balls) ────
         shell_counts_2d = r_counts_long.view(K, L)
-        ball_sizes_2d = torch.cumsum(shell_counts_2d, dim=1)
-        ball_sizes = ball_sizes_2d.reshape(num_buckets)
-        self.ball_sizes = ball_sizes
-
+        ball_sizes = torch.cumsum(shell_counts_2d, dim=1).reshape(K * L)
         self.d_max = torch.where(
             ball_sizes > 0,
-            torch.zeros(num_buckets, device=self.device, dtype=torch.int32),
-            torch.full((num_buckets,), -1, device=self.device, dtype=torch.int32)
+            torch.zeros(K * L, device=self.device, dtype=torch.int32),
+            torch.full((K * L,), -1, device=self.device, dtype=torch.int32),
         )
-        self.max_list_offsets = torch.cat([
-            torch.zeros(1, device=self.device, dtype=torch.long),
-            torch.cumsum(ball_sizes, 0),
-        ])
-        total_ml_cap = int(ball_sizes.sum().item())
-        self.max_list_values = torch.full(
-            (total_ml_cap,), -1, device=self.device, dtype=torch.int32
-        )
-        self.max_list_count = ball_sizes.to(device=self.device, dtype=torch.int32)
-
-        # Populate persistent max_list with chunked vectorized writes.
-        # Initially yA(a)=0 for all A-points, so max_list(ball) = entire ball.
-        MAX_INIT_CHUNK = 8_000_000
-        total_shell = self.shell_red_indices.numel()
-        entry_centers = entry_bkt // L
-        entry_levels = self.shell_red_levels
-        entry_maxlv = self.max_level_per_center[entry_centers]
-        entry_local_rank = (
-            torch.arange(total_shell, device=self.device, dtype=torch.long)
-            - self.shell_red_offsets[entry_centers * L]
-        )
-        nballs = (entry_maxlv - entry_levels + 1).clamp(min=0)
-        total_writes = int(nballs.sum().item())
-
-        cum_nb = torch.cumsum(nballs, 0)
-        entry_chunk_start = 0
-        while entry_chunk_start < total_shell:
-            base = int(cum_nb[entry_chunk_start - 1].item()) if entry_chunk_start > 0 else 0
-            entry_chunk_end = int(
-                torch.searchsorted(
-                    cum_nb,
-                    torch.tensor(base + MAX_INIT_CHUNK, device=self.device, dtype=torch.long),
-                    right=True,
-                ).item()
-            )
-            if entry_chunk_end <= entry_chunk_start:
-                entry_chunk_end = entry_chunk_start + 1
-
-            c_nb = nballs[entry_chunk_start:entry_chunk_end]
-            c_lv = entry_levels[entry_chunk_start:entry_chunk_end]
-            c_ctr = entry_centers[entry_chunk_start:entry_chunk_end]
-            c_rank = entry_local_rank[entry_chunk_start:entry_chunk_end]
-            c_vals = self.shell_red_indices[entry_chunk_start:entry_chunk_end]
-            chunk_writes = int(c_nb.sum().item())
-
-            if chunk_writes > 0:
-                cum_c = torch.cumsum(c_nb, 0)
-                seg_c = cum_c - c_nb
-                gr = torch.arange(chunk_writes, device=self.device, dtype=torch.long)
-                ball_off = gr - torch.repeat_interleave(seg_c, c_nb)
-
-                exp_ctr = torch.repeat_interleave(c_ctr, c_nb)
-                exp_lv = torch.repeat_interleave(c_lv, c_nb)
-                exp_rank = torch.repeat_interleave(c_rank, c_nb)
-                exp_vals = torch.repeat_interleave(c_vals, c_nb)
-
-                target_k = exp_lv + ball_off
-                target_bkt = exp_ctr * L + target_k
-                write_pos = self.max_list_offsets[target_bkt] + exp_rank
-
-                self.max_list_values[write_pos] = exp_vals.to(self.max_list_values.dtype)
-
-                del exp_ctr, exp_lv, exp_rank, exp_vals, ball_off
-                del target_k, target_bkt, write_pos, cum_c, seg_c, gr
-
-            del c_nb, c_lv, c_ctr, c_rank, c_vals
-            entry_chunk_start = entry_chunk_end
-
-        del entry_bkt, entry_centers, entry_levels, entry_maxlv, entry_local_rank, nballs, cum_nb
+        del ball_sizes, shell_counts_2d
 
     def _iter_ball_chunks(self, bucket_ids, L, max_ball_entries):
         if bucket_ids.numel() == 0:
@@ -344,7 +271,6 @@ class ColorAwareTwoLevelSolver:
         _s7_t_unique = 0.0   # torch.unique to compute aff_bkts
         _s7_t_expand = 0.0   # ball expansion: repeat_interleave for exp_a and b_local
         _s7_t_amax   = 0.0   # scatter_reduce amax for new d_max
-        _s7_t_write  = 0.0   # filter is_max + bincount + argsort + write back to max_list
         _s7_phases   = 0     # number of phases where r_new.numel() > 0
 
         while True:
@@ -427,8 +353,72 @@ class ColorAwareTwoLevelSolver:
             if timing_enabled:
                 _sync_if_cuda()
                 phase_t0 = time.perf_counter()
-            ml_counts_f = self.max_list_count[cand_bkt].float()
-            has_weight = ml_counts_f > 0
+            S2_MAX_ENTRIES = 2_000_000
+
+            uniq_cand_bkt, inv_cand_bkt = torch.unique(cand_bkt, return_inverse=True)
+            max_counts_unique = torch.zeros(
+                uniq_cand_bkt.numel(), device=device, dtype=torch.long
+            )
+
+            s2_ball_st = self.shell_red_offsets[(uniq_cand_bkt // L) * L]
+            s2_ball_en = self.shell_red_offsets[
+                (uniq_cand_bkt // L) * L + (uniq_cand_bkt % L) + 1
+            ]
+            s2_ball_ln = s2_ball_en - s2_ball_st
+            s2_cum_ln = torch.cumsum(s2_ball_ln, 0)
+
+            s2_chunk_start = 0
+            while s2_chunk_start < uniq_cand_bkt.numel():
+                base_s2 = int(s2_cum_ln[s2_chunk_start - 1].item()) if s2_chunk_start > 0 else 0
+                s2_chunk_end = int(
+                    torch.searchsorted(
+                        s2_cum_ln,
+                        torch.tensor(base_s2 + S2_MAX_ENTRIES, device=device, dtype=torch.long),
+                        right=True,
+                    ).item()
+                )
+                if s2_chunk_end <= s2_chunk_start:
+                    s2_chunk_end = s2_chunk_start + 1
+
+                c_bkt = uniq_cand_bkt[s2_chunk_start:s2_chunk_end]
+                c_bst = s2_ball_st[s2_chunk_start:s2_chunk_end]
+                c_bln = s2_ball_ln[s2_chunk_start:s2_chunk_end]
+                c_size = c_bkt.numel()
+                c_total = int(c_bln.sum().item())
+
+                if c_total > 0:
+                    cum_c2 = torch.cumsum(c_bln, 0)
+                    seg_c2 = cum_c2 - c_bln
+                    gr_c2 = _ensure_long_arange(self, '_s2_exp', c_total, device)
+                    sh_c2 = (
+                        torch.repeat_interleave(c_bst, c_bln)
+                        + gr_c2
+                        - torch.repeat_interleave(seg_c2, c_bln)
+                    )
+                    exp_a_c = self.shell_red_indices[sh_c2]
+                    bl_c = torch.repeat_interleave(
+                        torch.arange(c_size, device=device, dtype=torch.long), c_bln
+                    )
+
+                    ya_c = self.yA[exp_a_c].long()
+                    dm_c = self.d_max[c_bkt[bl_c]].long()
+                    is_mx = ya_c == dm_c
+
+                    max_counts_unique[s2_chunk_start:s2_chunk_end] = torch.bincount(
+                        bl_c[is_mx], minlength=c_size
+                    )
+
+                    del exp_a_c, bl_c, ya_c, dm_c, is_mx
+                    del cum_c2, seg_c2, gr_c2, sh_c2
+
+                del c_bkt, c_bst, c_bln
+                s2_chunk_start = s2_chunk_end
+
+            max_counts_f = max_counts_unique[inv_cand_bkt].float()
+            del uniq_cand_bkt, inv_cand_bkt, max_counts_unique
+            del s2_ball_st, s2_ball_en, s2_ball_ln, s2_cum_ln
+
+            has_weight = max_counts_f > 0
             if not has_weight.any():
                 self.yB[B_free] += 1
                 _print_dual_debug(
@@ -447,13 +437,13 @@ class ColorAwareTwoLevelSolver:
                 cand_b = cand_b[has_weight]
                 cand_bkt = cand_bkt[has_weight]
                 cand_kb = cand_kb[has_weight]
-                ml_counts_f = ml_counts_f[has_weight]
+                max_counts_f = max_counts_f[has_weight]
 
             gumbel = -torch.log(
                 -torch.log(torch.rand(cand_bkt.numel(), device=device).clamp(min=1e-10))
                 + 1e-10
             )
-            scores = torch.log(ml_counts_f) + gumbel
+            scores = torch.log(max_counts_f) + gumbel
             cand_edge_idx = _ensure_long_arange(self, '_cand_edge_arange', cand_bkt.numel(), device)
 
             best_per_b = torch.full((N,), float('-inf'), device=device)
@@ -490,40 +480,102 @@ class ColorAwareTwoLevelSolver:
                     _print_phase_timing(iteration, num_free, timings, "no_chosen")
                 continue
 
-            # ── STEP 3: Proposal — each b draws one a from max_list ───────
+            # ── STEP 3: Proposal — each b draws one a from its current max set ───────
             if timing_enabled:
                 _sync_if_cuda()
                 phase_t0 = time.perf_counter()
-            ml_lens_raw = self.max_list_count[chosen_bkt].long()
-            has_entries = ml_lens_raw > 0
-            if not has_entries.all():
-                chosen_bkt = chosen_bkt[has_entries]
-                b_with_cand = b_with_cand[has_entries]
-                ml_lens_raw = ml_lens_raw[has_entries]
-                num_b_cand = b_with_cand.numel()
-                if num_b_cand == 0:
-                    self.yB[B_free] += 1
-                    _print_dual_debug(
-                        iteration,
-                        num_free,
-                        B_free,
-                        torch.empty(0, device=device, dtype=torch.long),
-                    )
-                    if timing_enabled:
-                        _sync_if_cuda()
-                        timings['s3'] = time.perf_counter() - phase_t0
-                        timings['total'] = time.perf_counter() - iter_t0
-                        _print_phase_timing(iteration, num_free, timings, "no_entries")
-                    continue
+            S3_MAX_ENTRIES = 2_000_000
 
-            ml_starts = self.max_list_offsets[chosen_bkt]
-            ml_lens = ml_lens_raw.clamp(min=1)
-            rand_idx = (torch.rand(num_b_cand, device=device) * ml_lens.float()).long()
-            rand_idx = torch.minimum(rand_idx.clamp_min(0), ml_lens - 1)
-            proposal_a = self.max_list_values[ml_starts + rand_idx].long()
-            proposal_b = b_with_cand
-            # Guard: filter any invalid proposals (should not happen after Change 1+2,
-            # but kept as a safety net)
+            proposal_a_parts = []
+            proposal_b_parts = []
+
+            # Compute ball boundaries for all chosen buckets
+            s3_ball_st = self.shell_red_offsets[(chosen_bkt // L) * L]
+            s3_ball_en = self.shell_red_offsets[(chosen_bkt // L) * L + (chosen_bkt % L) + 1]
+            s3_ball_ln = s3_ball_en - s3_ball_st
+            s3_cum_ln  = torch.cumsum(s3_ball_ln, 0)
+
+            s3_chunk_start = 0
+            while s3_chunk_start < num_b_cand:
+                base_s3 = int(s3_cum_ln[s3_chunk_start - 1].item()) if s3_chunk_start > 0 else 0
+                s3_chunk_end = int(
+                    torch.searchsorted(
+                        s3_cum_ln,
+                        torch.tensor(base_s3 + S3_MAX_ENTRIES, device=device, dtype=torch.long),
+                        right=True,
+                    ).item()
+                )
+                if s3_chunk_end <= s3_chunk_start:
+                    s3_chunk_end = s3_chunk_start + 1
+
+                c_bkt    = chosen_bkt[s3_chunk_start:s3_chunk_end]
+                c_bvals  = b_with_cand[s3_chunk_start:s3_chunk_end]
+                c_bst    = s3_ball_st[s3_chunk_start:s3_chunk_end]
+                c_bln    = s3_ball_ln[s3_chunk_start:s3_chunk_end]
+                c_size   = c_bkt.numel()
+                c_total  = int(c_bln.sum().item())
+
+                if c_total > 0:
+                    cum_c3  = torch.cumsum(c_bln, 0)
+                    seg_c3  = cum_c3 - c_bln
+                    gr_c3   = _ensure_long_arange(self, '_s3_exp', c_total, device)
+                    sh_c3   = torch.repeat_interleave(c_bst, c_bln) \
+                              + gr_c3 - torch.repeat_interleave(seg_c3, c_bln)
+                    exp_a_c = self.shell_red_indices[sh_c3]
+                    bl_c    = torch.repeat_interleave(
+                        torch.arange(c_size, device=device, dtype=torch.long), c_bln
+                    )
+
+                    ya_c  = self.yA[exp_a_c].long()
+                    dm_c  = self.d_max[c_bkt[bl_c]].long()
+                    is_mx = ya_c == dm_c
+
+                    max_a_c  = exp_a_c[is_mx]
+                    max_bl_c = bl_c[is_mx]
+
+                    if max_a_c.numel() > 0:
+                        # Gumbel-max trick: uniform random sample per ball, fully parallel
+                        gumbel_c = -torch.log(
+                            -torch.log(torch.rand(max_a_c.numel(), device=device).clamp(min=1e-10))
+                            + 1e-10
+                        )
+                        best_g = torch.full((c_size,), float('-inf'), device=device)
+                        best_g.scatter_reduce_(0, max_bl_c, gumbel_c, reduce='amax', include_self=True)
+                        is_win = gumbel_c == best_g[max_bl_c]
+
+                        win_idx = torch.full((c_size,), max_a_c.numel(), device=device, dtype=torch.long)
+                        eidx_c  = _ensure_long_arange(self, '_s3_eidx', max_a_c.numel(), device)
+                        win_idx.scatter_reduce_(
+                            0, max_bl_c[is_win], eidx_c[is_win], reduce='amin', include_self=True
+                        )
+                        valid = win_idx < max_a_c.numel()
+                        if valid.any():
+                            proposal_a_parts.append(max_a_c[win_idx[valid]])
+                            proposal_b_parts.append(c_bvals[valid])
+
+                    del exp_a_c, bl_c, ya_c, dm_c, is_mx, max_a_c, max_bl_c
+                    del cum_c3, seg_c3, gr_c3, sh_c3
+
+                del c_bkt, c_bvals, c_bst, c_bln
+                s3_chunk_start = s3_chunk_end
+
+            del s3_ball_st, s3_ball_en, s3_ball_ln, s3_cum_ln
+
+            if not proposal_a_parts:
+                self.yB[B_free] += 1
+                _print_dual_debug(iteration, num_free, B_free,
+                                  torch.empty(0, device=device, dtype=torch.long))
+                if timing_enabled:
+                    _sync_if_cuda()
+                    timings['s3'] = time.perf_counter() - phase_t0
+                    timings['total'] = time.perf_counter() - iter_t0
+                    _print_phase_timing(iteration, num_free, timings, "no_proposals")
+                continue
+
+            proposal_a = torch.cat(proposal_a_parts)
+            proposal_b = torch.cat(proposal_b_parts)
+            num_b_cand = proposal_a.numel()
+
             valid_prop = (proposal_a >= 0) & (proposal_a < self.N)
             if not valid_prop.all():
                 proposal_a = proposal_a[valid_prop]
@@ -737,36 +789,9 @@ class ColorAwareTwoLevelSolver:
                             _sync_if_cuda()
                             _s7_t_amax += time.perf_counter() - _s7_t0
 
-                            _sync_if_cuda()
-                            _s7_t0 = time.perf_counter()
-                            is_max = ya_vals == new_dm[b_local]
-                            max_a = exp_a[is_max]
-                            max_local = b_local[is_max]
-
-                            new_counts = torch.bincount(max_local, minlength=chunk_size)
-                            perm = torch.argsort(max_local, stable=True)
-                            s_local = max_local[perm]
-                            s_a = max_a[perm]
-                            grp_off = torch.cat([
-                                torch.zeros(1, device=device, dtype=torch.long),
-                                torch.cumsum(new_counts, 0),
-                            ])
-                            rank = (
-                                _ensure_long_arange(self, '_s7_rank', s_a.numel(), device)
-                                - grp_off[s_local]
-                            )
-                            write_pos = self.max_list_offsets[chunk_bkts[s_local]] + rank
-
-                            self.max_list_values[write_pos] = s_a.to(
-                                self.max_list_values.dtype
-                            )
-                            self.max_list_count[chunk_bkts] = new_counts.to(torch.int32)
                             self.d_max[chunk_bkts] = new_dm.to(torch.int32)
-                            _sync_if_cuda()
-                            _s7_t_write += time.perf_counter() - _s7_t0
 
-                            del exp_a, b_local, ya_vals, new_dm, is_max, max_a, max_local
-                            del new_counts, perm, s_local, s_a, grp_off, rank, write_pos
+                            del exp_a, b_local, ya_vals, new_dm
                             del sh_idx, cum_cl, seg_cl, gr_cl
 
                         bkt_chunk_start = bkt_chunk_end
@@ -782,14 +807,13 @@ class ColorAwareTwoLevelSolver:
             B_free = F_B_new
 
         _sync_if_cuda()
-        s7_total = _s7_t_inv + _s7_t_unique + _s7_t_expand + _s7_t_amax + _s7_t_write
+        s7_total = _s7_t_inv + _s7_t_unique + _s7_t_expand + _s7_t_amax
         print(
             f"[Step 7 sub-timing | N={N} phases_with_updates={_s7_phases}]\n"
             f"  inv_collection : {_s7_t_inv:.4f}s\n"
             f"  unique_bkts    : {_s7_t_unique:.4f}s\n"
             f"  ball_expand    : {_s7_t_expand:.4f}s\n"
             f"  scatter_amax   : {_s7_t_amax:.4f}s\n"
-            f"  filter_write   : {_s7_t_write:.4f}s\n"
             f"  total_accounted: {s7_total:.4f}s",
             flush=True,
         )
