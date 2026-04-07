@@ -596,114 +596,146 @@ class ColorAwareTwoLevelSolver:
             _print_dual_debug(iteration, num_free, F_B_new, r_new)
 
             # ── STEP 7: Incremental pre-processing update (vectorized) ────
+            if timing_enabled:
+                _sync_if_cuda()
+                phase_t0 = time.perf_counter()
             if r_new.numel() > 0:
-                if timing_enabled:
-                    _sync_if_cuda()
-                    phase_t0 = time.perf_counter()
+                S7_CHANGED_CHUNK = 128
+                S7_MAX_BALL_ENTRIES = 2_000_000
 
-                inv_st = self.inv_a_offsets[r_new]
-                inv_en = self.inv_a_offsets[r_new + 1]
-                inv_ln = inv_en - inv_st
-                total_ia = int(inv_ln.sum().item())
+                for r_chunk_start in range(0, r_new.numel(), S7_CHANGED_CHUNK):
+                    r_chunk = r_new[r_chunk_start: r_chunk_start + S7_CHANGED_CHUNK]
 
-                if total_ia > 0:
-                    cum_ia = torch.cumsum(inv_ln, 0)
-                    seg_ia = cum_ia - inv_ln
-                    gr_ia = _ensure_long_arange(self, '_s7_ia', total_ia, device)
-                    rep_ia = torch.repeat_interleave(inv_st, inv_ln)
-                    off_ia = gr_ia - torch.repeat_interleave(seg_ia, inv_ln)
-                    idx_ia = rep_ia + off_ia
+                    inv_st = self.inv_a_offsets[r_chunk]
+                    inv_en = self.inv_a_offsets[r_chunk + 1]
+                    inv_ln = inv_en - inv_st
+                    total_inv = int(inv_ln.sum().item())
+                    if total_inv == 0:
+                        continue
 
+                    cum_inv = torch.cumsum(inv_ln, 0)
+                    seg_inv = cum_inv - inv_ln
+                    gr_inv = _ensure_long_arange(self, '_s7_ia', total_inv, device)
+                    idx_ia = (
+                        torch.repeat_interleave(inv_st, inv_ln)
+                        + gr_inv
+                        - torch.repeat_interleave(seg_inv, inv_ln)
+                    )
                     bkt_sh = self.inv_a_bucket_ids[idx_ia]
                     cq = bkt_sh // L
                     ka = bkt_sh % L
                     maxlv = self.max_level_per_center[cq]
+
                     nballs = (maxlv - ka + 1).clamp(min=0)
                     total_bup = int(nballs.sum().item())
-
                     if total_bup == 0:
-                        pass
-                    else:
-                        cum_bup = torch.cumsum(nballs, 0)
-                        seg_bup = cum_bup - nballs
-                        gr_boff = _ensure_long_arange(self, '_s7_boff', total_bup, device)
-                        boff = gr_boff - torch.repeat_interleave(seg_bup, nballs)
-                        exp_cq = torch.repeat_interleave(cq, nballs)
-                        exp_ka = torch.repeat_interleave(ka, nballs)
-                        aff_bkts = torch.unique(exp_cq * L + exp_ka + boff, sorted=True)
+                        del inv_st, inv_en, inv_ln, bkt_sh, cq, ka, maxlv, nballs
+                        continue
 
-                        ball_st = self.shell_red_offsets[(aff_bkts // L) * L]
-                        ball_en = self.shell_red_offsets[aff_bkts + 1]
-                        ball_ln = ball_en - ball_st
-                        total_entries = int(ball_ln.sum().item())
+                    cum_nb = torch.cumsum(nballs, 0)
+                    seg_nb = cum_nb - nballs
+                    gr_nb = _ensure_long_arange(self, '_s7_boff', total_bup, device)
+                    boff = gr_nb - torch.repeat_interleave(seg_nb, nballs)
+                    exp_cq = torch.repeat_interleave(cq, nballs)
+                    exp_ka = torch.repeat_interleave(ka, nballs)
+                    aff_bkts = torch.unique(exp_cq * L + exp_ka + boff)
 
-                        if total_entries == 0:
-                            pass
-                        else:
-                            cum_entries = torch.cumsum(ball_ln, 0)
-                            seg_entries = cum_entries - ball_ln
-                            gr_exp = _ensure_long_arange(self, '_s7_exp', total_entries, device)
-                            rep_ball_st = torch.repeat_interleave(ball_st, ball_ln)
-                            off_exp = gr_exp - torch.repeat_interleave(seg_entries, ball_ln)
-                            sh_idx = rep_ball_st + off_exp
+                    del exp_cq, exp_ka, boff, cq, ka, maxlv, nballs, cum_nb, seg_nb
+                    del inv_st, inv_en, inv_ln, bkt_sh, gr_inv, idx_ia, gr_nb
 
-                            ball_a = self.shell_red_indices[sh_idx].long()
-                            ball_ids = _ensure_long_arange(
-                                self, '_s7_ball_local', aff_bkts.numel(), device
+                    if aff_bkts.numel() == 0:
+                        continue
+
+                    ball_st = self.shell_red_offsets[(aff_bkts // L) * L]
+                    ball_en = self.shell_red_offsets[(aff_bkts // L) * L + (aff_bkts % L) + 1]
+                    ball_ln = ball_en - ball_st
+                    cum_ball = torch.cumsum(ball_ln, 0)
+
+                    bkt_chunk_start = 0
+                    while bkt_chunk_start < aff_bkts.numel():
+                        base = (
+                            int(cum_ball[bkt_chunk_start - 1].item())
+                            if bkt_chunk_start > 0
+                            else 0
+                        )
+                        bkt_chunk_end = int(
+                            torch.searchsorted(
+                                cum_ball,
+                                torch.tensor(
+                                    base + S7_MAX_BALL_ENTRIES,
+                                    device=device,
+                                    dtype=torch.long,
+                                ),
+                                right=True,
+                            ).item()
+                        )
+                        if bkt_chunk_end <= bkt_chunk_start:
+                            bkt_chunk_end = bkt_chunk_start + 1
+
+                        chunk_bkts = aff_bkts[bkt_chunk_start:bkt_chunk_end]
+                        chunk_ball_st = ball_st[bkt_chunk_start:bkt_chunk_end]
+                        chunk_ball_ln = ball_ln[bkt_chunk_start:bkt_chunk_end]
+                        chunk_size = chunk_bkts.numel()
+                        total_chunk = int(chunk_ball_ln.sum().item())
+
+                        if total_chunk > 0:
+                            cum_cl = torch.cumsum(chunk_ball_ln, 0)
+                            seg_cl = cum_cl - chunk_ball_ln
+                            gr_cl = _ensure_long_arange(self, '_s7_exp', total_chunk, device)
+                            sh_idx = (
+                                torch.repeat_interleave(chunk_ball_st, chunk_ball_ln)
+                                + gr_cl
+                                - torch.repeat_interleave(seg_cl, chunk_ball_ln)
                             )
-                            ball_local = torch.repeat_interleave(ball_ids, ball_ln)
-                            ball_yA = self.yA[ball_a]
-
-                            new_dmax = torch.full(
-                                (aff_bkts.numel(),),
-                                torch.iinfo(self.yA.dtype).min,
-                                device=device,
-                                dtype=self.yA.dtype,
-                            )
-                            new_dmax.scatter_reduce_(
-                                0, ball_local, ball_yA, reduce='amax', include_self=False
+                            exp_a = self.shell_red_indices[sh_idx]
+                            b_local = torch.repeat_interleave(
+                                torch.arange(chunk_size, device=device, dtype=torch.long),
+                                chunk_ball_ln,
                             )
 
-                            keep_mask = ball_yA == new_dmax[ball_local]
-                            keep_local = ball_local[keep_mask]
-                            keep_vals = ball_a[keep_mask]
-                            new_counts = torch.bincount(
-                                keep_local, minlength=aff_bkts.numel()
-                            ).to(device=device, dtype=torch.long)
+                            ya_vals = self.yA[exp_a].long()
+                            new_dm = torch.full((chunk_size,), -1, device=device, dtype=torch.long)
+                            new_dm.scatter_reduce_(
+                                0, b_local, ya_vals, reduce='amax', include_self=True
+                            )
 
-                            self.d_max[aff_bkts] = new_dmax.to(self.d_max.dtype)
-                            self.max_list_count[aff_bkts] = new_counts.to(self.max_list_count.dtype)
+                            is_max = ya_vals == new_dm[b_local]
+                            max_a = exp_a[is_max]
+                            max_local = b_local[is_max]
 
-                            if keep_vals.numel() > 0:
-                                keep_order = torch.argsort(keep_local, stable=True)
-                                sorted_ball_local = keep_local[keep_order]
-                                sorted_keep_vals = keep_vals[keep_order]
-                                keep_counts = torch.bincount(
-                                    sorted_ball_local, minlength=aff_bkts.numel()
-                                ).to(device=device, dtype=torch.long)
-                                keep_offsets = torch.cat([
-                                    torch.zeros(1, device=device, dtype=torch.long),
-                                    torch.cumsum(keep_counts, 0),
-                                ])
-                                keep_rank = (
-                                    _ensure_long_arange(
-                                        self, '_s7_keep_rank', sorted_keep_vals.numel(), device
-                                    )
-                                    - keep_offsets[sorted_ball_local]
-                                )
-                                write_pos = (
-                                    self.max_list_offsets[aff_bkts[sorted_ball_local]]
-                                    + keep_rank
-                                )
-                                self.max_list_values[write_pos] = sorted_keep_vals.to(
-                                    self.max_list_values.dtype
-                                )
+                            new_counts = torch.bincount(max_local, minlength=chunk_size)
+                            perm = torch.argsort(max_local, stable=True)
+                            s_local = max_local[perm]
+                            s_a = max_a[perm]
+                            grp_off = torch.cat([
+                                torch.zeros(1, device=device, dtype=torch.long),
+                                torch.cumsum(new_counts, 0),
+                            ])
+                            rank = (
+                                _ensure_long_arange(self, '_s7_rank', s_a.numel(), device)
+                                - grp_off[s_local]
+                            )
+                            write_pos = self.max_list_offsets[chunk_bkts[s_local]] + rank
 
-                if timing_enabled:
-                    _sync_if_cuda()
-                    timings['s7'] = time.perf_counter() - phase_t0
-                    timings['total'] = time.perf_counter() - iter_t0
-                    _print_phase_timing(iteration, num_free, timings, "ok")
+                            self.max_list_values[write_pos] = s_a.to(
+                                self.max_list_values.dtype
+                            )
+                            self.max_list_count[chunk_bkts] = new_counts.to(torch.int32)
+                            self.d_max[chunk_bkts] = new_dm.to(torch.int32)
+
+                            del exp_a, b_local, ya_vals, new_dm, is_max, max_a, max_local
+                            del new_counts, perm, s_local, s_a, grp_off, rank, write_pos
+                            del sh_idx, cum_cl, seg_cl, gr_cl
+
+                        bkt_chunk_start = bkt_chunk_end
+
+                    del aff_bkts, ball_st, ball_en, ball_ln, cum_ball
+
+            if timing_enabled:
+                _sync_if_cuda()
+                timings['s7'] = time.perf_counter() - phase_t0
+                timings['total'] = time.perf_counter() - iter_t0
+                _print_phase_timing(iteration, num_free, timings, "ok")
 
             B_free = F_B_new
 

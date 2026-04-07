@@ -4,10 +4,12 @@ from ..utils.distance import TiledEuclideanKernel, TiledManhattanKernel
 
 
 class ColorAwareClustering:
-    def __init__(self, epsilon, batch_size=2048, metric='L2'):
+    def __init__(self, epsilon, batch_size=None, metric='L2'):
         self.epsilon = epsilon
-        self.batch_size = batch_size
         self.metric = metric
+        if batch_size is None:
+            batch_size = 256 if metric == 'L1' else 2048
+        self.batch_size = batch_size
 
     def run(self, P_red_norm, P_blue_norm):
         if self.metric == 'L1':
