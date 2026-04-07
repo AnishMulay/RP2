@@ -68,6 +68,8 @@ class ColorAwareTwoLevelSolver:
         r_c, r_l, r_p = red_coo
         N = self.N
 
+        torch.cuda.synchronize(self.device)
+        t0 = time.perf_counter()
         b_c_shifted = b_c + N
         all_centers = torch.cat([b_c_shifted, r_c])
         all_levels = torch.cat([b_l, r_l])
@@ -123,7 +125,11 @@ class ColorAwareTwoLevelSolver:
             reduce="amax", include_self=True
         )
         self.max_level_per_center = max_level_per_center
+        torch.cuda.synchronize(self.device)
+        t_coo = time.perf_counter() - t0
 
+        torch.cuda.synchronize(self.device)
+        t0 = time.perf_counter()
         blue_mask = ~is_red_point
         blue_centers = center_map[blue_mask]
         blue_points = all_points[blue_mask] - N
@@ -154,8 +160,12 @@ class ColorAwareTwoLevelSolver:
             torch.zeros(1, device=self.device, dtype=torch.long),
             torch.cumsum(a_counts_long, 0)
         ])
+        torch.cuda.synchronize(self.device)
+        t_inv = time.perf_counter() - t0
 
         # ── Structures 5+6: ball_sizes, d_max, max_list (chunked persistent build) ────
+        torch.cuda.synchronize(self.device)
+        t0 = time.perf_counter()
         num_buckets = K * L
 
         shell_counts_2d = r_counts_long.view(K, L)
@@ -177,10 +187,14 @@ class ColorAwareTwoLevelSolver:
             (total_ml_cap,), -1, device=self.device, dtype=torch.int32
         )
         self.max_list_count = ball_sizes.to(device=self.device, dtype=torch.int32)
+        torch.cuda.synchronize(self.device)
+        t_alloc = time.perf_counter() - t0
 
         # Populate persistent max_list chunk-by-chunk.
         # Initially yA(a)=0 for all A-points, so max_list(ball) = entire ball.
         max_init_writes = 4_000_000
+        torch.cuda.synchronize(self.device)
+        t0 = time.perf_counter()
         for q in range(K):
             center_shell_start = self.shell_red_offsets[q * L]
             center_shell_end = self.shell_red_offsets[(q + 1) * L]
@@ -232,6 +246,19 @@ class ColorAwareTwoLevelSolver:
                     self.max_list_values[write_pos] = exp_points.to(self.max_list_values.dtype)
 
                 shell_chunk_start = shell_chunk_end
+        torch.cuda.synchronize(self.device)
+        t_ml_init = time.perf_counter() - t0
+
+        torch.cuda.synchronize(self.device)
+        print(
+            f"[_build_csr_and_inv | N={self.N} K={K} L={L}]\n"
+            f"  coo_filter_sort : {t_coo:.4f}s\n"
+            f"  inv_construction: {t_inv:.4f}s\n"
+            f"  alloc           : {t_alloc:.4f}s\n"
+            f"  max_list_init   : {t_ml_init:.4f}s\n"
+            f"  total_accounted : {t_coo + t_inv + t_alloc + t_ml_init:.4f}s",
+            flush=True,
+        )
 
     def _iter_ball_chunks(self, bucket_ids, L, max_ball_entries):
         if bucket_ids.numel() == 0:
