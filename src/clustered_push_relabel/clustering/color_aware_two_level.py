@@ -4,7 +4,7 @@ from ..utils.distance import TiledEuclideanKernel, TiledManhattanKernel
 
 
 class ColorAwareClustering:
-    def __init__(self, epsilon, batch_size=256, metric='L2'):
+    def __init__(self, epsilon, batch_size=2048, metric='L2'):
         self.epsilon = epsilon
         self.batch_size = batch_size
         self.metric = metric
@@ -28,11 +28,21 @@ class ColorAwareClustering:
 
         p_sample = 1.0 / math.sqrt(n_total)
         sampled_mask = torch.bernoulli(torch.full((n_total,), p_sample, device=device)).bool()
-        sampled_pts = P_all[sampled_mask]
-        if sampled_pts.numel() > 0:
-            d_min_all = get_dists(sampled_pts, ws_all).min(dim=1).values
+        sampled_red_mask = sampled_mask[:N]
+        sampled_blue_mask = sampled_mask[N:]
+
+        sampled_red_pts = P_red_norm[sampled_red_mask]
+        sampled_blue_pts = P_blue_norm[sampled_blue_mask]
+
+        if sampled_red_pts.numel() > 0:
+            d_min_red = get_dists(sampled_red_pts, ws_all).min(dim=1).values
         else:
-            d_min_all = torch.full((n_total,), float('inf'), device=device)
+            d_min_red = torch.full((n_total,), float('inf'), device=device)
+
+        if sampled_blue_pts.numel() > 0:
+            d_min_blue = get_dists(sampled_blue_pts, ws_all).min(dim=1).values
+        else:
+            d_min_blue = torch.full((n_total,), float('inf'), device=device)
 
         red_c_list, red_l_list, red_p_list = [], [], []
         for batch_start in range(0, N, self.batch_size):
@@ -41,8 +51,8 @@ class ColorAwareClustering:
             c_pts = P_red_norm[c_ids]
             dists = get_dists(c_pts, ws_all)
 
-            is_sampled = sampled_mask[c_ids]
-            non_sampled_member = dists < d_min_all.unsqueeze(1)
+            is_sampled = sampled_red_mask[c_ids]
+            non_sampled_member = dists < d_min_red.unsqueeze(1)
             sampled_member = is_sampled.unsqueeze(0).expand(n_total, -1)
             member = sampled_member | non_sampled_member
 
@@ -61,8 +71,8 @@ class ColorAwareClustering:
             c_pts = P_blue_norm[c_ids]
             dists = get_dists(c_pts, ws_all)
 
-            is_sampled = sampled_mask[c_ids + N]
-            non_sampled_member = dists < d_min_all.unsqueeze(1)
+            is_sampled = sampled_blue_mask[c_ids]
+            non_sampled_member = dists < d_min_blue.unsqueeze(1)
             sampled_member = is_sampled.unsqueeze(0).expand(n_total, -1)
             member = sampled_member | non_sampled_member
 
