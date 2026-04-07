@@ -267,10 +267,11 @@ def main():
     print(
         f"{'n':>8}  {'delta':>12}  {'eps*delta':>12}  "
         f"{'exact_avg':>12}  {'color_avg':>12}  {'abs_err':>12}  "
-        f"{'abs_err/delta':>14}  {'rel_err_%':>10}  {'color_time_s':>14}",
+        f"{'abs_err/delta':>14}  {'rel_err_%':>10}  "
+        f"{'exact_time_s':>14}  {'color_time_s':>14}  {'speedup_x':>10}",
         flush=True,
     )
-    print("-" * 116, flush=True)
+    print("-" * 144, flush=True)
     for n in n_list:
         row = summary[n]
         delta = average_float_or_nan(row["diameter"])
@@ -280,7 +281,9 @@ def main():
         abs_err = average_float_or_nan(row["abs_error"])
         normalized_abs_err = average_float_or_nan(row["normalized_abs_error"])
         rel_err = average_float_or_nan(row["rel_error"])
+        exact_time = average_float_or_nan(row["exact_time"])
         color_time = average_float_or_nan(row["color_time"])
+        speedup = exact_time / color_time if exact_time == exact_time and color_time > 0 else float("nan")
         print(
             f"{n:>8}  "
             f"{format_summary_value(delta):>12}  "
@@ -290,7 +293,9 @@ def main():
             f"{format_summary_value(abs_err):>12}  "
             f"{format_summary_value(normalized_abs_err):>14}  "
             f"{format_summary_value(rel_err, precision=2):>10}  "
-            f"{format_summary_value(color_time):>14}",
+            f"{format_summary_value(exact_time):>14}  "
+            f"{format_summary_value(color_time):>14}  "
+            f"{format_summary_value(speedup, precision=2):>10}",
             flush=True,
         )
     f.close()
