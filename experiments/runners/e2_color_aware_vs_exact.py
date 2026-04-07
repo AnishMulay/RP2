@@ -4,6 +4,7 @@ BASE_DIR = pathlib.Path(__file__).resolve().parent.parent.parent
 #!/usr/bin/env python3
 import os, csv, time
 import argparse
+import contextlib
 import math
 import numpy as np
 import torch
@@ -95,6 +96,11 @@ def average_l1_matching_cost(P_red, P_blue, matching):
     return (P_blue - matched_red).abs().sum(dim=1).mean().item()
 
 
+def l1_diameter(P_red, P_blue):
+    P_all = torch.cat([P_red, P_blue], dim=0)
+    return (P_all.max(dim=0).values - P_all.min(dim=0).values).sum().item()
+
+
 def reset_peak_memory_stats_if_cuda(device):
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -111,13 +117,19 @@ def synchronize_if_cuda(device):
         torch.cuda.synchronize()
 
 
-def average_or_na(values):
+def average_float_or_nan(values):
     if not values:
+        return float("nan")
+    return sum(values) / len(values)
+
+
+def format_summary_value(value, precision=6, suffix=""):
+    if value != value:
         return "n/a"
-    return f"{sum(values) / len(values):.6f}"
+    return f"{value:.{precision}f}{suffix}"
 
 
-DEFAULT_N_VALUES = [500, 1000, 2000]
+DEFAULT_N_VALUES = list(range(1000, 20001, 1000))
 
 
 def main():
@@ -127,7 +139,7 @@ def main():
     group.add_argument("--min_n", type=int, help="Min N (use with --max_n, --step)")
     parser.add_argument("--max_n", type=int, help="Max N")
     parser.add_argument("--step", type=int, help="Step size")
-    parser.add_argument("--epsilon", type=float, default=0.05, help="Sinkhorn regularization (default 0.05 for L1 costs)")
+    parser.add_argument("--epsilon", type=float, default=0.05, help="Normalized clustering/push-relabel epsilon")
     parser.add_argument("--trials", type=int, default=1, help="Trials per N (different random samples)")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
     parser.add_argument("--csv", type=str, default="results_e2_color_aware.csv", help="Output CSV file")
@@ -160,16 +172,22 @@ def main():
             "exact_time": [],
             "color_cost": [],
             "color_time": [],
+            "diameter": [],
+            "abs_error": [],
+            "normalized_abs_error": [],
+            "rel_error": [],
         }
         for n in n_list
     }
     for n in n_list:
         for t in range(args.trials):
             trial_seed = base_seed + t
-            print(f"\nRunning MNIST n={n}, trial {t+1}")
+            print(f"\n[n={n} trial={t+1}/{args.trials}] loading MNIST sample", flush=True)
             red, blue = load_mnist_flat(n, seed=trial_seed, data_dir=args.data_dir)
             P_red = red.to(device)
             P_blue = blue.to(device)
+            delta = l1_diameter(P_red, P_blue)
+            summary[n]["diameter"].append(delta)
             dim = 784
             exact_cost = None
             exact_time = None
@@ -177,6 +195,7 @@ def main():
                 print("POT not installed, skipping exact OT.")
             else:
                 try:
+                    print(f"[n={n} trial={t+1}/{args.trials} solver=POT-Exact]", flush=True)
                     C = compute_cost_matrix_L1(red.numpy(), blue.numpy())
                     a = np.full(n, 1.0/n, dtype=np.float64)
                     b = np.full(n, 1.0/n, dtype=np.float64)
@@ -186,7 +205,6 @@ def main():
                     exact_time = t1 - t0
                     total_cost = float((P_plan * C).sum())
                     exact_cost = total_cost
-                    print(f"Exact cost = {exact_cost:.4f} (time {exact_time:.2f}s)")
                     summary[n]["exact_cost"].append(exact_cost)
                     summary[n]["exact_time"].append(exact_time)
                     writer.writerow([dataset_label, n, dim, args.epsilon, 2, t+1,
@@ -200,12 +218,14 @@ def main():
                                      "POT-Exact", "fail", "", "", "", "", "", "", ""])
                     f.flush()
             try:
+                print(f"[n={n} trial={t+1}/{args.trials} solver=ColorAware-2L]", flush=True)
                 reset_peak_memory_stats_if_cuda(device)
                 t_start = time.time()
                 solver = ColorAwareTwoLevelSolver(P_red, P_blue, args.epsilon, metric="L1")
                 synchronize_if_cuda(device)
                 t_mid = time.time()
-                solver.solve()
+                with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+                    solver.solve()
                 synchronize_if_cuda(device)
                 t_end = time.time()
                 total_time = t_end - t_start
@@ -229,18 +249,10 @@ def main():
             if status == "success":
                 summary[n]["color_cost"].append(cost_val)
                 summary[n]["color_time"].append(total_time)
-                abs_err_str = f"{abs_err:.6f}" if abs_err != "" else "n/a"
-                rel_err_str = f"{rel_err:.2f}%" if rel_err != "" else "n/a"
-                print(
-                    "[ColorAware-2L]\n"
-                    f"  cost        : {cost_val:.6f}\n"
-                    f"  total time  : {total_time:.4f}s\n"
-                    f"  cluster time: {clust_time:.4f}s\n"
-                    f"  solve time  : {solve_time:.4f}s\n"
-                    f"  abs error   : {abs_err_str}\n"
-                    f"  rel error   : {rel_err_str}",
-                    flush=True,
-                )
+                if abs_err != "":
+                    summary[n]["abs_error"].append(abs_err)
+                    summary[n]["normalized_abs_error"].append(abs_err / delta)
+                    summary[n]["rel_error"].append(rel_err)
             writer.writerow([dataset_label, n, dim, args.epsilon, 2, t+1,
                              "ColorAware-2L", status,
                              f"{total_time:.6f}" if not math.isnan(total_time) else "",
@@ -253,19 +265,32 @@ def main():
             f.flush()
     print("\nSummary")
     print(
-        f"{'n':>8}  {'Exact Cost':>12}  {'Exact Time (s)':>14}  "
-        f"{'Color Cost':>12}  {'Color Time (s)':>14}",
+        f"{'n':>8}  {'delta':>12}  {'eps*delta':>12}  "
+        f"{'exact_avg':>12}  {'color_avg':>12}  {'abs_err':>12}  "
+        f"{'abs_err/delta':>14}  {'rel_err_%':>10}  {'color_time_s':>14}",
         flush=True,
     )
-    print("-" * 68, flush=True)
+    print("-" * 116, flush=True)
     for n in n_list:
         row = summary[n]
+        delta = average_float_or_nan(row["diameter"])
+        eps_delta = args.epsilon * delta if delta == delta else float("nan")
+        exact_cost = average_float_or_nan(row["exact_cost"])
+        color_cost = average_float_or_nan(row["color_cost"])
+        abs_err = average_float_or_nan(row["abs_error"])
+        normalized_abs_err = average_float_or_nan(row["normalized_abs_error"])
+        rel_err = average_float_or_nan(row["rel_error"])
+        color_time = average_float_or_nan(row["color_time"])
         print(
             f"{n:>8}  "
-            f"{average_or_na(row['exact_cost']):>12}  "
-            f"{average_or_na(row['exact_time']):>14}  "
-            f"{average_or_na(row['color_cost']):>12}  "
-            f"{average_or_na(row['color_time']):>14}",
+            f"{format_summary_value(delta):>12}  "
+            f"{format_summary_value(eps_delta):>12}  "
+            f"{format_summary_value(exact_cost):>12}  "
+            f"{format_summary_value(color_cost):>12}  "
+            f"{format_summary_value(abs_err):>12}  "
+            f"{format_summary_value(normalized_abs_err):>14}  "
+            f"{format_summary_value(rel_err, precision=2):>10}  "
+            f"{format_summary_value(color_time):>14}",
             flush=True,
         )
     f.close()
