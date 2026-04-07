@@ -63,6 +63,7 @@ class ColorAwareClustering:
                 red_c_list.append(c_ids[c_local])
                 red_l_list.append(levels[p_idx, c_local])
                 red_p_list.append(p_idx)
+            del dists, member, levels
 
         blue_c_list, blue_l_list, blue_p_list = [], [], []
         for batch_start in range(0, N, self.batch_size):
@@ -83,6 +84,7 @@ class ColorAwareClustering:
                 blue_c_list.append(c_ids[c_local])
                 blue_l_list.append(levels[p_idx, c_local])
                 blue_p_list.append(p_idx)
+            del dists, member, levels
 
         def _cat_or_empty(lst, device):
             if not lst:

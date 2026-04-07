@@ -40,5 +40,4 @@ class TiledManhattanKernel:
         return {"P": P}
 
     def compute_dist_tile(self, query_points, workspace):
-        dists = torch.cdist(query_points, workspace["P"], p=1)
-        return dists.t()
+        return torch.cdist(workspace["P"], query_points, p=1)

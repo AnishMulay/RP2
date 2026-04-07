@@ -57,6 +57,7 @@ class ColorAwareTwoLevelSolver:
 
         del blue_coo, red_coo, cluster_engine, P_red_norm, P_blue_norm, P_all
         gc.collect()
+        torch.cuda.empty_cache()
         self.yA = torch.zeros(self.N, device=self.device, dtype=torch.int32)
         self.yB = torch.full((self.N,), 1, device=self.device, dtype=torch.int32)
         self.MA = torch.full((self.N,), -1, device=self.device, dtype=torch.int32)
