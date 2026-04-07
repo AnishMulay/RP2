@@ -68,8 +68,6 @@ class ColorAwareTwoLevelSolver:
         r_c, r_l, r_p = red_coo
         N = self.N
 
-        torch.cuda.synchronize(self.device)
-        t0 = time.perf_counter()
         b_c_shifted = b_c + N
         all_centers = torch.cat([b_c_shifted, r_c])
         all_levels = torch.cat([b_l, r_l])
@@ -126,11 +124,7 @@ class ColorAwareTwoLevelSolver:
             reduce="amax", include_self=True
         )
         self.max_level_per_center = max_level_per_center
-        torch.cuda.synchronize(self.device)
-        t_coo = time.perf_counter() - t0
 
-        torch.cuda.synchronize(self.device)
-        t0 = time.perf_counter()
         blue_mask = ~is_red_point
         blue_centers = center_map[blue_mask]
         blue_points = all_points[blue_mask] - N
@@ -161,12 +155,8 @@ class ColorAwareTwoLevelSolver:
             torch.zeros(1, device=self.device, dtype=torch.long),
             torch.cumsum(a_counts_long, 0)
         ])
-        torch.cuda.synchronize(self.device)
-        t_inv = time.perf_counter() - t0
 
         # ── Structures 5+6: ball_sizes, d_max, max_list (chunked persistent build) ────
-        torch.cuda.synchronize(self.device)
-        t0 = time.perf_counter()
         num_buckets = K * L
 
         shell_counts_2d = r_counts_long.view(K, L)
@@ -188,14 +178,10 @@ class ColorAwareTwoLevelSolver:
             (total_ml_cap,), -1, device=self.device, dtype=torch.int32
         )
         self.max_list_count = ball_sizes.to(device=self.device, dtype=torch.int32)
-        torch.cuda.synchronize(self.device)
-        t_alloc = time.perf_counter() - t0
 
         # Populate persistent max_list with chunked vectorized writes.
         # Initially yA(a)=0 for all A-points, so max_list(ball) = entire ball.
         MAX_INIT_CHUNK = 8_000_000
-        torch.cuda.synchronize(self.device)
-        t0 = time.perf_counter()
         total_shell = self.shell_red_indices.numel()
         entry_centers = entry_bkt // L
         entry_levels = self.shell_red_levels
@@ -252,19 +238,6 @@ class ColorAwareTwoLevelSolver:
             entry_chunk_start = entry_chunk_end
 
         del entry_bkt, entry_centers, entry_levels, entry_maxlv, entry_local_rank, nballs, cum_nb
-        torch.cuda.synchronize(self.device)
-        t_ml_init = time.perf_counter() - t0
-
-        torch.cuda.synchronize(self.device)
-        print(
-            f"[_build_csr_and_inv | N={self.N} K={K} L={L}]\n"
-            f"  coo_filter_sort : {t_coo:.4f}s\n"
-            f"  inv_construction: {t_inv:.4f}s\n"
-            f"  alloc           : {t_alloc:.4f}s\n"
-            f"  max_list_init   : {t_ml_init:.4f}s\n"
-            f"  total_accounted : {t_coo + t_inv + t_alloc + t_ml_init:.4f}s",
-            flush=True,
-        )
 
     def _iter_ball_chunks(self, bucket_ids, L, max_ball_entries):
         if bucket_ids.numel() == 0:
@@ -365,6 +338,14 @@ class ColorAwareTwoLevelSolver:
                 f"s7={timings['s7']:.4f}s total={timings['total']:.4f}s",
                 flush=True,
             )
+
+        # Step 7 sub-timing accumulators (accumulated across all phases)
+        _s7_t_inv    = 0.0   # INV collection: offsets lookup + repeat_interleave for cq/ka/nballs
+        _s7_t_unique = 0.0   # torch.unique to compute aff_bkts
+        _s7_t_expand = 0.0   # ball expansion: repeat_interleave for exp_a and b_local
+        _s7_t_amax   = 0.0   # scatter_reduce amax for new d_max
+        _s7_t_write  = 0.0   # filter is_max + bincount + argsort + write back to max_list
+        _s7_phases   = 0     # number of phases where r_new.numel() > 0
 
         while True:
             num_free = B_free.numel()
@@ -633,17 +614,22 @@ class ColorAwareTwoLevelSolver:
                 _sync_if_cuda()
                 phase_t0 = time.perf_counter()
             if r_new.numel() > 0:
+                _s7_phases += 1
                 S7_CHANGED_CHUNK = 128
                 S7_MAX_BALL_ENTRIES = 2_000_000
 
                 for r_chunk_start in range(0, r_new.numel(), S7_CHANGED_CHUNK):
                     r_chunk = r_new[r_chunk_start: r_chunk_start + S7_CHANGED_CHUNK]
 
+                    _sync_if_cuda()
+                    _s7_t0 = time.perf_counter()
                     inv_st = self.inv_a_offsets[r_chunk]
                     inv_en = self.inv_a_offsets[r_chunk + 1]
                     inv_ln = inv_en - inv_st
                     total_inv = int(inv_ln.sum().item())
                     if total_inv == 0:
+                        _sync_if_cuda()
+                        _s7_t_inv += time.perf_counter() - _s7_t0
                         continue
 
                     cum_inv = torch.cumsum(inv_ln, 0)
@@ -663,6 +649,8 @@ class ColorAwareTwoLevelSolver:
                     total_bup = int(nballs.sum().item())
                     if total_bup == 0:
                         del inv_st, inv_en, inv_ln, bkt_sh, cq, ka, maxlv, nballs
+                        _sync_if_cuda()
+                        _s7_t_inv += time.perf_counter() - _s7_t0
                         continue
 
                     cum_nb = torch.cumsum(nballs, 0)
@@ -671,10 +659,19 @@ class ColorAwareTwoLevelSolver:
                     boff = gr_nb - torch.repeat_interleave(seg_nb, nballs)
                     exp_cq = torch.repeat_interleave(cq, nballs)
                     exp_ka = torch.repeat_interleave(ka, nballs)
-                    aff_bkts = torch.unique(exp_cq * L + exp_ka + boff)
+                    aff_bkt_input = exp_cq * L + exp_ka + boff
 
                     del exp_cq, exp_ka, boff, cq, ka, maxlv, nballs, cum_nb, seg_nb
                     del inv_st, inv_en, inv_ln, bkt_sh, gr_inv, idx_ia, gr_nb
+                    _sync_if_cuda()
+                    _s7_t_inv += time.perf_counter() - _s7_t0
+
+                    _sync_if_cuda()
+                    _s7_t0 = time.perf_counter()
+                    aff_bkts = torch.unique(aff_bkt_input)
+                    _sync_if_cuda()
+                    _s7_t_unique += time.perf_counter() - _s7_t0
+                    del aff_bkt_input
 
                     if aff_bkts.numel() == 0:
                         continue
@@ -712,6 +709,8 @@ class ColorAwareTwoLevelSolver:
                         total_chunk = int(chunk_ball_ln.sum().item())
 
                         if total_chunk > 0:
+                            _sync_if_cuda()
+                            _s7_t0 = time.perf_counter()
                             cum_cl = torch.cumsum(chunk_ball_ln, 0)
                             seg_cl = cum_cl - chunk_ball_ln
                             gr_cl = _ensure_long_arange(self, '_s7_exp', total_chunk, device)
@@ -725,13 +724,21 @@ class ColorAwareTwoLevelSolver:
                                 torch.arange(chunk_size, device=device, dtype=torch.long),
                                 chunk_ball_ln,
                             )
+                            _sync_if_cuda()
+                            _s7_t_expand += time.perf_counter() - _s7_t0
 
+                            _sync_if_cuda()
+                            _s7_t0 = time.perf_counter()
                             ya_vals = self.yA[exp_a].long()
                             new_dm = torch.full((chunk_size,), -1, device=device, dtype=torch.long)
                             new_dm.scatter_reduce_(
                                 0, b_local, ya_vals, reduce='amax', include_self=True
                             )
+                            _sync_if_cuda()
+                            _s7_t_amax += time.perf_counter() - _s7_t0
 
+                            _sync_if_cuda()
+                            _s7_t0 = time.perf_counter()
                             is_max = ya_vals == new_dm[b_local]
                             max_a = exp_a[is_max]
                             max_local = b_local[is_max]
@@ -755,6 +762,8 @@ class ColorAwareTwoLevelSolver:
                             )
                             self.max_list_count[chunk_bkts] = new_counts.to(torch.int32)
                             self.d_max[chunk_bkts] = new_dm.to(torch.int32)
+                            _sync_if_cuda()
+                            _s7_t_write += time.perf_counter() - _s7_t0
 
                             del exp_a, b_local, ya_vals, new_dm, is_max, max_a, max_local
                             del new_counts, perm, s_local, s_a, grp_off, rank, write_pos
@@ -772,6 +781,18 @@ class ColorAwareTwoLevelSolver:
 
             B_free = F_B_new
 
+        _sync_if_cuda()
+        s7_total = _s7_t_inv + _s7_t_unique + _s7_t_expand + _s7_t_amax + _s7_t_write
+        print(
+            f"[Step 7 sub-timing | N={N} phases_with_updates={_s7_phases}]\n"
+            f"  inv_collection : {_s7_t_inv:.4f}s\n"
+            f"  unique_bkts    : {_s7_t_unique:.4f}s\n"
+            f"  ball_expand    : {_s7_t_expand:.4f}s\n"
+            f"  scatter_amax   : {_s7_t_amax:.4f}s\n"
+            f"  filter_write   : {_s7_t_write:.4f}s\n"
+            f"  total_accounted: {s7_total:.4f}s",
+            flush=True,
+        )
         self.cleanup_remaining_points()
 
     def cleanup_remaining_points(self):
