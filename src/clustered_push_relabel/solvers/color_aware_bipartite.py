@@ -109,6 +109,7 @@ class ColorAwareTwoLevelSolver:
         self.shell_red_indices = red_points[perm_r].to(device=self.device, dtype=torch.long)
         self.shell_red_levels = red_levels[perm_r].to(device=self.device, dtype=torch.long)
         sorted_red_buckets = red_bucket_ids[perm_r]
+        entry_bkt = sorted_red_buckets
 
         r_counts = torch.bincount(sorted_red_buckets, minlength=K * L)
         r_counts_long = r_counts.to(device=self.device, dtype=torch.long)
@@ -190,62 +191,67 @@ class ColorAwareTwoLevelSolver:
         torch.cuda.synchronize(self.device)
         t_alloc = time.perf_counter() - t0
 
-        # Populate persistent max_list chunk-by-chunk.
+        # Populate persistent max_list with chunked vectorized writes.
         # Initially yA(a)=0 for all A-points, so max_list(ball) = entire ball.
-        max_init_writes = 4_000_000
+        MAX_INIT_CHUNK = 8_000_000
         torch.cuda.synchronize(self.device)
         t0 = time.perf_counter()
-        for q in range(K):
-            center_shell_start = self.shell_red_offsets[q * L]
-            center_shell_end = self.shell_red_offsets[(q + 1) * L]
-            num_center_shell = int((center_shell_end - center_shell_start).item())
-            if num_center_shell == 0:
-                continue
+        total_shell = self.shell_red_indices.numel()
+        entry_centers = entry_bkt // L
+        entry_levels = self.shell_red_levels
+        entry_maxlv = self.max_level_per_center[entry_centers]
+        entry_local_rank = (
+            torch.arange(total_shell, device=self.device, dtype=torch.long)
+            - self.shell_red_offsets[entry_centers * L]
+        )
+        nballs = (entry_maxlv - entry_levels + 1).clamp(min=0)
+        total_writes = int(nballs.sum().item())
 
-            center_levels = self.shell_red_levels[center_shell_start:center_shell_end]
-            center_points = self.shell_red_indices[center_shell_start:center_shell_end]
-            center_local = _ensure_long_arange(
-                self, '_init_center_local', num_center_shell, self.device
+        cum_nb = torch.cumsum(nballs, 0)
+        entry_chunk_start = 0
+        while entry_chunk_start < total_shell:
+            base = int(cum_nb[entry_chunk_start - 1].item()) if entry_chunk_start > 0 else 0
+            entry_chunk_end = int(
+                torch.searchsorted(
+                    cum_nb,
+                    torch.tensor(base + MAX_INIT_CHUNK, device=self.device, dtype=torch.long),
+                    right=True,
+                ).item()
             )
-            center_max_level = self.max_level_per_center[q]
-            num_balls_each = center_max_level - center_levels + 1
-            cum_writes = torch.cumsum(num_balls_each, 0)
+            if entry_chunk_end <= entry_chunk_start:
+                entry_chunk_end = entry_chunk_start + 1
 
-            shell_chunk_start = 0
-            while shell_chunk_start < num_center_shell:
-                base_writes = int(cum_writes[shell_chunk_start - 1].item()) if shell_chunk_start > 0 else 0
-                limit_writes = base_writes + max_init_writes
-                shell_chunk_end = int(
-                    torch.searchsorted(
-                        cum_writes,
-                        torch.tensor(limit_writes, device=self.device, dtype=torch.long),
-                        right=True,
-                    ).item()
-                )
-                if shell_chunk_end <= shell_chunk_start:
-                    shell_chunk_end = shell_chunk_start + 1
+            c_nb = nballs[entry_chunk_start:entry_chunk_end]
+            c_lv = entry_levels[entry_chunk_start:entry_chunk_end]
+            c_ctr = entry_centers[entry_chunk_start:entry_chunk_end]
+            c_rank = entry_local_rank[entry_chunk_start:entry_chunk_end]
+            c_vals = self.shell_red_indices[entry_chunk_start:entry_chunk_end]
+            chunk_writes = int(c_nb.sum().item())
 
-                levels_chunk = center_levels[shell_chunk_start:shell_chunk_end]
-                local_chunk = center_local[shell_chunk_start:shell_chunk_end]
-                points_chunk = center_points[shell_chunk_start:shell_chunk_end]
-                nballs_chunk = num_balls_each[shell_chunk_start:shell_chunk_end]
-                total_writes = int(nballs_chunk.sum().item())
+            if chunk_writes > 0:
+                cum_c = torch.cumsum(c_nb, 0)
+                seg_c = cum_c - c_nb
+                gr = torch.arange(chunk_writes, device=self.device, dtype=torch.long)
+                ball_off = gr - torch.repeat_interleave(seg_c, c_nb)
 
-                if total_writes > 0:
-                    cum_nb = torch.cumsum(nballs_chunk, 0)
-                    seg_nb = cum_nb - nballs_chunk
-                    gr = _ensure_long_arange(self, '_init_write_arange', total_writes, self.device)
-                    ball_off = gr - torch.repeat_interleave(seg_nb, nballs_chunk)
+                exp_ctr = torch.repeat_interleave(c_ctr, c_nb)
+                exp_lv = torch.repeat_interleave(c_lv, c_nb)
+                exp_rank = torch.repeat_interleave(c_rank, c_nb)
+                exp_vals = torch.repeat_interleave(c_vals, c_nb)
 
-                    exp_levels = torch.repeat_interleave(levels_chunk, nballs_chunk)
-                    exp_local = torch.repeat_interleave(local_chunk, nballs_chunk)
-                    exp_points = torch.repeat_interleave(points_chunk, nballs_chunk)
+                target_k = exp_lv + ball_off
+                target_bkt = exp_ctr * L + target_k
+                write_pos = self.max_list_offsets[target_bkt] + exp_rank
 
-                    target_bkt = q * L + exp_levels + ball_off
-                    write_pos = self.max_list_offsets[target_bkt] + exp_local
-                    self.max_list_values[write_pos] = exp_points.to(self.max_list_values.dtype)
+                self.max_list_values[write_pos] = exp_vals.to(self.max_list_values.dtype)
 
-                shell_chunk_start = shell_chunk_end
+                del exp_ctr, exp_lv, exp_rank, exp_vals, ball_off
+                del target_k, target_bkt, write_pos, cum_c, seg_c, gr
+
+            del c_nb, c_lv, c_ctr, c_rank, c_vals
+            entry_chunk_start = entry_chunk_end
+
+        del entry_bkt, entry_centers, entry_levels, entry_maxlv, entry_local_rank, nballs, cum_nb
         torch.cuda.synchronize(self.device)
         t_ml_init = time.perf_counter() - t0
 
