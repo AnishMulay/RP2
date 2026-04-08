@@ -61,13 +61,13 @@ def resolve_mnist_paths(data_dir=None):
 
 
 def load_mnist_flat(n_samples, seed=0, data_dir=None):
-    """Load MNIST images, normalize pixels to [0,1], sample n_samples for red and blue."""
+    """Load MNIST images, normalize pixels to [0,1], and sample balanced red/blue sets."""
     import gzip
     img_path, lbl_path = resolve_mnist_paths(data_dir=data_dir)
     # Load images
     with gzip.open(img_path, "rb") as f:
         images = np.frombuffer(f.read(), dtype=np.uint8, offset=16).reshape(-1, 784)
-    # Load labels (in case needed for potential analysis, though not used in this experiment)
+    # Load labels for balanced per-digit sampling.
     with gzip.open(lbl_path, "rb") as f:
         labels = np.frombuffer(f.read(), dtype=np.uint8, offset=8)
     # Normalize pixel values to [0,1]
@@ -75,10 +75,31 @@ def load_mnist_flat(n_samples, seed=0, data_dir=None):
     total = images.shape[0]
     if 2 * n_samples > total:
         raise ValueError(f"Not enough MNIST images to sample {2*n_samples} (only {total} available).")
+    if n_samples % 10 != 0:
+        raise ValueError(
+            f"n_samples ({n_samples}) must be divisible by 10 for equal per-digit sampling."
+        )
+
+    samples_per_digit = n_samples // 10
     rng = np.random.RandomState(seed)
-    perm = rng.permutation(total)
-    red_idx = perm[:n_samples]
-    blue_idx = perm[n_samples:2*n_samples]
+    red_parts = []
+    blue_parts = []
+
+    for digit in range(10):
+        digit_idx = np.flatnonzero(labels == digit)
+        needed = 2 * samples_per_digit
+        if digit_idx.size < needed:
+            raise ValueError(
+                f"Not enough MNIST images for digit {digit}: need {needed}, found {digit_idx.size}."
+            )
+        chosen = rng.permutation(digit_idx)[:needed]
+        red_parts.append(chosen[:samples_per_digit])
+        blue_parts.append(chosen[samples_per_digit:])
+
+    red_idx = np.concatenate(red_parts)
+    blue_idx = np.concatenate(blue_parts)
+    rng.shuffle(red_idx)
+    rng.shuffle(blue_idx)
     red = torch.from_numpy(images[red_idx]).float()
     blue = torch.from_numpy(images[blue_idx]).float()
     return red, blue  # return flat 784-D tensors
