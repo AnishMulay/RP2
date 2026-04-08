@@ -179,7 +179,7 @@ def main():
     )
     parser.add_argument("--n_values",  type=int, nargs="+", default=None,
                         help="List of N values (default: 1000..20000 step 1000)")
-    parser.add_argument("--epsilon",   type=float, default=0.05,
+    parser.add_argument("--epsilon",   type=float, default=0.01,
                         help="Clustering epsilon (normalized; same as E2)")
     parser.add_argument("--trials",    type=int, default=1,
                         help="Independent trials per N")
