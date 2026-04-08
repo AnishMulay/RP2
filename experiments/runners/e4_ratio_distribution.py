@@ -334,7 +334,10 @@ def main():
     print(f"  Clustering done in {time.time()-t0:.2f}s  "
           f"({r_p.numel()} red edges, {b_p.numel()} blue edges)", flush=True)
 
-    # Free GPU clustering data
+    # Keep normalized tensors on CPU for kNN — proxy distances are in
+    # normalized space so true distances must be too.
+    P_red_norm_cpu  = P_red_norm.cpu()
+    P_blue_norm_cpu = P_blue_norm.cpu()
     del P_red_norm, P_blue_norm, P_all_dev
 
     # --- 3. Build inverted index (CPU, small) ---
@@ -346,13 +349,13 @@ def main():
           f"({len(p_to_red)} red-center entries, {len(p_to_blue)} blue-center entries)",
           flush=True)
 
-    # --- 4a. kNN: blue queries → red targets ---
+    # --- 4a. kNN: blue queries → red targets (in NORMALIZED space) ---
+    # Proxy distances are 2*max(k_b,k_a)*epsilon in normalized space,
+    # so true distances must also be in normalized space for the ratio to be valid.
     print(f"\nComputing kNN: blue → red (k={k_nn}) ...", flush=True)
-    blue_dev = blue.to(device)
-    red_dev  = red.to(device)
-    # True distances are in original (un-normalized) pixel space
+    blue_dev = P_blue_norm_cpu.to(device)
+    red_dev  = P_red_norm_cpu.to(device)
     knn_br_idx, knn_br_dist = knn_l1(blue_dev, red_dev, k=k_nn)
-    # knn_br_idx[i, j] = red index (0..N-1) of j-th nearest red neighbor of blue i
     del blue_dev, red_dev
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -378,14 +381,12 @@ def main():
           f"covered={len(blue_ratios)}  uncovered={blue_uncov}  zero_dist={blue_zero}",
           flush=True)
 
-    # --- 4b. kNN: red queries → blue targets ---
+    # --- 4b. kNN: red queries → blue targets (in NORMALIZED space) ---
     print(f"\nComputing kNN: red → blue (k={k_nn}) ...", flush=True)
-    red_dev2  = red.to(device)
-    blue_dev2 = blue.to(device)
+    red_dev2  = P_red_norm_cpu.to(device)
+    blue_dev2 = P_blue_norm_cpu.to(device)
     knn_rb_idx, knn_rb_dist = knn_l1(red_dev2, blue_dev2, k=k_nn)
-    # knn_rb_idx[i, j] = blue index (0..N-1) of j-th nearest blue neighbor of red i
-    # → P_all index = N + knn_rb_idx[i, j]
-    del red_dev2, blue_dev2
+    del red_dev2, blue_dev2, P_red_norm_cpu, P_blue_norm_cpu
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
