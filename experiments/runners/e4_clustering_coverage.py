@@ -82,16 +82,37 @@ def load_mnist_flat(n_samples, seed=0, data_dir=None):
 # Exact matching helper
 # ---------------------------------------------------------------------------
 
-def run_exact_matching(red_np, blue_np):
+def compute_l1_cost_chunked(red_np, blue_np, chunk_size=256):
     """
-    Returns:
-      matching: int array of length N where matching[b] = a
-                (blue index b is matched to red index a).
-      total_cost: float, total L1 transport cost (unnormalized).
-      elapsed: float seconds (solver only, not cost matrix build).
+    Compute the (N x N) L1 cost matrix row-by-row in chunks of `chunk_size`
+    rows to avoid materialising an (N, N, D) intermediate array.
+    Peak extra memory: chunk_size * N * D * 4 bytes.
+    For chunk_size=256, N=20000, D=784: ~1.6 GB — well within limits.
     """
     N = red_np.shape[0]
-    C = np.abs(red_np[:, None, :] - blue_np[None, :, :]).sum(axis=2).astype(np.float64)
+    C = np.empty((N, N), dtype=np.float64)
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        # shape: (end-start, N) — no third dimension kept in memory
+        C[start:end] = np.abs(
+            red_np[start:end, None, :].astype(np.float64) -
+            blue_np[None, :, :].astype(np.float64)
+        ).sum(axis=2)
+    return C
+
+
+def run_exact_matching(red_np, blue_np, chunk_size=256):
+    """
+    Returns:
+      matching_rb: int array of length N where matching_rb[a] = b
+                   (red point a is matched to blue point b).
+      total_cost:  float, total L1 transport cost (unnormalized).
+      elapsed:     float seconds (solver only, not cost matrix build).
+    """
+    N = red_np.shape[0]
+    print(f"    Building L1 cost matrix ({N}x{N}) in chunks of {chunk_size} ...",
+          flush=True)
+    C = compute_l1_cost_chunked(red_np, blue_np, chunk_size=chunk_size)
     a = np.full(N, 1.0 / N, dtype=np.float64)
     b = np.full(N, 1.0 / N, dtype=np.float64)
 
