@@ -240,13 +240,13 @@ def plot_distributions(blue_ratios, red_ratios, epsilon, N, out_path):
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     fig.suptitle(
         f"Proxy/True L1 Distance Ratio Distribution  (N={N}, ε={epsilon})\n"
-        f"Each query point's √N nearest cross-color neighbors",
+        f"Each query's √(2N)={k_nn} nearest neighbors among all {2*N} points",
         fontsize=13
     )
 
     for ax, ratios, label, color in [
-        (axes[0], blue_ratios, "Blue query → Red neighbors", "steelblue"),
-        (axes[1], red_ratios,  "Red query → Blue neighbors", "tomato"),
+        (axes[0], blue_ratios, "Blue query → All neighbors", "steelblue"),
+        (axes[1], red_ratios,  "Red query → All neighbors",  "tomato"),
     ]:
         ratios_arr = np.array(ratios, dtype=np.float64)
         # Clip extreme outliers for display (keep 99.5th percentile)
@@ -304,10 +304,11 @@ def main():
 
     N       = args.n
     epsilon = args.epsilon
-    k_nn    = max(1, int(math.floor(math.sqrt(N))))   # floor(sqrt(N))
+    # k = floor(sqrt(total points)) where total = 2N
+    k_nn    = max(1, int(math.floor(math.sqrt(2 * N))))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}  N={N}  ε={epsilon}  k_nn={k_nn}\n")
+    print(f"Device: {device}  N={N}  total_pts={2*N}  ε={epsilon}  k_nn={k_nn}\n")
 
     # --- 1. Load data ---
     print("Loading MNIST ...", flush=True)
@@ -318,9 +319,9 @@ def main():
     print("\nRunning clustering ...", flush=True)
     P_red_dev  = red.to(device)
     P_blue_dev = blue.to(device)
-    P_all_dev  = torch.cat([P_red_dev, P_blue_dev], dim=0)
+    P_all_dev  = torch.cat([P_red_dev, P_blue_dev], dim=0)   # (2N, D)
 
-    # L1 diameter for normalization
+    # L1 diameter for normalization (mirrors solver internals exactly)
     diameter = (P_all_dev.max(dim=0).values - P_all_dev.min(dim=0).values).sum().item()
     diameter = max(diameter, 1e-9)
     P_red_norm  = P_red_dev  / diameter
@@ -334,11 +335,10 @@ def main():
     print(f"  Clustering done in {time.time()-t0:.2f}s  "
           f"({r_p.numel()} red edges, {b_p.numel()} blue edges)", flush=True)
 
-    # Keep normalized tensors on CPU for kNN — proxy distances are in
-    # normalized space so true distances must be too.
-    P_red_norm_cpu  = P_red_norm.cpu()
-    P_blue_norm_cpu = P_blue_norm.cpu()
-    del P_red_norm, P_blue_norm, P_all_dev
+    # Keep full normalized P_all on CPU for kNN.
+    # Proxy distances live in normalized space, so true distances must too.
+    P_all_norm_cpu = torch.cat([P_red_norm, P_blue_norm], dim=0).cpu()  # (2N, D)
+    del P_red_norm, P_blue_norm, P_all_dev, P_red_dev, P_blue_dev
 
     # --- 3. Build inverted index (CPU, small) ---
     print("\nBuilding inverted index ...", flush=True)
@@ -349,80 +349,74 @@ def main():
           f"({len(p_to_red)} red-center entries, {len(p_to_blue)} blue-center entries)",
           flush=True)
 
-    # --- 4a. kNN: blue queries → red targets (in NORMALIZED space) ---
-    # Proxy distances are 2*max(k_b,k_a)*epsilon in normalized space,
-    # so true distances must also be in normalized space for the ratio to be valid.
-    print(f"\nComputing kNN: blue → red (k={k_nn}) ...", flush=True)
-    blue_dev = P_blue_norm_cpu.to(device)
-    red_dev  = P_red_norm_cpu.to(device)
-    knn_br_idx, knn_br_dist = knn_l1(blue_dev, red_dev, k=k_nn)
-    del blue_dev, red_dev
+    # --- 4. Single kNN call: all 2N points → all 2N points ---
+    # We query k_nn+1 neighbors because every point's nearest neighbor is
+    # itself (distance 0); we drop that entry after the call.
+    # Memory: (2N x 2N) float32 = (10000 x 10000) x 4 bytes = 400 MB at N=5000.
+    print(f"\nComputing kNN over all {2*N} points (k={k_nn}, +1 for self) ...", flush=True)
+    P_all_dev2 = P_all_norm_cpu.to(device)
+    knn_all_idx, knn_all_dist = knn_l1(P_all_dev2, P_all_dev2, k=k_nn + 1)
+    # knn_all_idx[i, 0] == i with dist 0.0 (self) for all i  → drop column 0
+    knn_all_idx  = knn_all_idx[:, 1:]   # (2N, k_nn)  — P_all indices of neighbors
+    knn_all_dist = knn_all_dist[:, 1:]  # (2N, k_nn)  — normalized L1 distances
+    del P_all_dev2
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    del P_all_norm_cpu
 
-    # Convert to P_all indices for blue queries: blue i → P_all index N+i
-    blue_pall = np.arange(N, 2*N, dtype=np.int64)     # (N,)
-    # Red neighbor indices are already 0..N-1 (P_all indices for red)
-    # knn_br_idx is already red P_all indices since red = 0..N-1
+    # --- 5a. Blue query points: P_all indices N..2N-1 ---
+    blue_pall      = np.arange(N, 2 * N, dtype=np.int64)       # (N,)
+    knn_blue_idx   = knn_all_idx[N:]    # (N, k_nn)  neighbor P_all indices
+    knn_blue_dist  = knn_all_dist[N:]   # (N, k_nn)
 
-    # --- 5a. Compute ratios for blue→red ---
-    print("\nComputing proxy ratios (blue → red) ...", flush=True)
+    print("\nComputing proxy ratios (blue queries → all neighbors) ...", flush=True)
     t0 = time.time()
     blue_ratios, blue_uncov, blue_zero = compute_ratios(
         query_pall_indices    = blue_pall,
-        neighbor_pall_indices = knn_br_idx,
-        true_dists_np         = knn_br_dist,
+        neighbor_pall_indices = knn_blue_idx,
+        true_dists_np         = knn_blue_dist,
         p_to_red              = p_to_red,
         p_to_blue             = p_to_blue,
         epsilon               = epsilon,
-        label                 = "blue→red",
+        label                 = "blue→all",
     )
     print(f"  Done in {time.time()-t0:.2f}s  "
           f"covered={len(blue_ratios)}  uncovered={blue_uncov}  zero_dist={blue_zero}",
           flush=True)
 
-    # --- 4b. kNN: red queries → blue targets (in NORMALIZED space) ---
-    print(f"\nComputing kNN: red → blue (k={k_nn}) ...", flush=True)
-    red_dev2  = P_red_norm_cpu.to(device)
-    blue_dev2 = P_blue_norm_cpu.to(device)
-    knn_rb_idx, knn_rb_dist = knn_l1(red_dev2, blue_dev2, k=k_nn)
-    del red_dev2, blue_dev2, P_red_norm_cpu, P_blue_norm_cpu
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+    # --- 5b. Red query points: P_all indices 0..N-1 ---
+    red_pall       = np.arange(0, N, dtype=np.int64)            # (N,)
+    knn_red_idx    = knn_all_idx[:N]    # (N, k_nn)
+    knn_red_dist   = knn_all_dist[:N]   # (N, k_nn)
 
-    red_pall = np.arange(0, N, dtype=np.int64)                  # (N,) red P_all indices
-    knn_rb_pall = knn_rb_idx + N                                  # (N, k) blue P_all indices
-
-    # --- 5b. Compute ratios for red→blue ---
-    print("\nComputing proxy ratios (red → blue) ...", flush=True)
+    print("\nComputing proxy ratios (red queries → all neighbors) ...", flush=True)
     t0 = time.time()
     red_ratios, red_uncov, red_zero = compute_ratios(
         query_pall_indices    = red_pall,
-        neighbor_pall_indices = knn_rb_pall,
-        true_dists_np         = knn_rb_dist,
+        neighbor_pall_indices = knn_red_idx,
+        true_dists_np         = knn_red_dist,
         p_to_red              = p_to_red,
         p_to_blue             = p_to_blue,
         epsilon               = epsilon,
-        label                 = "red→blue",
+        label                 = "red→all",
     )
     print(f"  Done in {time.time()-t0:.2f}s  "
           f"covered={len(red_ratios)}  uncovered={red_uncov}  zero_dist={red_zero}",
           flush=True)
 
     # --- 6. Summary statistics ---
+    total_pairs = N * k_nn
     print("\n" + "=" * 60)
-    print(f"{'':30s}  {'blue→red':>12}  {'red→blue':>12}")
-    print("-" * 60)
     for label, ratios, uncov, zero in [
-        ("blue→red", blue_ratios, blue_uncov, blue_zero),
-        ("red→blue", red_ratios,  red_uncov,  red_zero),
+        ("blue→all", blue_ratios, blue_uncov, blue_zero),
+        ("red→all",  red_ratios,  red_uncov,  red_zero),
     ]:
         if ratios:
             arr = np.array(ratios)
             print(f"\n  [{label}]")
-            print(f"    total pairs   : {N * k_nn}")
-            print(f"    covered       : {len(ratios)}  ({100*len(ratios)/(N*k_nn):.1f}%)")
-            print(f"    uncovered     : {uncov}  ({100*uncov/(N*k_nn):.1f}%)")
+            print(f"    total pairs   : {total_pairs}")
+            print(f"    covered       : {len(ratios)}  ({100*len(ratios)/total_pairs:.1f}%)")
+            print(f"    uncovered     : {uncov}  ({100*uncov/total_pairs:.1f}%)")
             print(f"    zero-dist skip: {zero}")
             print(f"    ratio mean    : {arr.mean():.4f}")
             print(f"    ratio median  : {np.median(arr):.4f}")
