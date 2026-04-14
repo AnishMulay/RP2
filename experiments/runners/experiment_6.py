@@ -24,6 +24,7 @@ N_VALUES = [50_000, 100_000, 200_000]
 EPSILON = 0.01
 SYNTHETIC_DIM = 2
 SEED = 42
+BATCH_SIZE = 512
 WARMUP_RUNS = 3
 TIMED_RUNS = 5
 
@@ -131,9 +132,15 @@ def benchmark_run(model, P_red, P_blue):
 
 def method_factories():
     return [
-        ("FastGPUClustering", lambda: FastGPUClustering(epsilon=EPSILON)),
-        ("ColorAwareClustering", lambda: ColorAwareClustering(epsilon=EPSILON)),
-        ("SimpleClustering", lambda: SimpleClustering()),
+        (
+            "FastGPUClustering",
+            lambda: FastGPUClustering(epsilon=EPSILON, batch_size=BATCH_SIZE),
+        ),
+        (
+            "ColorAwareClustering",
+            lambda: ColorAwareClustering(epsilon=EPSILON, batch_size=BATCH_SIZE),
+        ),
+        ("SimpleClustering", lambda: SimpleClustering(tile_size=BATCH_SIZE)),
     ]
 
 
@@ -178,7 +185,7 @@ def main():
     ]
     rows = []
 
-    print(f"Device: {device}  epsilon={EPSILON}")
+    print(f"Device: {device}  epsilon={EPSILON}  batch_size={BATCH_SIZE}")
     print(f"Warmup runs: {WARMUP_RUNS}  timed runs: {TIMED_RUNS}")
 
     for dataset_name, loader in datasets:
