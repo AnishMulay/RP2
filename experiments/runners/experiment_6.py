@@ -15,7 +15,7 @@ SRC_DIR = BASE_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from clustered_push_relabel.clustering.color_aware_two_level import ColorAwareClustering
+# from clustered_push_relabel.clustering.color_aware_two_level import ColorAwareClustering
 from clustered_push_relabel.clustering.simple import SimpleClustering
 from clustered_push_relabel.clustering.two_level import FastGPUClustering
 
@@ -136,10 +136,10 @@ def method_factories():
             "FastGPUClustering",
             lambda: FastGPUClustering(epsilon=EPSILON, batch_size=BATCH_SIZE),
         ),
-        (
-            "ColorAwareClustering",
-            lambda: ColorAwareClustering(epsilon=EPSILON, batch_size=BATCH_SIZE),
-        ),
+        # (
+        #     "ColorAwareClustering",
+        #     lambda: ColorAwareClustering(epsilon=EPSILON, batch_size=BATCH_SIZE),
+        # ),
         ("SimpleClustering", lambda: SimpleClustering(tile_size=BATCH_SIZE)),
     ]
 
@@ -149,7 +149,7 @@ def print_table(rows):
         ("Dataset", 11),
         ("N", 7),
         ("FastGPUClustering", 19),
-        ("ColorAwareClustering", 21),
+        # ("ColorAwareClustering", 21),
         ("SimpleClustering", 18),
     ]
     header_line = " | ".join(
@@ -165,7 +165,6 @@ def print_table(rows):
             f"{row['dataset']:<11} | "
             f"{row['n']:>7,} | "
             f"{row['FastGPUClustering']:>16.1f} ms | "
-            f"{row['ColorAwareClustering']:>18.1f} ms | "
             f"{row['SimpleClustering']:>15.1f} ms"
         )
 
