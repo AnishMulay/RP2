@@ -20,7 +20,7 @@ from clustered_push_relabel.clustering.simple import SimpleClustering
 from clustered_push_relabel.clustering.two_level import FastGPUClustering
 
 
-N_VALUES = [1000, 5000, 10000]
+N_VALUES = [50_000, 100_000, 200_000]
 EPSILON = 0.01
 SYNTHETIC_DIM = 2
 SEED = 42
@@ -174,7 +174,7 @@ def main():
 
     datasets = [
         ("Synthetic", generate_synthetic_2d),
-        ("MNIST", load_mnist_pair),
+        # ("MNIST", load_mnist_pair),
     ]
     rows = []
 
