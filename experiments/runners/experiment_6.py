@@ -15,14 +15,13 @@ SRC_DIR = BASE_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from clustered_push_relabel.clustering.k_level import FastGPUMultiLevelClustering
+from clustered_push_relabel.clustering.color_aware_two_level import ColorAwareClustering
 from clustered_push_relabel.clustering.simple import SimpleClustering
 from clustered_push_relabel.clustering.two_level import FastGPUClustering
 
 
 N_VALUES = [1000, 5000, 10000]
 EPSILON = 0.01
-K_LEVELS = 4
 SYNTHETIC_DIM = 2
 SEED = 42
 WARMUP_RUNS = 3
@@ -133,10 +132,7 @@ def benchmark_run(model, P_red, P_blue):
 def method_factories():
     return [
         ("FastGPUClustering", lambda: FastGPUClustering(epsilon=EPSILON)),
-        (
-            "FastGPUMultiLevel",
-            lambda: FastGPUMultiLevelClustering(epsilon=EPSILON, k=K_LEVELS),
-        ),
+        ("ColorAwareClustering", lambda: ColorAwareClustering(epsilon=EPSILON)),
         ("SimpleClustering", lambda: SimpleClustering()),
     ]
 
@@ -146,7 +142,7 @@ def print_table(rows):
         ("Dataset", 11),
         ("N", 7),
         ("FastGPUClustering", 19),
-        ("FastGPUMultiLevel", 19),
+        ("ColorAwareClustering", 21),
         ("SimpleClustering", 18),
     ]
     header_line = " | ".join(
@@ -162,7 +158,7 @@ def print_table(rows):
             f"{row['dataset']:<11} | "
             f"{row['n']:>7,} | "
             f"{row['FastGPUClustering']:>16.1f} ms | "
-            f"{row['FastGPUMultiLevel']:>16.1f} ms | "
+            f"{row['ColorAwareClustering']:>18.1f} ms | "
             f"{row['SimpleClustering']:>15.1f} ms"
         )
 
@@ -182,7 +178,7 @@ def main():
     ]
     rows = []
 
-    print(f"Device: {device}  epsilon={EPSILON}  k={K_LEVELS}")
+    print(f"Device: {device}  epsilon={EPSILON}")
     print(f"Warmup runs: {WARMUP_RUNS}  timed runs: {TIMED_RUNS}")
 
     for dataset_name, loader in datasets:
