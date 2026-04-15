@@ -39,9 +39,12 @@ class SimpleClustering:
     computed in O(M) with a vectorised cummax, no sort needed.
     """
 
-    def __init__(self, tile_size: int = 2048):
+    def __init__(self, epsilon: float, tile_size: int = 2048):
         if tile_size <= 0:
             raise ValueError("tile_size must be positive")
+        if epsilon <= 0:
+            raise ValueError("epsilon must be positive")
+        self.epsilon = float(epsilon)
         self.tile_size = int(tile_size)
 
     # ── Public interface ──────────────────────────────────────────────────────
@@ -59,16 +62,20 @@ class SimpleClustering:
             sampled_idx  (S,)    indices into A of sampled red centers
             A_sampled    (S, d)  coordinates of sampled red centers
             DR           (S, N)  DR[i,j] = d(A_sampled[i], A[j])
+            DR_int       (S, N)  floor(DR / epsilon)  (int32)
             DB           (N, S)  DB[b,s] = d(B[b], A_sampled[s])
             d_min_b      (N,)    d(B[b], nearest sampled red)
+            d_min_b_int  (N,)    floor(d_min_b / epsilon)  (int32)
             nearest_s    (N,)    index into sampled_idx for each blue
             adj_ptr      (N+1,)  CSR row pointers  (int64)
             adj_col      (M,)    red indices per blue in CSR order  (int64)
+            adj_dist_int (M,)    floor(d(B[b], A[a]) / epsilon) for CSR entries
         """
         _validate(A, B)
         device = A.device
         N      = A.shape[0]
         T      = self.tile_size
+        eps    = self.epsilon
 
         # ── 1. Sample red centers  w.p. 1/√N ─────────────────────────────────
         sample_mask = torch.rand(N, device=device) < (1.0 / math.sqrt(N))
@@ -83,6 +90,8 @@ class SimpleClustering:
         DB = torch.cdist(B,  A_s,
                          compute_mode="use_mm_for_euclid_dist_if_necessary")  # (N, S)
         d_min_b, nearest_s = DB.min(dim=1)                     # (N,)  each
+        DR_int      = (DR      / eps).floor_().to(torch.int32)  # (S, N)
+        d_min_b_int = (d_min_b / eps).floor_().to(torch.int32)  # (N,)
 
         # ── 3. Pre-computed norms and threshold ───────────────────────────────
         d_min_b_sq = d_min_b.pow(2)            # (N,)  threshold per blue
@@ -114,12 +123,13 @@ class SimpleClustering:
         adj_ptr[1:] = counts.cumsum(0)
         M           = int(adj_ptr[-1].item())
         adj_col     = torch.empty(M, dtype=torch.long, device=device)
+        adj_dist_int = torch.empty(M, dtype=torch.int32, device=device)
         del counts
 
         if M == 0:
             del float_buf, bool_buf
-            return _pack(sampled_idx, A_s, DR, DB, d_min_b, nearest_s,
-                         adj_ptr, adj_col)
+            return _pack(sampled_idx, A_s, DR, DR_int, DB, d_min_b,
+                         d_min_b_int, nearest_s, adj_ptr, adj_col, adj_dist_int)
 
         # ── 7. Pass 2: fill adj_col in CSR order ──────────────────────────────
         # cursor[b] = next write position for blue point b.
@@ -142,14 +152,18 @@ class SimpleClustering:
 
             # Write positions: cursor[b] + intra-group offset of this pair
             # (no sort needed — b_idx is already sorted)
-            write_pos       = cursor[b_idx] + _group_offsets(b_idx)
-            adj_col[write_pos] = (t_idx + start).long()
+            write_pos           = cursor[b_idx] + _group_offsets(b_idx)
+            adj_col[write_pos]  = (t_idx + start).long()
+            adj_dist_int[write_pos] = (
+                torch.sqrt(float_buf[:, :t][b_idx, t_idx]) / eps
+            ).floor_().to(torch.int32)
 
             # Advance cursor for every blue point that received pairs this tile
             cursor.scatter_add_(0, b_idx, torch.ones_like(b_idx))
 
         del float_buf, bool_buf, cursor
-        return _pack(sampled_idx, A_s, DR, DB, d_min_b, nearest_s, adj_ptr, adj_col)
+        return _pack(sampled_idx, A_s, DR, DR_int, DB, d_min_b, d_min_b_int,
+                     nearest_s, adj_ptr, adj_col, adj_dist_int)
 
     def get_adj(self, b: int, result: Dict) -> torch.Tensor:
         """Zero-copy adjacency slice for blue point b (no data movement)."""
@@ -247,15 +261,18 @@ def _group_offsets(b_idx: torch.Tensor) -> torch.Tensor:
     return cumsum - baseline
 
 
-def _pack(sampled_idx, A_s, DR, DB, d_min_b, nearest_s,
-          adj_ptr, adj_col) -> Dict[str, torch.Tensor]:
+def _pack(sampled_idx, A_s, DR, DR_int, DB, d_min_b, d_min_b_int, nearest_s,
+          adj_ptr, adj_col, adj_dist_int) -> Dict[str, torch.Tensor]:
     return {
         "sampled_idx" : sampled_idx,
         "A_sampled"   : A_s,
         "DR"          : DR,
+        "DR_int"      : DR_int,
         "DB"          : DB,
         "d_min_b"     : d_min_b,
+        "d_min_b_int" : d_min_b_int,
         "nearest_s"   : nearest_s,
         "adj_ptr"     : adj_ptr,
         "adj_col"     : adj_col,
+        "adj_dist_int": adj_dist_int,
     }
