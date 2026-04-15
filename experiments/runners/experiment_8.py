@@ -156,12 +156,18 @@ def result_na():
 
 def run_method(n, method_name, P_red, P_blue, device):
     try:
+        print(f"  Running {method_name} for N={n:,}...", flush=True)
         if method_name == "Exact":
             time_ms, total_cost, avg_cost = benchmark_exact(P_red, P_blue)
         elif method_name == "Simple":
             time_ms, total_cost, avg_cost = benchmark_simple(P_red, P_blue, device)
         else:
             raise ValueError(f"Unknown method: {method_name}")
+        print(
+            f"  Completed {method_name} for N={n:,}: "
+            f"{time_ms:.1f} ms, avg_cost={avg_cost:.4f}",
+            flush=True,
+        )
         return {
             "time_ms": time_ms,
             "total_cost": total_cost,
@@ -245,8 +251,16 @@ def main():
     if device.type == "cuda":
         torch.cuda.manual_seed_all(SEED)
 
+    print("Experiment 8: Simple vs Exact, Synthetic 2D", flush=True)
+    print(f"Device: {device}", flush=True)
+    print(f"Seed: {SEED}", flush=True)
+    print(f"N values: {', '.join(f'{n:,}' for n in N_VALUES)}", flush=True)
+    print(f"Warmup runs: {WARMUP_RUNS}  Timed runs: {TIMED_RUNS}", flush=True)
+    print(f"Methods: {', '.join(METHODS)}", flush=True)
+
     rows = []
     for n in N_VALUES:
+        print(f"\nPreparing Synthetic 2D data for N={n:,}...", flush=True)
         try:
             P_red, P_blue = generate_synthetic_2d(n, device)
         except Exception as exc:
@@ -260,6 +274,7 @@ def main():
             empty_cache_if_cuda(device)
             continue
 
+        print(f"Generated Synthetic 2D data for N={n:,}.", flush=True)
         results = {}
         for method_name in METHODS:
             results[method_name] = run_method(n, method_name, P_red, P_blue, device)
