@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import contextlib
 import math
 import os
 import pathlib
@@ -26,14 +25,14 @@ from clustered_push_relabel.solvers.color_aware_bipartite import ColorAwareTwoLe
 from clustered_push_relabel.solvers.simple_bipartite import SimpleGPUSolver
 
 
-N_VALUES = [1_000, 5_000, 10_000]
+N_VALUES = [2_000]
 EPSILON = 0.01
 SYNTHETIC_DIM = 2
 SEED = 42
 BATCH_SIZE = 512
-WARMUP_RUNS = 3
-TIMED_RUNS = 5
-METHODS = ["Exact", "ColorAware", "Simple"]
+WARMUP_RUNS = 0
+TIMED_RUNS = 1
+METHODS = ["ColorAware", "Simple"]
 
 
 def resolve_mnist_paths(data_dir=None):
@@ -146,12 +145,6 @@ def solver_matching(solver):
     return solver.MB
 
 
-def solve_quietly(solver):
-    with open(os.devnull, "w") as devnull:
-        with contextlib.redirect_stdout(devnull):
-            solver.solve()
-
-
 def benchmark_exact(P_red, P_blue):
     if ot is None:
         raise RuntimeError("POT is not installed; exact solver unavailable.")
@@ -186,7 +179,7 @@ def benchmark_solver(P_red, P_blue, device, factory):
         empty_cache_if_cuda(device)
         solver = factory()
         synchronize_if_cuda(device)
-        solve_quietly(solver)
+        solver.solve()
         synchronize_if_cuda(device)
         del solver
 
@@ -197,7 +190,7 @@ def benchmark_solver(P_red, P_blue, device, factory):
         solver = factory()
         synchronize_if_cuda(device)
         t0 = time.perf_counter()
-        solve_quietly(solver)
+        solver.solve()
         synchronize_if_cuda(device)
         t1 = time.perf_counter()
         costs.append(average_l2_matching_cost(P_red, P_blue, solver_matching(solver)))
@@ -220,7 +213,9 @@ def run_method(method_name, P_red, P_blue, device):
                 P_red,
                 P_blue,
                 device,
-                lambda: ColorAwareTwoLevelSolver(P_red, P_blue, EPSILON, metric="L2"),
+                lambda: ColorAwareTwoLevelSolver(
+                    P_red, P_blue, EPSILON, metric="L2", verbose=True
+                ),
             )
         elif method_name == "Simple":
             time_ms, cost = benchmark_solver(
@@ -228,7 +223,7 @@ def run_method(method_name, P_red, P_blue, device):
                 P_blue,
                 device,
                 lambda: SimpleGPUSolver(
-                    P_red, P_blue, EPSILON, batch_size=BATCH_SIZE
+                    P_red, P_blue, EPSILON, batch_size=BATCH_SIZE, verbose=True
                 ),
             )
         else:
@@ -257,13 +252,8 @@ def format_cost(value):
 
 
 def print_table(rows, metric_key, title, formatter):
-    headers = [
-        ("Dataset", 11),
-        ("N", 7),
-        ("Exact", 13),
-        ("ColorAware", 13),
-        ("Simple", 13),
-    ]
+    headers = [("Dataset", 11), ("N", 7)]
+    headers.extend((method_name, 13) for method_name in METHODS)
     print()
     print(title)
     header_line = " | ".join(
@@ -274,13 +264,15 @@ def print_table(rows, metric_key, title, formatter):
     print(header_line)
     print(separator)
     for row in rows:
-        print(
-            f"{row['dataset']:<11} | "
-            f"{row['n']:>7,} | "
-            f"{formatter(row['results']['Exact'][metric_key]):>13} | "
-            f"{formatter(row['results']['ColorAware'][metric_key]):>13} | "
-            f"{formatter(row['results']['Simple'][metric_key]):>13}"
+        cells = [
+            f"{row['dataset']:<11}",
+            f"{row['n']:>7,}",
+        ]
+        cells.extend(
+            f"{formatter(row['results'][method_name][metric_key]):>13}"
+            for method_name in METHODS
         )
+        print(" | ".join(cells))
 
 
 def main():
@@ -291,11 +283,6 @@ def main():
         torch.cuda.manual_seed_all(SEED)
 
     datasets = [("Synthetic", generate_synthetic_2d)]
-    try:
-        resolve_mnist_paths()
-        datasets.append(("MNIST", load_mnist_pair))
-    except FileNotFoundError as exc:
-        print(f"Warning: {exc} Skipping MNIST.", flush=True)
 
     print(f"Device: {device}  epsilon={EPSILON}  batch_size={BATCH_SIZE}")
     print(f"Warmup runs: {WARMUP_RUNS}  timed runs: {TIMED_RUNS}")

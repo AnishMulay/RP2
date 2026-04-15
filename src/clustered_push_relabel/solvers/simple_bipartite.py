@@ -120,6 +120,14 @@ class SimpleGPUSolver:
         B_free = torch.arange(N, device=device, dtype=torch.long)
         iteration = 0
 
+        def _print_progress(iteration, free_before, free_after, status):
+            if self.verbose and iteration % 100 == 0:
+                print(
+                    f"[Simple iter {iteration}] free_before={free_before} "
+                    f"free_after={free_after} status={status}",
+                    flush=True,
+                )
+
         while True:
             num_free = B_free.numel()
             if num_free <= self.epsilon_int:
@@ -127,9 +135,6 @@ class SimpleGPUSolver:
             if iteration >= self.max_iters:
                 break
             iteration += 1
-
-            if self.verbose and iteration % 100 == 0:
-                print(f"[Simple iter {iteration}] free={num_free}")
 
             pair_inverse, set1_counts, set1_offsets, set1_values = (
                 self._set1_groups(B_free)
@@ -165,6 +170,7 @@ class SimpleGPUSolver:
 
             if not proposal_a_parts:
                 self.y_B[B_free] += 1
+                _print_progress(iteration, num_free, num_free, "no_proposals")
                 continue
 
             proposal_a = torch.cat(proposal_a_parts)
@@ -174,6 +180,7 @@ class SimpleGPUSolver:
 
             if r_new.numel() == 0:
                 self.y_B[B_free] += 1
+                _print_progress(iteration, num_free, num_free, "no_accepts")
                 continue
 
             F_B_new = self._update_matching(B_free, r_new, b_new)
@@ -182,6 +189,7 @@ class SimpleGPUSolver:
             self.y_A[r_new] -= 1
             self.V[:, r_new] -= 1
 
+            _print_progress(iteration, num_free, F_B_new.numel(), "ok")
             B_free = F_B_new
 
         self.iterations = iteration
