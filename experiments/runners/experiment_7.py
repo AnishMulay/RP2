@@ -25,14 +25,14 @@ from clustered_push_relabel.solvers.color_aware_bipartite import ColorAwareTwoLe
 from clustered_push_relabel.solvers.simple_bipartite import SimpleGPUSolver
 
 
-N_VALUES = [1_000, 5_000, 10_000]
+N_VALUES = [2_000]
 EPSILON = 0.01
 SYNTHETIC_DIM = 2
 SEED = 42
 BATCH_SIZE = 512
-WARMUP_RUNS = 1
-TIMED_RUNS = 3
-METHODS = ["Exact", "ColorAware", "Simple"]
+WARMUP_RUNS = 0
+TIMED_RUNS = 1
+METHODS = ["ColorAware", "Simple"]
 
 
 def resolve_mnist_paths(data_dir=None):
@@ -283,11 +283,6 @@ def main():
         torch.cuda.manual_seed_all(SEED)
 
     datasets = [("Synthetic", generate_synthetic_2d)]
-    try:
-        resolve_mnist_paths()
-        datasets.append(("MNIST", load_mnist_pair))
-    except FileNotFoundError as exc:
-        print(f"Warning: {exc} Skipping MNIST.", flush=True)
 
     print(f"Device: {device}  epsilon={EPSILON}  batch_size={BATCH_SIZE}")
     print(f"Warmup runs: {WARMUP_RUNS}  timed runs: {TIMED_RUNS}")
