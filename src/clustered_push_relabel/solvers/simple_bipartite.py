@@ -620,13 +620,52 @@ class SimpleGPUSolver:
                 "check3_max": None,
             }
 
-        # Actual float cost then discretize for comparison with integer duals
-        actual_dists = torch.norm(
-            self.P_blue[matched_b] - self.P_red[matched_a], p=2, dim=1
+        # ── Determine proxy cost for each matched edge ────────────────────────
+        # Step 1: encode all CSR entries as b*N + a for O(M) membership lookup
+        N = self.N
+        all_b_for_adj = torch.repeat_interleave(
+            torch.arange(N, device=device, dtype=torch.long),
+            self.adj_ptr[1:] - self.adj_ptr[:-1],
         )
-        cost_int = (actual_dists / self.epsilon).floor_().to(torch.long)
+        adj_keys = all_b_for_adj * N + self.adj_col  # (M,) unique keys
+
+        # Step 2: encode matched pairs the same way
+        matched_keys = matched_b * N + matched_a  # (num_matched,)
+
+        # Step 3: membership test — which matched pairs are in the adj list
+        in_adj = torch.isin(matched_keys, adj_keys)  # (num_matched,) bool
+
+        # Step 4: for in-adj pairs, retrieve adj_dist_int via sorted binary search
+        proxy_cost = torch.zeros(matched_b.numel(), device=device, dtype=torch.long)
+
+        if in_adj.any():
+            sort_idx     = torch.argsort(adj_keys)
+            sorted_keys  = adj_keys[sort_idx]
+            sorted_dists = self.adj_dist_int[sort_idx].to(torch.long)
+            pos = torch.searchsorted(sorted_keys, matched_keys[in_adj])
+            proxy_cost[in_adj] = sorted_dists[pos]
+
+        # Step 5: for non-adj pairs, use triangle proxy through nearest sampled center
+        #   proxy = d_min_b_int[b] + DR_int[nearest_s[b]][a]
+        #   DR_int[s][a] = y_A[a] - V[s][a]   (V definition: V[s][a] = y_A[a] - DR_int[s][a])
+        if (~in_adj).any():
+            na_b = matched_b[~in_adj]
+            na_a = matched_a[~in_adj]
+            s_na = self.nearest_s[na_b]
+            dr_int_na = (
+                self.y_A[na_a].to(torch.long)
+                - self.V[s_na, na_a].to(torch.long)
+            )
+            proxy_cost[~in_adj] = (
+                self.d_min_b_int[na_b].to(torch.long) + dr_int_na
+            )
+
+        # Step 6: compute slack against proxy cost
+        #   For phase-matched edges, tightness was established at match time:
+        #     y_B[b] + y_A[a] == proxy_cost(b,a) + 1
+        #   Then y_A[a] -= 1 immediately, giving slack = proxy_cost - y_B - y_A = 0
         slack_matched = (
-            cost_int
+            proxy_cost
             - self.y_B[matched_b].to(torch.long)
             - self.y_A[matched_a].to(torch.long)
         )
