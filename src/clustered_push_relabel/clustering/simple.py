@@ -124,12 +124,14 @@ class SimpleClustering:
         M           = int(adj_ptr[-1].item())
         adj_col     = torch.empty(M, dtype=torch.long, device=device)
         adj_dist_int = torch.empty(M, dtype=torch.int32, device=device)
+        adj_dist_float = torch.empty(M, dtype=A.dtype, device=device)
         del counts
 
         if M == 0:
             del float_buf, bool_buf
             return _pack(sampled_idx, A_s, DR, DR_int, DB, d_min_b,
-                         d_min_b_int, nearest_s, adj_ptr, adj_col, adj_dist_int)
+                         d_min_b_int, nearest_s, adj_ptr, adj_col, adj_dist_int,
+                         adj_dist_float)
 
         # ── 7. Pass 2: fill adj_col in CSR order ──────────────────────────────
         # cursor[b] = next write position for blue point b.
@@ -154,16 +156,16 @@ class SimpleClustering:
             # (no sort needed — b_idx is already sorted)
             write_pos           = cursor[b_idx] + _group_offsets(b_idx)
             adj_col[write_pos]  = (t_idx + start).long()
-            adj_dist_int[write_pos] = (
-                torch.sqrt(float_buf[:, :t][b_idx, t_idx]) / eps
-            ).floor_().to(torch.int32)
+            actual_dists = torch.sqrt(float_buf[:, :t][b_idx, t_idx])
+            adj_dist_float[write_pos] = actual_dists
+            adj_dist_int[write_pos] = (actual_dists / eps).floor_().to(torch.int32)
 
             # Advance cursor for every blue point that received pairs this tile
             cursor.scatter_add_(0, b_idx, torch.ones_like(b_idx))
 
         del float_buf, bool_buf, cursor
         return _pack(sampled_idx, A_s, DR, DR_int, DB, d_min_b, d_min_b_int,
-                     nearest_s, adj_ptr, adj_col, adj_dist_int)
+                     nearest_s, adj_ptr, adj_col, adj_dist_int, adj_dist_float)
 
     def get_adj(self, b: int, result: Dict) -> torch.Tensor:
         """Zero-copy adjacency slice for blue point b (no data movement)."""
@@ -262,7 +264,7 @@ def _group_offsets(b_idx: torch.Tensor) -> torch.Tensor:
 
 
 def _pack(sampled_idx, A_s, DR, DR_int, DB, d_min_b, d_min_b_int, nearest_s,
-          adj_ptr, adj_col, adj_dist_int) -> Dict[str, torch.Tensor]:
+          adj_ptr, adj_col, adj_dist_int, adj_dist_float) -> Dict[str, torch.Tensor]:
     return {
         "sampled_idx" : sampled_idx,
         "A_sampled"   : A_s,
@@ -275,4 +277,5 @@ def _pack(sampled_idx, A_s, DR, DR_int, DB, d_min_b, d_min_b_int, nearest_s,
         "adj_ptr"     : adj_ptr,
         "adj_col"     : adj_col,
         "adj_dist_int": adj_dist_int,
+        "adj_dist_float": adj_dist_float,
     }

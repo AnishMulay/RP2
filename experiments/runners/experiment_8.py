@@ -20,6 +20,7 @@ except ImportError:
     ot = None
 
 from clustered_push_relabel.solvers.simple_bipartite import SimpleGPUSolver
+from clustered_push_relabel.clustering.simple import SimpleClustering
 
 
 N_VALUES = [
@@ -40,7 +41,7 @@ SEED = 42
 BATCH_SIZE = 512
 WARMUP_RUNS = 0
 TIMED_RUNS = 1
-METHODS = ("Exact", "Simple")
+METHODS = ("Exact", "ProxyExact", "Simple")
 
 
 def generate_synthetic_2d(n, device):
@@ -80,6 +81,44 @@ def compute_cost_matrix_L2(red, blue):
     X = torch.as_tensor(red, dtype=torch.float64).contiguous()
     Y = torch.as_tensor(blue, dtype=torch.float64).contiguous()
     return torch.cdist(X, Y, p=2).cpu().numpy()
+
+
+def build_proxy_matrix(clustering, N, epsilon):
+    """
+    Build an (N, N) proxy cost matrix from SimpleClustering output.
+
+    For every (b, a) pair the proxy cost is:
+        d_min_b[b] + DR[nearest_s[b], a]   (triangle proxy through nearest center)
+
+    For pairs where a is in b's adjacency list, overwrite with the exact
+    stored float distance adj_dist_float[entry].
+
+    NOTE: Allocates an (N x N) float32 tensor on GPU. Only valid for N up to
+    roughly 10,000 (400 MB at float32). Do not use for larger N.
+
+    Returns a CPU float64 numpy array of shape (N, N) ready for ot.emd.
+    """
+    device = clustering["DR"].device
+    DR = clustering["DR"]           # (S, N) float
+    d_min_b = clustering["d_min_b"] # (N,)   float
+    nearest_s = clustering["nearest_s"]  # (N,) int64
+    adj_ptr = clustering["adj_ptr"]      # (N+1,) int64
+    adj_col = clustering["adj_col"]      # (M,) int64
+    adj_dist_float = clustering["adj_dist_float"]  # (M,) float
+
+    # Triangle proxy for all (b, a): d_min_b[b] + DR[nearest_s[b], a]
+    # DR[nearest_s, :] selects one row of DR per blue -> (N, N)
+    C = d_min_b.unsqueeze(1) + DR[nearest_s, :]  # (N, N)
+
+    # Overwrite adjacency-list entries with exact stored distances
+    if adj_col.numel() > 0:
+        b_indices = torch.repeat_interleave(
+            torch.arange(N, device=device, dtype=torch.long),
+            adj_ptr[1:] - adj_ptr[:-1],
+        )
+        C[b_indices, adj_col] = adj_dist_float
+
+    return C.cpu().to(torch.float64).numpy()
 
 
 def matching_from_plan(plan):
@@ -128,6 +167,36 @@ def benchmark_exact(P_red, P_blue):
     match_B = matching_from_plan(plan)
     total_cost, avg_cost = matching_costs(red_cpu, blue_cpu, match_B)
     del plan, match_B, C
+    return (t1 - t0) * 1000.0, total_cost, avg_cost
+
+
+def benchmark_proxy_exact(P_red, P_blue, device):
+    if ot is None:
+        raise RuntimeError("POT is not installed; exact solver unavailable.")
+
+    P_red_norm, P_blue_norm, diameter = normalize_points(P_red, P_blue)
+    N = P_red_norm.shape[0]
+
+    cluster_engine = SimpleClustering(epsilon=EPSILON, tile_size=BATCH_SIZE)
+    clustering = cluster_engine.run(P_red_norm, P_blue_norm)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    C = build_proxy_matrix(clustering, N, EPSILON)
+
+    a = np.full(N, 1.0 / N, dtype=np.float64)
+    b = np.full(N, 1.0 / N, dtype=np.float64)
+
+    t0 = time.perf_counter()
+    plan = ot.emd(a, b, C, numItermax=10**6)
+    t1 = time.perf_counter()
+
+    match_B = matching_from_plan(plan)
+    total_cost, avg_cost = matching_costs(P_red_norm, P_blue_norm, match_B)
+    total_cost *= diameter
+    avg_cost *= diameter
+
+    del plan, match_B, C, clustering, cluster_engine
     return (t1 - t0) * 1000.0, total_cost, avg_cost
 
 
@@ -190,6 +259,10 @@ def run_method(n, method_name, P_red, P_blue, device):
         phases = math.nan
         if method_name == "Exact":
             time_ms, total_cost, avg_cost = benchmark_exact(P_red, P_blue)
+        elif method_name == "ProxyExact":
+            time_ms, total_cost, avg_cost = benchmark_proxy_exact(
+                P_red, P_blue, device
+            )
         elif method_name == "Simple":
             time_ms, total_cost, avg_cost, phases = benchmark_simple(
                 P_red, P_blue, device
@@ -258,25 +331,32 @@ def format_add_err(exact_result, simple_result):
 def print_table(rows):
     print()
     print(
-        "  N    | ExactT(ms) | SimpleT(ms) | Phases | Speedup | "
-        "ExactAvg | SimpleAvg | AvgAddErr"
+        "  N    | ExactT(ms) | ProxyT(ms) | SimpleT(ms) | Phases | Speedup | "
+        "ExactAvg | ProxyAvg | SimpleAvg | ProxyAddErr | SimpleAddErr"
     )
-    print("-------|------------|-------------|--------|---------|----------|-----------|----------")
+    print(
+        "-------|------------|------------|-------------|--------|---------|"
+        "----------|----------|-----------|-------------|-------------"
+    )
 
     for row in rows:
         n = row["n"]
         exact = row["results"]["Exact"]
+        proxy = row["results"]["ProxyExact"]
         simple = row["results"]["Simple"]
 
         print(
             f"{n:>6,} | "
             f"{format_time(exact['time_ms']):>10} | "
+            f"{format_time(proxy['time_ms']):>10} | "
             f"{format_time(simple['time_ms']):>11} | "
             f"{format_phases(simple['phases']):>6} | "
             f"{format_speedup(exact, simple):>7} | "
             f"{format_avg_cost(exact['avg_cost']):>8} | "
+            f"{format_avg_cost(proxy['avg_cost']):>8} | "
             f"{format_avg_cost(simple['avg_cost']):>9} | "
-            f"{format_add_err(exact, simple):>9}"
+            f"{format_add_err(exact, proxy):>11} | "
+            f"{format_add_err(proxy, simple):>11}"
         )
 
 
