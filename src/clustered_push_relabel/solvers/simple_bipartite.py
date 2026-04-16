@@ -141,6 +141,7 @@ class SimpleGPUSolver:
             pair_inverse, set1_counts, set1_offsets, set1_values = (
                 self._set1_groups(B_free)
             )
+            unique_pairs, delta_pair_inverse = self._set1_delta_groups(B_free)
             set1_count_per_blue = set1_counts[pair_inverse]
             set2_count_per_blue = self._set2_counts(B_free)
 
@@ -180,7 +181,10 @@ class SimpleGPUSolver:
                 proposal_b_parts.append(b2)
 
             if not proposal_a_parts:
-                self.y_B[B_free] += 1
+                delta = self._compute_delta(
+                    B_free, unique_pairs, delta_pair_inverse
+                )
+                self.y_B[B_free] += delta
                 _print_progress(iteration, num_free, num_free, "no_proposals")
                 continue
 
@@ -190,13 +194,20 @@ class SimpleGPUSolver:
             r_new, b_new = self._resolve_conflicts(proposal_a, proposal_b)
 
             if r_new.numel() == 0:
-                self.y_B[B_free] += 1
+                delta = self._compute_delta(
+                    B_free, unique_pairs, delta_pair_inverse
+                )
+                self.y_B[B_free] += delta
                 _print_progress(iteration, num_free, num_free, "no_accepts")
                 continue
 
             F_B_new = self._update_matching(B_free, r_new, b_new)
 
-            self.y_B[F_B_new] += 1
+            unique_pairs_new, pair_inverse_new = self._set1_delta_groups(F_B_new)
+            delta = self._compute_delta(
+                F_B_new, unique_pairs_new, pair_inverse_new
+            )
+            self.y_B[F_B_new] += delta
             self.y_A[r_new] -= 1
             self.V[:, r_new] -= 1
 
@@ -275,6 +286,83 @@ class SimpleGPUSolver:
         rand_idx.clamp_(max=selected_counts - 1)
         value_idx = set1_offsets[selected_pair] + rand_idx
         return selected_b, set1_values[value_idx]
+
+    def _set1_delta_groups(self, B_free):
+        free_s = self.nearest_s[B_free]
+        free_t = 1 - self.y_B[B_free] - self.d_min_b_int[B_free]
+
+        order = torch.argsort(free_s)
+        sorted_pairs = torch.stack(
+            (free_s[order], free_t[order].to(torch.long)),
+            dim=1,
+        )
+        unique_pairs, inverse_sorted = torch.unique(
+            sorted_pairs, dim=0, return_inverse=True
+        )
+
+        pair_inverse = torch.empty_like(inverse_sorted)
+        pair_inverse[order] = inverse_sorted
+        return unique_pairs, pair_inverse
+
+    def _compute_delta(self, B_free, unique_pairs, pair_inverse):
+        num_free = B_free.numel()
+        if num_free == 0:
+            return 1
+
+        pair_s = unique_pairs[:, 0].to(torch.long)
+        v_pair_row_max = self.V[pair_s].max(dim=1).values.to(torch.long)
+        target1 = (
+            self.d_min_b_int[B_free] + 1 - self.y_B[B_free]
+        ).to(torch.long)
+        min_slack1_per_blue = target1 - v_pair_row_max[pair_inverse]
+
+        sentinel = torch.iinfo(torch.int64).max // 4
+        min_adj_term = torch.full(
+            (num_free,), sentinel, device=self.device, dtype=torch.long
+        )
+
+        starts = self.adj_ptr[B_free]
+        ends = self.adj_ptr[B_free + 1]
+        lengths = ends - starts
+        total_edges = int(lengths.sum().item())
+        if total_edges != 0:
+            edge_range = _ensure_long_arange(
+                self, "_delta_set2_edge_arange", total_edges, self.device
+            )
+            free_pos = _ensure_long_arange(
+                self, "_delta_set2_free_pos", num_free, self.device
+            )
+            cum_len = torch.cumsum(lengths, dim=0)
+            packed_starts = cum_len - lengths
+
+            active_free_pos = torch.repeat_interleave(free_pos, lengths)
+            active_edge_idx = (
+                torch.repeat_interleave(starts, lengths)
+                + edge_range
+                - torch.repeat_interleave(packed_starts, lengths)
+            )
+
+            active_a = self.adj_col[active_edge_idx]
+            adj_term = (
+                self.adj_dist_int[active_edge_idx].to(torch.long)
+                - self.y_A[active_a].to(torch.long)
+            )
+            min_adj_term.scatter_reduce_(
+                0, active_free_pos, adj_term, reduce="amin", include_self=True
+            )
+
+        min_slack2_per_blue = (
+            1 - self.y_B[B_free].to(torch.long) + min_adj_term
+        )
+        min_slack_per_blue = torch.minimum(
+            min_slack1_per_blue, min_slack2_per_blue
+        )
+
+        positive_mask = min_slack_per_blue > 0
+        if positive_mask.any().item():
+            delta = int(min_slack_per_blue[positive_mask].min().item())
+            return max(delta, 1)
+        return 1
 
     def _set2_counts(self, B_free):
         num_free = B_free.numel()
