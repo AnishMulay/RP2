@@ -34,7 +34,7 @@ N_VALUES = [
     9_000,
     10_000,
 ]
-EPSILON = 0.01
+EPSILON = 0.001
 SYNTHETIC_DIM = 2
 SEED = 42
 BATCH_SIZE = 512
@@ -236,17 +236,17 @@ def format_speedup(exact_result, simple_result):
 
 
 def format_add_err(exact_result, simple_result):
-    exact_total = exact_result["total_cost"]
-    simple_total = simple_result["total_cost"]
-    if not is_available(exact_total) or not is_available(simple_total):
+    exact_avg = exact_result["avg_cost"]
+    simple_avg = simple_result["avg_cost"]
+    if not is_available(exact_avg) or not is_available(simple_avg):
         return "N/A"
-    return f"{simple_total - exact_total:.2f}"
+    return f"{simple_avg - exact_avg:.4f}"
 
 
 def print_table(rows):
     print()
-    print("  N    | ExactT(ms) | SimpleT(ms) | Speedup | ExactAvg | SimpleAvg | AddErr")
-    print("-------|------------|-------------|---------|----------|-----------|--------")
+    print("  N    | ExactT(ms) | SimpleT(ms) | Speedup | ExactAvg | SimpleAvg | AvgAddErr")
+    print("-------|------------|-------------|---------|----------|-----------|----------")
 
     for row in rows:
         n = row["n"]
@@ -260,7 +260,7 @@ def print_table(rows):
             f"{format_speedup(exact, simple):>7} | "
             f"{format_avg_cost(exact['avg_cost']):>8} | "
             f"{format_avg_cost(simple['avg_cost']):>9} | "
-            f"{format_add_err(exact, simple):>6}"
+            f"{format_add_err(exact, simple):>9}"
         )
 
 
