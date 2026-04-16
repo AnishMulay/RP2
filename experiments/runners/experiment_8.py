@@ -240,8 +240,11 @@ def benchmark_simple(P_red, P_blue, device):
     total_cost, avg_cost = matching_costs(P_red_norm, P_blue_norm, match_B)
     total_cost *= diameter
     avg_cost *= diameter
+    solver.verbose = True
+    feasibility = solver.verify_solution()
+    solver.verbose = False
     del solver, match_B, P_red_norm, P_blue_norm
-    return (t1 - t0) * 1000.0, total_cost, avg_cost, phases
+    return (t1 - t0) * 1000.0, total_cost, avg_cost, phases, feasibility
 
 
 def result_na():
@@ -250,6 +253,7 @@ def result_na():
         "total_cost": math.nan,
         "avg_cost": math.nan,
         "phases": math.nan,
+        "feasibility": None,
     }
 
 
@@ -257,6 +261,7 @@ def run_method(n, method_name, P_red, P_blue, device):
     try:
         print(f"  Running {method_name} for N={n:,}...", flush=True)
         phases = math.nan
+        feasibility = None
         if method_name == "Exact":
             time_ms, total_cost, avg_cost = benchmark_exact(P_red, P_blue)
         elif method_name == "ProxyExact":
@@ -264,7 +269,7 @@ def run_method(n, method_name, P_red, P_blue, device):
                 P_red, P_blue, device
             )
         elif method_name == "Simple":
-            time_ms, total_cost, avg_cost, phases = benchmark_simple(
+            time_ms, total_cost, avg_cost, phases, feasibility = benchmark_simple(
                 P_red, P_blue, device
             )
         else:
@@ -279,6 +284,7 @@ def run_method(n, method_name, P_red, P_blue, device):
             "total_cost": total_cost,
             "avg_cost": avg_cost,
             "phases": phases,
+            "feasibility": feasibility,
         }
     except Exception as exc:
         print(f"Warning: N={n:,} {method_name} failed: {exc}", flush=True)
@@ -360,6 +366,41 @@ def print_table(rows):
         )
 
 
+def print_feasibility_table(rows):
+    print()
+    print("Feasibility Verification Table (Simple solver)")
+    print(
+        "  N    | Ch1 Violations | Ch1 WorstSlack | "
+        "Ch2 Total | Ch2 Violations | Ch2 SlackRange | "
+        "Ch3 Total | Ch3 Violations | Ch3 SlackRange"
+    )
+    print("-" * 120)
+
+    for row in rows:
+        n = row["n"]
+        f = row["results"]["Simple"].get("feasibility")
+        if f is None:
+            print(f"{n:>6,} | {'N/A':>14} | {'N/A':>14} | {'N/A':>9} | {'N/A':>14} | {'N/A':>14} | {'N/A':>9} | {'N/A':>14} | {'N/A':>14}")
+            continue
+
+        def fmt_range(mn, mx):
+            if mn is None or mx is None:
+                return "N/A"
+            return f"[{mn}, {mx}]"
+
+        print(
+            f"{n:>6,} | "
+            f"{f['check1_violations']:>14} | "
+            f"{f['check1_worst_slack']:>14} | "
+            f"{f['check2_total']:>9} | "
+            f"{f['check2_violations']:>14} | "
+            f"{fmt_range(f['check2_min'], f['check2_max']):>14} | "
+            f"{f['check3_total']:>9} | "
+            f"{f['check3_violations']:>14} | "
+            f"{fmt_range(f['check3_min'], f['check3_max']):>14}"
+        )
+
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(SEED)
@@ -400,6 +441,7 @@ def main():
         empty_cache_if_cuda(device)
 
     print_table(rows)
+    print_feasibility_table(rows)
 
 
 if __name__ == "__main__":

@@ -573,6 +573,8 @@ class SimpleGPUSolver:
         ends   = self.adj_ptr[all_b + 1]
         lengths = ends - starts
         total_edges = int(lengths.sum().item())
+        n_violations = 0
+        worst = None
 
         if total_edges > 0:
             edge_range   = torch.arange(total_edges, device=device, dtype=torch.long)
@@ -605,7 +607,18 @@ class SimpleGPUSolver:
 
         if matched_b.numel() == 0:
             print("[Verify] No matched edges to check.")
-            return
+            return {
+                "check1_violations": n_violations,
+                "check1_worst_slack": worst,
+                "check2_total": 0,
+                "check2_violations": 0,
+                "check2_min": None,
+                "check2_max": None,
+                "check3_total": 0,
+                "check3_violations": 0,
+                "check3_min": None,
+                "check3_max": None,
+            }
 
         # Actual float cost then discretize for comparison with integer duals
         actual_dists = torch.norm(
@@ -646,3 +659,16 @@ class SimpleGPUSolver:
                   f"Max={int(cleanup_slack.max().item())}")
         else:
             print("[Verify] Check 3 — No cleanup-matched edges.")
+
+        return {
+            "check1_violations": n_violations,
+            "check1_worst_slack": worst,
+            "check2_total": phase_slack.numel() if phase_slack.numel() > 0 else 0,
+            "check2_violations": n_nonzero if phase_slack.numel() > 0 else 0,
+            "check2_min": int(phase_slack.min().item()) if phase_slack.numel() > 0 else None,
+            "check2_max": int(phase_slack.max().item()) if phase_slack.numel() > 0 else None,
+            "check3_total": cleanup_slack.numel() if cleanup_slack.numel() > 0 else 0,
+            "check3_violations": n_neg if cleanup_slack.numel() > 0 else 0,
+            "check3_min": int(cleanup_slack.min().item()) if cleanup_slack.numel() > 0 else None,
+            "check3_max": int(cleanup_slack.max().item()) if cleanup_slack.numel() > 0 else None,
+        }
