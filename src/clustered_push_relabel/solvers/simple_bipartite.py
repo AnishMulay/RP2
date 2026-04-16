@@ -40,6 +40,7 @@ class SimpleGPUSolver:
         verbose=False,
         max_iters=50000,
         set1_pair_batch=64,
+        diameter: float = 1.0,
     ):
         if A.device != B.device:
             raise ValueError("A and B must be on the same device")
@@ -60,6 +61,7 @@ class SimpleGPUSolver:
         self.N = A.shape[0]
         self.epsilon = float(epsilon)
         self.epsilon_int = int(round(self.epsilon * self.N))
+        self.diameter = float(diameter)
         self.verbose = verbose
         self.max_iters = int(max_iters)
         self.set1_pair_batch = int(set1_pair_batch)
@@ -139,13 +141,23 @@ class SimpleGPUSolver:
             pair_inverse, set1_counts, set1_offsets, set1_values = (
                 self._set1_groups(B_free)
             )
-            set1_has = set1_counts[pair_inverse] > 0
+            set1_count_per_blue = set1_counts[pair_inverse]
+            set2_count_per_blue = self._set2_counts(B_free)
 
-            set2_has, set2_choice = self._set2_choices(B_free)
-
-            rand_pick = torch.rand(num_free, device=device) < 0.5
-            choose_set1 = set1_has & (~set2_has | rand_pick)
-            choose_set2 = set2_has & (~set1_has | ~rand_pick)
+            total_count = (set1_count_per_blue + set2_count_per_blue).float()
+            has_any = total_count > 0
+            p1 = torch.where(
+                has_any,
+                set1_count_per_blue.float() / total_count,
+                torch.zeros_like(total_count),
+            )
+            rand_pick = torch.rand(num_free, device=device)
+            choose_set1 = (
+                has_any
+                & (set1_count_per_blue > 0)
+                & ((set2_count_per_blue == 0) | (rand_pick < p1))
+            )
+            choose_set2 = has_any & (set2_count_per_blue > 0) & (~choose_set1)
 
             proposal_a_parts = []
             proposal_b_parts = []
@@ -162,8 +174,7 @@ class SimpleGPUSolver:
                 proposal_a_parts.append(a1)
                 proposal_b_parts.append(b1)
 
-            b2 = B_free[choose_set2]
-            a2 = set2_choice[choose_set2]
+            b2, a2 = self._set2_sample(B_free, choose_set2)
             if a2.numel() != 0:
                 proposal_a_parts.append(a2)
                 proposal_b_parts.append(b2)
@@ -265,11 +276,10 @@ class SimpleGPUSolver:
         value_idx = set1_offsets[selected_pair] + rand_idx
         return selected_b, set1_values[value_idx]
 
-    def _set2_choices(self, B_free):
+    def _set2_counts(self, B_free):
         num_free = B_free.numel()
-        set2_has = torch.zeros(num_free, device=self.device, dtype=torch.bool)
-        set2_choice = torch.full(
-            (num_free,), -1, device=self.device, dtype=torch.long
+        set2_count_per_blue = torch.zeros(
+            num_free, device=self.device, dtype=torch.long
         )
 
         starts = self.adj_ptr[B_free]
@@ -277,7 +287,7 @@ class SimpleGPUSolver:
         lengths = ends - starts
         total_edges = int(lengths.sum().item())
         if total_edges == 0:
-            return set2_has, set2_choice
+            return set2_count_per_blue
 
         edge_range = _ensure_long_arange(
             self, "_set2_edge_arange", total_edges, self.device
@@ -298,34 +308,79 @@ class SimpleGPUSolver:
         target_y_a = self.adj_dist_int[active_edge_idx] + 1 - self.y_B[active_b]
         is_candidate = self.y_A[active_a] == target_y_a
         cand_free_pos = active_free_pos[is_candidate]
+
+        if cand_free_pos.numel() != 0:
+            set2_count_per_blue.scatter_add_(
+                0, cand_free_pos, torch.ones_like(cand_free_pos)
+            )
+        return set2_count_per_blue
+
+    def _set2_sample(self, B_free, choose_set2):
+        selected_b = B_free[choose_set2]
+        num_selected = selected_b.numel()
+        if num_selected == 0:
+            empty = torch.empty(0, device=self.device, dtype=torch.long)
+            return empty, empty
+
+        starts = self.adj_ptr[selected_b]
+        ends = self.adj_ptr[selected_b + 1]
+        lengths = ends - starts
+        total_edges = int(lengths.sum().item())
+        if total_edges == 0:
+            empty = torch.empty(0, device=self.device, dtype=torch.long)
+            return empty, empty
+
+        edge_range = _ensure_long_arange(
+            self, "_set2_sample_edge_arange", total_edges, self.device
+        )
+        selected_pos = _ensure_long_arange(
+            self, "_set2_sample_pos", num_selected, self.device
+        )
+        cum_len = torch.cumsum(lengths, dim=0)
+        packed_starts = cum_len - lengths
+
+        active_selected_pos = torch.repeat_interleave(selected_pos, lengths)
+        active_b = selected_b[active_selected_pos]
+        active_edge_idx = (
+            torch.repeat_interleave(starts, lengths)
+            + edge_range
+            - torch.repeat_interleave(packed_starts, lengths)
+        )
+
+        active_a = self.adj_col[active_edge_idx]
+        target_y_a = self.adj_dist_int[active_edge_idx] + 1 - self.y_B[active_b]
+        is_candidate = self.y_A[active_a] == target_y_a
+        cand_selected_pos = active_selected_pos[is_candidate]
         cand_a = active_a[is_candidate]
         cand_count = cand_a.numel()
+        if cand_count == 0:
+            empty = torch.empty(0, device=self.device, dtype=torch.long)
+            return empty, empty
+
         cand_idx = _ensure_long_arange(
-            self, "_set2_cand_arange", cand_count, self.device
+            self, "_set2_sample_cand_arange", cand_count, self.device
         )
 
         rand_prio = torch.rand(cand_count, device=self.device)
-        min_prio = torch.full((num_free,), float("inf"), device=self.device)
+        min_prio = torch.full((num_selected,), float("inf"), device=self.device)
         min_prio.scatter_reduce_(
-            0, cand_free_pos, rand_prio, reduce="amin", include_self=True
+            0, cand_selected_pos, rand_prio, reduce="amin", include_self=True
         )
 
-        is_min = rand_prio == min_prio[cand_free_pos]
+        is_min = rand_prio == min_prio[cand_selected_pos]
         winner_idx = torch.full(
-            (num_free,), cand_count, device=self.device, dtype=torch.long
+            (num_selected,), cand_count, device=self.device, dtype=torch.long
         )
         winner_idx.scatter_reduce_(
             0,
-            cand_free_pos[is_min],
+            cand_selected_pos[is_min],
             cand_idx[is_min],
             reduce="amin",
             include_self=True,
         )
 
         valid = winner_idx < cand_count
-        set2_has[valid] = True
-        set2_choice[valid] = cand_a[winner_idx[valid]]
-        return set2_has, set2_choice
+        return selected_b[valid], cand_a[winner_idx[valid]]
 
     def _resolve_conflicts(self, proposal_a, proposal_b):
         num_props = proposal_a.numel()
@@ -383,6 +438,7 @@ class SimpleGPUSolver:
 
     def calculate_final_stats(self):
         dists = torch.norm(self.P_blue - self.P_red[self.match_B], p=2, dim=1)
+        dists = dists * self.diameter
         total_cost = dists.sum()
         avg_cost = total_cost / self.N
         print(f"Total Euclidean Cost: {total_cost.item():.4f}")

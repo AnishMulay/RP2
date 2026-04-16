@@ -51,6 +51,20 @@ def generate_synthetic_2d(n, device):
     return P_red, P_blue
 
 
+def normalize_points(P_red, P_blue):
+    """
+    Normalize red and blue points jointly by the diameter of their union.
+    Returns (P_red_norm, P_blue_norm, diameter).
+    diameter is a Python float for passing to SimpleGPUSolver.
+    """
+    all_points = torch.cat([P_red, P_blue], dim=0)
+    mean = all_points.mean(dim=0, keepdim=True)
+    centered = all_points - mean
+    diameter = float(2.0 * centered.norm(dim=1).max().item())
+    diameter = max(diameter, 1e-8)
+    return P_red / diameter, P_blue / diameter, diameter
+
+
 def synchronize_if_cuda(device):
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -118,10 +132,17 @@ def benchmark_exact(P_red, P_blue):
 
 
 def benchmark_simple(P_red, P_blue, device):
+    P_red_norm, P_blue_norm, diameter = normalize_points(P_red, P_blue)
+
     for _ in range(WARMUP_RUNS):
         empty_cache_if_cuda(device)
         solver = SimpleGPUSolver(
-            P_red, P_blue, EPSILON, batch_size=BATCH_SIZE, verbose=False
+            P_red_norm,
+            P_blue_norm,
+            EPSILON,
+            batch_size=BATCH_SIZE,
+            verbose=False,
+            diameter=diameter,
         )
         synchronize_if_cuda(device)
         solver.solve()
@@ -130,7 +151,12 @@ def benchmark_simple(P_red, P_blue, device):
 
     empty_cache_if_cuda(device)
     solver = SimpleGPUSolver(
-        P_red, P_blue, EPSILON, batch_size=BATCH_SIZE, verbose=False
+        P_red_norm,
+        P_blue_norm,
+        EPSILON,
+        batch_size=BATCH_SIZE,
+        verbose=False,
+        diameter=diameter,
     )
 
     for _ in range(TIMED_RUNS):
@@ -141,8 +167,10 @@ def benchmark_simple(P_red, P_blue, device):
         t1 = time.perf_counter()
 
     match_B = result if result is not None else solver_matching(solver)
-    total_cost, avg_cost = matching_costs(P_red, P_blue, match_B)
-    del solver, match_B
+    total_cost, avg_cost = matching_costs(P_red_norm, P_blue_norm, match_B)
+    total_cost *= diameter
+    avg_cost *= diameter
+    del solver, match_B, P_red_norm, P_blue_norm
     return (t1 - t0) * 1000.0, total_cost, avg_cost
 
 
@@ -189,59 +217,51 @@ def format_time(value):
     return f"{value:.1f}"
 
 
-def format_total_cost(value):
-    if not is_available(value):
-        return "N/A"
-    return f"{value:.2f}"
-
-
 def format_avg_cost(value):
     if not is_available(value):
         return "N/A"
     return f"{value:.4f}"
 
 
-def format_ratio(exact_result, simple_result):
-    exact_avg = exact_result["avg_cost"]
-    simple_avg = simple_result["avg_cost"]
-    if not is_available(exact_avg) or not is_available(simple_avg) or exact_avg == 0:
+def format_speedup(exact_result, simple_result):
+    exact_time = exact_result["time_ms"]
+    simple_time = simple_result["time_ms"]
+    if (
+        not is_available(exact_time)
+        or not is_available(simple_time)
+        or simple_time == 0
+    ):
         return "N/A"
-    return f"{simple_avg / exact_avg:.3f}"
+    return f"{exact_time / simple_time:.2f}x"
+
+
+def format_add_err(exact_result, simple_result):
+    exact_total = exact_result["total_cost"]
+    simple_total = simple_result["total_cost"]
+    if not is_available(exact_total) or not is_available(simple_total):
+        return "N/A"
+    return f"{simple_total - exact_total:.2f}"
 
 
 def print_table(rows):
     print()
-    print(
-        "  N    | Method  | Time (ms) | Total Cost | Avg Cost | "
-        "Ratio (Simple/Exact)"
-    )
-    print(
-        "-------|---------|-----------|------------|----------|"
-        "---------------------"
-    )
+    print("  N    | ExactT(ms) | SimpleT(ms) | Speedup | ExactAvg | SimpleAvg | AddErr")
+    print("-------|------------|-------------|---------|----------|-----------|--------")
 
-    for idx, row in enumerate(rows):
+    for row in rows:
         n = row["n"]
         exact = row["results"]["Exact"]
         simple = row["results"]["Simple"]
 
         print(
-            f"{n:>6,} | {'Exact':<7} | "
-            f"{format_time(exact['time_ms']):>9} | "
-            f"{format_total_cost(exact['total_cost']):>10} | "
+            f"{n:>6,} | "
+            f"{format_time(exact['time_ms']):>10} | "
+            f"{format_time(simple['time_ms']):>11} | "
+            f"{format_speedup(exact, simple):>7} | "
             f"{format_avg_cost(exact['avg_cost']):>8} | "
-            f"{'—':>19}"
+            f"{format_avg_cost(simple['avg_cost']):>9} | "
+            f"{format_add_err(exact, simple):>6}"
         )
-        print(
-            f"{n:>6,} | {'Simple':<7} | "
-            f"{format_time(simple['time_ms']):>9} | "
-            f"{format_total_cost(simple['total_cost']):>10} | "
-            f"{format_avg_cost(simple['avg_cost']):>8} | "
-            f"{format_ratio(exact, simple):>19}"
-        )
-
-        if idx != len(rows) - 1:
-            print("       |         |           |            |          |")
 
 
 def main():
