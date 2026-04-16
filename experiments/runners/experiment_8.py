@@ -167,11 +167,12 @@ def benchmark_simple(P_red, P_blue, device):
         t1 = time.perf_counter()
 
     match_B = result if result is not None else solver_matching(solver)
+    phases = solver.iterations
     total_cost, avg_cost = matching_costs(P_red_norm, P_blue_norm, match_B)
     total_cost *= diameter
     avg_cost *= diameter
     del solver, match_B, P_red_norm, P_blue_norm
-    return (t1 - t0) * 1000.0, total_cost, avg_cost
+    return (t1 - t0) * 1000.0, total_cost, avg_cost, phases
 
 
 def result_na():
@@ -179,16 +180,20 @@ def result_na():
         "time_ms": math.nan,
         "total_cost": math.nan,
         "avg_cost": math.nan,
+        "phases": math.nan,
     }
 
 
 def run_method(n, method_name, P_red, P_blue, device):
     try:
         print(f"  Running {method_name} for N={n:,}...", flush=True)
+        phases = math.nan
         if method_name == "Exact":
             time_ms, total_cost, avg_cost = benchmark_exact(P_red, P_blue)
         elif method_name == "Simple":
-            time_ms, total_cost, avg_cost = benchmark_simple(P_red, P_blue, device)
+            time_ms, total_cost, avg_cost, phases = benchmark_simple(
+                P_red, P_blue, device
+            )
         else:
             raise ValueError(f"Unknown method: {method_name}")
         print(
@@ -200,6 +205,7 @@ def run_method(n, method_name, P_red, P_blue, device):
             "time_ms": time_ms,
             "total_cost": total_cost,
             "avg_cost": avg_cost,
+            "phases": phases,
         }
     except Exception as exc:
         print(f"Warning: N={n:,} {method_name} failed: {exc}", flush=True)
@@ -221,6 +227,12 @@ def format_avg_cost(value):
     if not is_available(value):
         return "N/A"
     return f"{value:.4f}"
+
+
+def format_phases(value):
+    if not is_available(value):
+        return "N/A"
+    return f"{int(value)}"
 
 
 def format_speedup(exact_result, simple_result):
@@ -245,8 +257,11 @@ def format_add_err(exact_result, simple_result):
 
 def print_table(rows):
     print()
-    print("  N    | ExactT(ms) | SimpleT(ms) | Speedup | ExactAvg | SimpleAvg | AvgAddErr")
-    print("-------|------------|-------------|---------|----------|-----------|----------")
+    print(
+        "  N    | ExactT(ms) | SimpleT(ms) | Phases | Speedup | "
+        "ExactAvg | SimpleAvg | AvgAddErr"
+    )
+    print("-------|------------|-------------|--------|---------|----------|-----------|----------")
 
     for row in rows:
         n = row["n"]
@@ -257,6 +272,7 @@ def print_table(rows):
             f"{n:>6,} | "
             f"{format_time(exact['time_ms']):>10} | "
             f"{format_time(simple['time_ms']):>11} | "
+            f"{format_phases(simple['phases']):>6} | "
             f"{format_speedup(exact, simple):>7} | "
             f"{format_avg_cost(exact['avg_cost']):>8} | "
             f"{format_avg_cost(simple['avg_cost']):>9} | "
