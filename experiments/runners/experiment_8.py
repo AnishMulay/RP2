@@ -108,7 +108,7 @@ def build_proxy_matrix(clustering, N, epsilon):
 
     # Triangle proxy for all (b, a): d_min_b[b] + DR[nearest_s[b], a]
     # DR[nearest_s, :] selects one row of DR per blue -> (N, N)
-    C = d_min_b.unsqueeze(1) + DR[nearest_s, :]  # (N, N)
+    C = (d_min_b.unsqueeze(1) + DR[nearest_s, :]).T  # (N_red × N_blue)
 
     # Overwrite adjacency-list entries with exact stored distances
     if adj_col.numel() > 0:
@@ -116,7 +116,7 @@ def build_proxy_matrix(clustering, N, epsilon):
             torch.arange(N, device=device, dtype=torch.long),
             adj_ptr[1:] - adj_ptr[:-1],
         )
-        C[b_indices, adj_col] = adj_dist_float
+        C[adj_col, b_indices] = adj_dist_float
 
     return C.cpu().to(torch.float64).numpy()
 

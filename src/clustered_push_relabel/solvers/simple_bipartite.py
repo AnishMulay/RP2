@@ -108,6 +108,7 @@ class SimpleGPUSolver:
         self.y_B = torch.zeros(self.N, device=self.device, dtype=torch.int32)
         self.match_A = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
         self.match_B = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
+        self.cleanup_blues = torch.empty(0, device=self.device, dtype=torch.long)
 
         # Existing experiment code uses MA/MB and yA/yB naming.
         self.yA = self.y_A
@@ -219,6 +220,7 @@ class SimpleGPUSolver:
         if self.verbose:
             print(f"[Simple] Matched: {(self.match_B != -1).sum().item()}/{self.N}")
             self.calculate_final_stats()
+            self.verify_solution()
         return self.match_B
 
     def _set1_groups(self, B_free):
@@ -522,6 +524,7 @@ class SimpleGPUSolver:
         count = min(free_b.numel(), free_a.numel())
         if count > 0:
             self.match_B[free_b[:count]] = free_a[:count]
+            self.cleanup_blues = free_b[:count].clone()
             self.match_A[free_a[:count]] = free_b[:count]
 
     def calculate_final_stats(self):
@@ -531,3 +534,115 @@ class SimpleGPUSolver:
         avg_cost = total_cost / self.N
         print(f"Total Euclidean Cost: {total_cost.item():.4f}")
         print(f"Avg Euclidean Cost: {avg_cost.item():.4f}")
+
+    def verify_solution(self):
+        """
+        Post-solve correctness checks based on epsilon-complementary slackness.
+
+        Three checks are run:
+
+        Check 1 — Global dual feasibility (all CSR / Set 2 edges):
+            For every blue b and every a in b's adjacency list:
+                slack = adj_dist_int[entry] + 1 - y_B[b] - y_A[a]  >=  0
+            A negative slack means the feasibility invariant was violated — a
+            fundamental bug. Reports count and worst-case value.
+
+        Check 2 — Tightness of phase-matched edges:
+            For every matched (b, a) pair that was NOT cleanup-matched:
+                slack = cost_int(b, a) - y_B[b] - y_A[a]  ==  0
+            At the moment of matching, admissibility gave:
+                y_B[b] + y_A[a] == cost(b, a) + 1
+            Then y_A[a] was immediately decremented by 1, giving slack exactly 0.
+            y_B[b] never increments again (b left F_B) and y_A[a] never decrements
+            again (a is matched). So any non-zero slack here is a bug.
+            Reports count of violations and the slack distribution.
+
+        Check 3 — Cleanup edges are feasible but not tight:
+            For cleanup-matched (b, a) pairs, slack >= 0 must hold but tightness
+            is not expected. Reports slack distribution separately.
+        """
+        device = self.device
+        N = self.N
+
+        print("\n[Verify] Running solution verification...")
+
+        # ── Check 1: Global dual feasibility over all CSR edges ──────────────
+        num_free = N  # check all blues, not just free ones
+        all_b = torch.arange(N, device=device, dtype=torch.long)
+        starts = self.adj_ptr[all_b]
+        ends   = self.adj_ptr[all_b + 1]
+        lengths = ends - starts
+        total_edges = int(lengths.sum().item())
+
+        if total_edges > 0:
+            edge_range   = torch.arange(total_edges, device=device, dtype=torch.long)
+            cum_len      = torch.cumsum(lengths, dim=0)
+            packed_starts = cum_len - lengths
+            active_b_pos = torch.repeat_interleave(all_b, lengths)
+            active_edge_idx = (
+                torch.repeat_interleave(starts, lengths)
+                + edge_range
+                - torch.repeat_interleave(packed_starts, lengths)
+            )
+            active_a   = self.adj_col[active_edge_idx]
+            slack_set2 = (
+                self.adj_dist_int[active_edge_idx].to(torch.long)
+                + 1
+                - self.y_B[active_b_pos].to(torch.long)
+                - self.y_A[active_a].to(torch.long)
+            )
+            n_violations = int((slack_set2 < 0).sum().item())
+            worst        = int(slack_set2.min().item())
+            print(f"[Verify] Check 1 — Feasibility violations: {n_violations} "
+                  f"(worst slack = {worst})")
+        else:
+            print("[Verify] Check 1 — No CSR edges to check.")
+
+        # ── Check 2 & 3: Slack of matched edges ──────────────────────────────
+        matched_b_mask = self.match_B != -1
+        matched_b      = torch.nonzero(matched_b_mask, as_tuple=True)[0]
+        matched_a      = self.match_B[matched_b]
+
+        if matched_b.numel() == 0:
+            print("[Verify] No matched edges to check.")
+            return
+
+        # Actual float cost then discretize for comparison with integer duals
+        actual_dists = torch.norm(
+            self.P_blue[matched_b] - self.P_red[matched_a], p=2, dim=1
+        )
+        cost_int = (actual_dists / self.epsilon).floor_().to(torch.long)
+        slack_matched = (
+            cost_int
+            - self.y_B[matched_b].to(torch.long)
+            - self.y_A[matched_a].to(torch.long)
+        )
+
+        # Separate phase-matched from cleanup-matched
+        is_cleanup = torch.zeros(N, dtype=torch.bool, device=device)
+        if self.cleanup_blues.numel() > 0:
+            is_cleanup[self.cleanup_blues] = True
+        matched_is_cleanup = is_cleanup[matched_b]
+
+        phase_slack   = slack_matched[~matched_is_cleanup]
+        cleanup_slack = slack_matched[ matched_is_cleanup]
+
+        # Check 2: phase-matched edges must have slack == 0
+        if phase_slack.numel() > 0:
+            n_nonzero = int((phase_slack != 0).sum().item())
+            print(f"[Verify] Check 2 — Phase-matched edges: {phase_slack.numel()} total, "
+                  f"{n_nonzero} with slack != 0 (must be 0). "
+                  f"Min={int(phase_slack.min().item())} "
+                  f"Max={int(phase_slack.max().item())}")
+        else:
+            print("[Verify] Check 2 — No phase-matched edges.")
+
+        # Check 3: cleanup edges, feasibility only
+        if cleanup_slack.numel() > 0:
+            n_neg = int((cleanup_slack < 0).sum().item())
+            print(f"[Verify] Check 3 — Cleanup-matched edges: {cleanup_slack.numel()} total, "
+                  f"{n_neg} with slack < 0 (feasibility violations). "
+                  f"Min={int(cleanup_slack.min().item())} "
+                  f"Max={int(cleanup_slack.max().item())}")
+        else:
+            print("[Verify] Check 3 — No cleanup-matched edges.")
