@@ -105,7 +105,7 @@ class SimpleGPUSolver:
         gc.collect()
 
         self.y_A = torch.zeros(self.N, device=self.device, dtype=torch.int32)
-        self.y_B = torch.full((self.N,), 1, device=self.device, dtype=torch.int32)
+        self.y_B = torch.zeros(self.N, device=self.device, dtype=torch.int32)
         self.match_A = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
         self.match_B = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
 
