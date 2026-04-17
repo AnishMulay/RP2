@@ -39,13 +39,21 @@ class SimpleClustering:
     computed in O(M) with a vectorised cummax, no sort needed.
     """
 
-    def __init__(self, epsilon: float, tile_size: int = 2048):
+    def __init__(
+        self,
+        epsilon: float,
+        tile_size: int = 2048,
+        sample_factor: float = 1.0,
+    ):
         if tile_size <= 0:
             raise ValueError("tile_size must be positive")
         if epsilon <= 0:
             raise ValueError("epsilon must be positive")
+        if sample_factor <= 0:
+            raise ValueError("sample_factor must be positive")
         self.epsilon = float(epsilon)
         self.tile_size = int(tile_size)
+        self.sample_factor = float(sample_factor)
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -78,7 +86,7 @@ class SimpleClustering:
         eps    = self.epsilon
 
         # ── 1. Sample red centers  w.p. 1/√N ─────────────────────────────────
-        sample_mask = torch.rand(N, device=device) < (1.0 / math.sqrt(N))
+        sample_mask = torch.rand(N, device=device) < (1.0 / (self.sample_factor * math.sqrt(N)))
         if not sample_mask.any():
             sample_mask[torch.randint(N, (1,), device=device)] = True
         sampled_idx = sample_mask.nonzero(as_tuple=True)[0]    # (S,)

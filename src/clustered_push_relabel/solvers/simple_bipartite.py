@@ -41,6 +41,7 @@ class SimpleGPUSolver:
         max_iters=50000,
         set1_pair_batch=64,
         diameter: float = 1.0,
+        sample_factor: float = 1.0,
     ):
         if A.device != B.device:
             raise ValueError("A and B must be on the same device")
@@ -62,6 +63,7 @@ class SimpleGPUSolver:
         self.epsilon = float(epsilon)
         self.epsilon_int = int(round(self.epsilon * self.N))
         self.diameter = float(diameter)
+        self.sample_factor = float(sample_factor)
         self.verbose = verbose
         self.max_iters = int(max_iters)
         self.set1_pair_batch = int(set1_pair_batch)
@@ -84,7 +86,9 @@ class SimpleGPUSolver:
 
         t0 = time.time()
         cluster_engine = SimpleClustering(
-            epsilon=self.epsilon, tile_size=self.batch_size
+            epsilon=self.epsilon,
+            tile_size=self.batch_size,
+            sample_factor=sample_factor,
         )
         clustering = cluster_engine.run(A, B)
         if self.device.type == "cuda":

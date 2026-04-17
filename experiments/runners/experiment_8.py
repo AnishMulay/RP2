@@ -23,25 +23,13 @@ from clustered_push_relabel.solvers.simple_bipartite import SimpleGPUSolver
 from clustered_push_relabel.clustering.simple import SimpleClustering
 
 
-N_VALUES = [
-    1_000,
-    2_000,
-    3_000,
-    4_000,
-    5_000,
-    6_000,
-    7_000,
-    8_000,
-    9_000,
-    10_000,
-]
-EPSILON = 0.001
 SYNTHETIC_DIM = 2
 SEED = 42
 BATCH_SIZE = 512
 WARMUP_RUNS = 0
 TIMED_RUNS = 1
 METHODS = ("Exact", "ProxyExact", "Simple")
+SAMPLE_FACTOR_DEFAULT = 1.0
 
 
 def generate_synthetic_2d(n, device):
@@ -170,19 +158,21 @@ def benchmark_exact(P_red, P_blue):
     return (t1 - t0) * 1000.0, total_cost, avg_cost
 
 
-def benchmark_proxy_exact(P_red, P_blue, device):
+def benchmark_proxy_exact(P_red, P_blue, device, epsilon, sample_factor):
     if ot is None:
         raise RuntimeError("POT is not installed; exact solver unavailable.")
 
     P_red_norm, P_blue_norm, diameter = normalize_points(P_red, P_blue)
     N = P_red_norm.shape[0]
 
-    cluster_engine = SimpleClustering(epsilon=EPSILON, tile_size=BATCH_SIZE)
+    cluster_engine = SimpleClustering(
+        epsilon=epsilon, tile_size=BATCH_SIZE, sample_factor=sample_factor
+    )
     clustering = cluster_engine.run(P_red_norm, P_blue_norm)
     if device.type == "cuda":
         torch.cuda.synchronize()
 
-    C = build_proxy_matrix(clustering, N, EPSILON)
+    C = build_proxy_matrix(clustering, N, epsilon)
 
     a = np.full(N, 1.0 / N, dtype=np.float64)
     b = np.full(N, 1.0 / N, dtype=np.float64)
@@ -200,7 +190,7 @@ def benchmark_proxy_exact(P_red, P_blue, device):
     return (t1 - t0) * 1000.0, total_cost, avg_cost
 
 
-def benchmark_simple(P_red, P_blue, device):
+def benchmark_simple(P_red, P_blue, device, epsilon, sample_factor):
     P_red_norm, P_blue_norm, diameter = normalize_points(P_red, P_blue)
 
     for _ in range(WARMUP_RUNS):
@@ -208,10 +198,11 @@ def benchmark_simple(P_red, P_blue, device):
         solver = SimpleGPUSolver(
             P_red_norm,
             P_blue_norm,
-            EPSILON,
+            epsilon,
             batch_size=BATCH_SIZE,
             verbose=False,
             diameter=diameter,
+            sample_factor=sample_factor,
         )
         synchronize_if_cuda(device)
         solver.solve()
@@ -222,10 +213,11 @@ def benchmark_simple(P_red, P_blue, device):
     solver = SimpleGPUSolver(
         P_red_norm,
         P_blue_norm,
-        EPSILON,
+        epsilon,
         batch_size=BATCH_SIZE,
         verbose=False,
         diameter=diameter,
+        sample_factor=sample_factor,
     )
 
     for _ in range(TIMED_RUNS):
@@ -257,7 +249,7 @@ def result_na():
     }
 
 
-def run_method(n, method_name, P_red, P_blue, device):
+def run_method(n, method_name, P_red, P_blue, device, epsilon, sample_factor):
     try:
         print(f"  Running {method_name} for N={n:,}...", flush=True)
         phases = math.nan
@@ -266,11 +258,11 @@ def run_method(n, method_name, P_red, P_blue, device):
             time_ms, total_cost, avg_cost = benchmark_exact(P_red, P_blue)
         elif method_name == "ProxyExact":
             time_ms, total_cost, avg_cost = benchmark_proxy_exact(
-                P_red, P_blue, device
+                P_red, P_blue, device, epsilon, sample_factor
             )
         elif method_name == "Simple":
             time_ms, total_cost, avg_cost, phases, feasibility = benchmark_simple(
-                P_red, P_blue, device
+                P_red, P_blue, device, epsilon, sample_factor
             )
         else:
             raise ValueError(f"Unknown method: {method_name}")
@@ -401,7 +393,73 @@ def print_feasibility_table(rows):
         )
 
 
+def pick(prompt, options):
+    """
+    Display a numbered menu and return the user's chosen value.
+    options is a list of (label, value) tuples.
+    Loops until a valid integer is entered.
+    """
+    print(f"\n{prompt}")
+    for i, (label, _) in enumerate(options, 1):
+        print(f"  {i}. {label}")
+    while True:
+        raw = input("Enter number: ").strip()
+        if raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(options):
+                chosen_label, chosen_value = options[idx - 1]
+                print(f"  → {chosen_label}")
+                return chosen_value
+        print(f"  Please enter a number between 1 and {len(options)}.")
+
+
+def configure_experiment():
+    """
+    Interactive CLI picker for experiment configuration.
+    Returns (n_values, epsilon, sample_factor).
+    """
+    print("\n" + "=" * 50)
+    print("  Experiment 8 Configuration")
+    print("=" * 50)
+
+    n_values = pick(
+        "Select N values:",
+        [
+            ("1,000 → 10,000 in steps of 1,000",
+             list(range(1_000, 11_000, 1_000))),
+            ("5,000 only",
+             [5_000]),
+        ],
+    )
+
+    epsilon = pick(
+        "Select epsilon:",
+        [
+            ("0.01",  0.01),
+            ("0.005", 0.005),
+            ("0.001", 0.001),
+        ],
+    )
+
+    sample_factor = pick(
+        "Select sampling probability:",
+        [
+            ("1 / sqrt(N)    (default)",  SAMPLE_FACTOR_DEFAULT),
+            ("1 / (2*sqrt(N))  (reduced)", 2.0),
+        ],
+    )
+
+    print("\nConfiguration:")
+    print(f"  N values      : {n_values}")
+    print(f"  Epsilon       : {epsilon}")
+    print(f"  Sample factor : 1 / ({int(sample_factor)}*sqrt(N))")
+    print()
+    return n_values, epsilon, sample_factor
+
+
 def main():
+    N_VALUES, EPSILON, SAMPLE_FACTOR = configure_experiment()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(SEED)
     np.random.seed(SEED)
@@ -412,6 +470,8 @@ def main():
     print(f"Device: {device}", flush=True)
     print(f"Seed: {SEED}", flush=True)
     print(f"N values: {', '.join(f'{n:,}' for n in N_VALUES)}", flush=True)
+    print(f"Epsilon: {EPSILON}", flush=True)
+    print(f"Sample factor: 1 / ({int(SAMPLE_FACTOR)}*sqrt(N))", flush=True)
     print(f"Warmup runs: {WARMUP_RUNS}  Timed runs: {TIMED_RUNS}", flush=True)
     print(f"Methods: {', '.join(METHODS)}", flush=True)
 
@@ -434,7 +494,15 @@ def main():
         print(f"Generated Synthetic 2D data for N={n:,}.", flush=True)
         results = {}
         for method_name in METHODS:
-            results[method_name] = run_method(n, method_name, P_red, P_blue, device)
+            results[method_name] = run_method(
+                n,
+                method_name,
+                P_red,
+                P_blue,
+                device,
+                epsilon=EPSILON,
+                sample_factor=SAMPLE_FACTOR,
+            )
 
         rows.append({"n": n, "results": results})
         del P_red, P_blue
