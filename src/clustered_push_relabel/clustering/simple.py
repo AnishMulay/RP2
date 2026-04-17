@@ -98,8 +98,8 @@ class SimpleClustering:
         DB = torch.cdist(B,  A_s,
                          compute_mode="use_mm_for_euclid_dist_if_necessary")  # (N, S)
         d_min_b, nearest_s = DB.min(dim=1)                     # (N,)  each
-        DR_int      = (DR      / eps).floor_().to(torch.int32)  # (S, N)
-        d_min_b_int = (d_min_b / eps).floor_().to(torch.int32)  # (N,)
+        DR_int      = (DR      / eps).ceil_().to(torch.int32)  # (S, N)
+        d_min_b_int = (d_min_b / eps).ceil_().to(torch.int32)  # (N,)
 
         # ── 3. Pre-computed norms and threshold ───────────────────────────────
         d_min_b_sq = d_min_b.pow(2)            # (N,)  threshold per blue
@@ -166,7 +166,7 @@ class SimpleClustering:
             adj_col[write_pos]  = (t_idx + start).long()
             actual_dists = torch.sqrt(float_buf[:, :t][b_idx, t_idx])
             adj_dist_float[write_pos] = actual_dists
-            adj_dist_int[write_pos] = (actual_dists / eps).floor_().to(torch.int32)
+            adj_dist_int[write_pos] = (actual_dists / eps).ceil_().to(torch.int32)
 
             # Advance cursor for every blue point that received pairs this tile
             cursor.scatter_add_(0, b_idx, torch.ones_like(b_idx))
