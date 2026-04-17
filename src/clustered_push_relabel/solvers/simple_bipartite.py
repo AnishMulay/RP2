@@ -598,6 +598,33 @@ class SimpleGPUSolver:
             pos = torch.searchsorted(sorted_keys, matched_keys[in_adj])
             proxy_cost[in_adj] = sorted_dists[pos]
 
+        # Diagnostic: for in-adj edges, also compute the triangle proxy and compare
+        if in_adj.any():
+            in_b = phase_b[in_adj]
+            in_a = phase_a[in_adj]
+            s_in = self.nearest_s[in_b]
+            dr_int_in = (
+                self.y_A[in_a].to(torch.long)
+                - self.V[s_in, in_a].to(torch.long)
+            )
+            triangle_proxy_for_in_adj = (
+                self.d_min_b_int[in_b].to(torch.long) + dr_int_in
+            )
+            direct_proxy_for_in_adj = proxy_cost[in_adj]
+            lhs_in = (
+                self.y_B[in_b].to(torch.long)
+                + self.y_A[in_a].to(torch.long)
+            )
+            matches_direct   = (lhs_in == direct_proxy_for_in_adj).sum().item()
+            matches_triangle = (lhs_in == triangle_proxy_for_in_adj).sum().item()
+            matches_neither  = int(in_adj.sum().item()) - matches_direct - matches_triangle
+            print(
+                f"[Diag] In-adj edges: {int(in_adj.sum().item())} total. "
+                f"Match direct proxy: {matches_direct}, "
+                f"match triangle proxy: {matches_triangle}, "
+                f"match neither: {matches_neither}"
+            )
+
         # Not in adjacency list: use two-hop bridge through nearest sampled center
         # DR_int[s][a] = y_A[a] - V[s][a]  (since V[s][a] = y_A[a] - DR_int[s][a])
         if (~in_adj).any():
