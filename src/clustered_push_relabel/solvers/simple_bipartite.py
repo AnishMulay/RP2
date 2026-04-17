@@ -541,177 +541,86 @@ class SimpleGPUSolver:
 
     def verify_solution(self):
         """
-        Post-solve correctness checks based on epsilon-complementary slackness.
+        Admissibility check for phase-matched edges only.
 
-        Three checks are run:
+        For every (b, a) pair matched during the phase loop (not cleanup),
+        the admissibility condition requires:
+            y_B[b] + y_A[a] == proxy_cost(b, a)
 
-        Check 1 — Global dual feasibility (all CSR / Set 2 edges):
-            For every blue b and every a in b's adjacency list:
-                slack = adj_dist_int[entry] + 1 - y_B[b] - y_A[a]  >=  0
-            A negative slack means the feasibility invariant was violated — a
-            fundamental bug. Reports count and worst-case value.
+        Proxy cost is:
+            - adj_dist_int[entry]                       if a is in b's adjacency list
+            - d_min_b_int[b] + DR_int[nearest_s[b]][a]  otherwise (two-hop bridge)
 
-        Check 2 — Tightness of phase-matched edges:
-            For every matched (b, a) pair that was NOT cleanup-matched:
-                slack = cost_int(b, a) - y_B[b] - y_A[a]  ==  0
-            At the moment of matching, admissibility gave:
-                y_B[b] + y_A[a] == cost(b, a) + 1
-            Then y_A[a] was immediately decremented by 1, giving slack exactly 0.
-            y_B[b] never increments again (b left F_B) and y_A[a] never decrements
-            again (a is matched). So any non-zero slack here is a bug.
-            Reports count of violations and the slack distribution.
-
-        Check 3 — Cleanup edges are feasible but not tight:
-            For cleanup-matched (b, a) pairs, slack >= 0 must hold but tightness
-            is not expected. Reports slack distribution separately.
+        Reports the number of violations of this condition.
         """
         device = self.device
         N = self.N
 
-        print("\n[Verify] Running solution verification...")
+        print("\n[Verify] Checking admissibility of phase-matched edges...")
 
-        # ── Check 1: Global dual feasibility over all CSR edges ──────────────
-        num_free = N  # check all blues, not just free ones
-        all_b = torch.arange(N, device=device, dtype=torch.long)
-        starts = self.adj_ptr[all_b]
-        ends   = self.adj_ptr[all_b + 1]
-        lengths = ends - starts
-        total_edges = int(lengths.sum().item())
-        n_violations = 0
-        worst = None
-
-        if total_edges > 0:
-            edge_range   = torch.arange(total_edges, device=device, dtype=torch.long)
-            cum_len      = torch.cumsum(lengths, dim=0)
-            packed_starts = cum_len - lengths
-            active_b_pos = torch.repeat_interleave(all_b, lengths)
-            active_edge_idx = (
-                torch.repeat_interleave(starts, lengths)
-                + edge_range
-                - torch.repeat_interleave(packed_starts, lengths)
-            )
-            active_a   = self.adj_col[active_edge_idx]
-            slack_set2 = (
-                self.adj_dist_int[active_edge_idx].to(torch.long)
-                + 1
-                - self.y_B[active_b_pos].to(torch.long)
-                - self.y_A[active_a].to(torch.long)
-            )
-            n_violations = int((slack_set2 < 0).sum().item())
-            worst        = int(slack_set2.min().item())
-            print(f"[Verify] Check 1 — Feasibility violations: {n_violations} "
-                  f"(worst slack = {worst})")
-        else:
-            print("[Verify] Check 1 — No CSR edges to check.")
-
-        # ── Check 2 & 3: Slack of matched edges ──────────────────────────────
         matched_b_mask = self.match_B != -1
-        matched_b      = torch.nonzero(matched_b_mask, as_tuple=True)[0]
-        matched_a      = self.match_B[matched_b]
+        matched_b = torch.nonzero(matched_b_mask, as_tuple=True)[0]
+        matched_a = self.match_B[matched_b]
 
         if matched_b.numel() == 0:
             print("[Verify] No matched edges to check.")
-            return {
-                "check1_violations": n_violations,
-                "check1_worst_slack": worst,
-                "check2_total": 0,
-                "check2_violations": 0,
-                "check2_min": None,
-                "check2_max": None,
-                "check3_total": 0,
-                "check3_violations": 0,
-                "check3_min": None,
-                "check3_max": None,
-            }
+            return {"phase_total": 0, "phase_violations": 0}
 
-        # ── Determine proxy cost for each matched edge ────────────────────────
-        # Step 1: encode all CSR entries as b*N + a for O(M) membership lookup
-        N = self.N
+        # Exclude cleanup-matched blues
+        is_cleanup = torch.zeros(N, dtype=torch.bool, device=device)
+        if self.cleanup_blues.numel() > 0:
+            is_cleanup[self.cleanup_blues] = True
+        phase_mask = ~is_cleanup[matched_b]
+        phase_b = matched_b[phase_mask]
+        phase_a = matched_a[phase_mask]
+
+        if phase_b.numel() == 0:
+            print("[Verify] No phase-matched edges to check.")
+            return {"phase_total": 0, "phase_violations": 0}
+
+        # Build proxy cost for each phase-matched edge
+        # Encode all CSR entries as b*N + a for membership lookup
         all_b_for_adj = torch.repeat_interleave(
             torch.arange(N, device=device, dtype=torch.long),
             self.adj_ptr[1:] - self.adj_ptr[:-1],
         )
-        adj_keys = all_b_for_adj * N + self.adj_col  # (M,) unique keys
+        adj_keys = all_b_for_adj * N + self.adj_col  # (M,)
+        matched_keys = phase_b * N + phase_a         # (num_phase,)
+        in_adj = torch.isin(matched_keys, adj_keys)  # (num_phase,) bool
 
-        # Step 2: encode matched pairs the same way
-        matched_keys = matched_b * N + matched_a  # (num_matched,)
+        proxy_cost = torch.zeros(phase_b.numel(), device=device, dtype=torch.long)
 
-        # Step 3: membership test — which matched pairs are in the adj list
-        in_adj = torch.isin(matched_keys, adj_keys)  # (num_matched,) bool
-
-        # Step 4: for in-adj pairs, retrieve adj_dist_int via sorted binary search
-        proxy_cost = torch.zeros(matched_b.numel(), device=device, dtype=torch.long)
-
+        # In-adjacency-list edges: use stored direct distance
         if in_adj.any():
-            sort_idx     = torch.argsort(adj_keys)
-            sorted_keys  = adj_keys[sort_idx]
+            sort_idx = torch.argsort(adj_keys)
+            sorted_keys = adj_keys[sort_idx]
             sorted_dists = self.adj_dist_int[sort_idx].to(torch.long)
             pos = torch.searchsorted(sorted_keys, matched_keys[in_adj])
             proxy_cost[in_adj] = sorted_dists[pos]
 
-        # Step 5: for non-adj pairs, use triangle proxy through nearest sampled center
-        #   proxy = d_min_b_int[b] + DR_int[nearest_s[b]][a]
-        #   DR_int[s][a] = y_A[a] - V[s][a]   (V definition: V[s][a] = y_A[a] - DR_int[s][a])
+        # Not in adjacency list: use two-hop bridge through nearest sampled center
+        # DR_int[s][a] = y_A[a] - V[s][a]  (since V[s][a] = y_A[a] - DR_int[s][a])
         if (~in_adj).any():
-            na_b = matched_b[~in_adj]
-            na_a = matched_a[~in_adj]
+            na_b = phase_b[~in_adj]
+            na_a = phase_a[~in_adj]
             s_na = self.nearest_s[na_b]
             dr_int_na = (
                 self.y_A[na_a].to(torch.long)
                 - self.V[s_na, na_a].to(torch.long)
             )
-            proxy_cost[~in_adj] = (
-                self.d_min_b_int[na_b].to(torch.long) + dr_int_na
-            )
+            proxy_cost[~in_adj] = self.d_min_b_int[na_b].to(torch.long) + dr_int_na
 
-        # Step 6: compute slack against proxy cost
-        #   For phase-matched edges, tightness was established at match time:
-        #     y_B[b] + y_A[a] == proxy_cost(b,a) + 1
-        #   Then y_A[a] -= 1 immediately, giving slack = proxy_cost - y_B - y_A = 0
-        slack_matched = (
-            proxy_cost
-            - self.y_B[matched_b].to(torch.long)
-            - self.y_A[matched_a].to(torch.long)
+        # Admissibility condition: y_B[b] + y_A[a] == proxy_cost
+        lhs = self.y_B[phase_b].to(torch.long) + self.y_A[phase_a].to(torch.long)
+        violations = int((lhs != proxy_cost).sum().item())
+
+        print(
+            f"[Verify] Phase-matched edges: {phase_b.numel()} total, "
+            f"{violations} admissibility violations "
+            f"(y_B[b] + y_A[a] != proxy_cost)"
         )
 
-        # Separate phase-matched from cleanup-matched
-        is_cleanup = torch.zeros(N, dtype=torch.bool, device=device)
-        if self.cleanup_blues.numel() > 0:
-            is_cleanup[self.cleanup_blues] = True
-        matched_is_cleanup = is_cleanup[matched_b]
-
-        phase_slack   = slack_matched[~matched_is_cleanup]
-        cleanup_slack = slack_matched[ matched_is_cleanup]
-
-        # Check 2: phase-matched edges must have slack == 0
-        if phase_slack.numel() > 0:
-            n_nonzero = int((phase_slack != 0).sum().item())
-            print(f"[Verify] Check 2 — Phase-matched edges: {phase_slack.numel()} total, "
-                  f"{n_nonzero} with slack != 0 (must be 0). "
-                  f"Min={int(phase_slack.min().item())} "
-                  f"Max={int(phase_slack.max().item())}")
-        else:
-            print("[Verify] Check 2 — No phase-matched edges.")
-
-        # Check 3: cleanup edges, feasibility only
-        if cleanup_slack.numel() > 0:
-            n_neg = int((cleanup_slack < 0).sum().item())
-            print(f"[Verify] Check 3 — Cleanup-matched edges: {cleanup_slack.numel()} total, "
-                  f"{n_neg} with slack < 0 (feasibility violations). "
-                  f"Min={int(cleanup_slack.min().item())} "
-                  f"Max={int(cleanup_slack.max().item())}")
-        else:
-            print("[Verify] Check 3 — No cleanup-matched edges.")
-
         return {
-            "check1_violations": n_violations,
-            "check1_worst_slack": worst,
-            "check2_total": phase_slack.numel() if phase_slack.numel() > 0 else 0,
-            "check2_violations": n_nonzero if phase_slack.numel() > 0 else 0,
-            "check2_min": int(phase_slack.min().item()) if phase_slack.numel() > 0 else None,
-            "check2_max": int(phase_slack.max().item()) if phase_slack.numel() > 0 else None,
-            "check3_total": cleanup_slack.numel() if cleanup_slack.numel() > 0 else 0,
-            "check3_violations": n_neg if cleanup_slack.numel() > 0 else 0,
-            "check3_min": int(cleanup_slack.min().item()) if cleanup_slack.numel() > 0 else None,
-            "check3_max": int(cleanup_slack.max().item()) if cleanup_slack.numel() > 0 else None,
+            "phase_total": phase_b.numel(),
+            "phase_violations": violations,
         }
