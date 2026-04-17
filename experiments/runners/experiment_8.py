@@ -244,6 +244,7 @@ def benchmark_simple(P_red, P_blue, device, epsilon, sample_factor):
                      device=solver.device, dtype=torch.float32)
     ).cpu().tolist()
     adj_stats = {
+        "samples": int(solver.V.shape[0]),
         "mean"  : float(lengths.mean().item()),
         "min"   : quantiles[0],
         "p10"   : quantiles[1],
@@ -426,19 +427,21 @@ def print_adj_stats_table(rows):
     print("Adjacency List Size Quantiles (per blue point, from SimpleClustering)")
     print(
         f"  {'N':>6} | {'Mean':>7} | {'Min':>6} | {'P10':>6} | {'P25':>6} | "
-        f"{'P50':>6} | {'P75':>6} | {'P90':>6} | {'P95':>6} | {'P99':>6} | {'Max':>6}"
+        f"{'P50':>6} | {'P75':>6} | {'P90':>6} | {'P95':>6} | {'P99':>6} | "
+        f"{'Max':>6} | {'Samples':>9}"
     )
-    print("-" * 95)
+    print("-" * 107)
     for row in rows:
         n = row["n"]
         s = row["results"]["Simple"].get("adj_stats")
         if s is None:
-            print(f"  {n:>6,} | {'N/A':>7}")
+            print(f"  {n:>6,} | {'N/A':>7} | {'N/A':>9}")
             continue
         print(
             f"  {n:>6,} | {s['mean']:>7.1f} | {s['min']:>6.0f} | {s['p10']:>6.0f} | "
             f"{s['p25']:>6.0f} | {s['p50']:>6.0f} | {s['p75']:>6.0f} | {s['p90']:>6.0f} | "
-            f"{s['p95']:>6.0f} | {s['p99']:>6.0f} | {s['max']:>6.0f}"
+            f"{s['p95']:>6.0f} | {s['p99']:>6.0f} | {s['max']:>6.0f} | "
+            f"{s['samples']:>9,}"
         )
 
 
