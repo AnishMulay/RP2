@@ -386,7 +386,7 @@ class SimpleGPUSolver:
 
     def _set1_groups(self, B_free):
         free_s = self.nearest_s[B_free]
-        free_t = 1 - self.y_B[B_free] - self.d_min_b_int[B_free]
+        free_t = self.d_min_b_int[B_free] + 1 - self.y_B[B_free]
 
         order = torch.argsort(free_s)
         sorted_pairs = torch.stack(
@@ -452,7 +452,7 @@ class SimpleGPUSolver:
 
     def _set1_delta_groups(self, B_free):
         free_s = self.nearest_s[B_free]
-        free_t = 1 - self.y_B[B_free] - self.d_min_b_int[B_free]
+        free_t = self.d_min_b_int[B_free] + 1 - self.y_B[B_free]
 
         order = torch.argsort(free_s)
         sorted_pairs = torch.stack(
