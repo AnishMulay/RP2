@@ -158,12 +158,8 @@ class SimpleGPUSolver:
                 torch.zeros_like(total_count),
             )
             rand_pick = torch.rand(num_free, device=device)
-            choose_set1 = (
-                has_any
-                & (set1_count_per_blue > 0)
-                & ((set2_count_per_blue == 0) | (rand_pick < p1))
-            )
-            choose_set2 = has_any & (set2_count_per_blue > 0) & (~choose_set1)
+            choose_set2 = has_any & (set2_count_per_blue > 0)
+            choose_set1 = has_any & (set1_count_per_blue > 0) & (set2_count_per_blue == 0)
 
             proposal_a_parts = []
             proposal_b_parts = []
