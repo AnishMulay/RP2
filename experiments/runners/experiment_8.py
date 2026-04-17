@@ -172,6 +172,12 @@ def benchmark_proxy_exact(P_red, P_blue, device, epsilon, sample_factor):
     if device.type == "cuda":
         torch.cuda.synchronize()
 
+    proxy_stats = {
+        "samples": int(clustering["DR"].shape[0]),
+        "overrides": int(clustering["adj_col"].numel()),
+        "total_entries": N * N,
+        "override_pct": 100.0 * int(clustering["adj_col"].numel()) / (N * N),
+    }
     C = build_proxy_matrix(clustering, N, epsilon)
 
     a = np.full(N, 1.0 / N, dtype=np.float64)
@@ -187,7 +193,7 @@ def benchmark_proxy_exact(P_red, P_blue, device, epsilon, sample_factor):
     avg_cost *= diameter
 
     del plan, match_B, C, clustering, cluster_engine
-    return (t1 - t0) * 1000.0, total_cost, avg_cost
+    return (t1 - t0) * 1000.0, total_cost, avg_cost, proxy_stats
 
 
 def benchmark_simple(P_red, P_blue, device, epsilon, sample_factor):
@@ -268,6 +274,7 @@ def result_na():
         "phases": math.nan,
         "feasibility": None,
         "adj_stats": None,
+        "proxy_stats": None,
     }
 
 
@@ -277,10 +284,11 @@ def run_method(n, method_name, P_red, P_blue, device, epsilon, sample_factor):
         phases = math.nan
         feasibility = None
         adj_stats = None
+        proxy_stats = None
         if method_name == "Exact":
             time_ms, total_cost, avg_cost = benchmark_exact(P_red, P_blue)
         elif method_name == "ProxyExact":
-            time_ms, total_cost, avg_cost = benchmark_proxy_exact(
+            time_ms, total_cost, avg_cost, proxy_stats = benchmark_proxy_exact(
                 P_red, P_blue, device, epsilon, sample_factor
             )
         elif method_name == "Simple":
@@ -306,6 +314,7 @@ def run_method(n, method_name, P_red, P_blue, device, epsilon, sample_factor):
             "phases": phases,
             "feasibility": feasibility,
             "adj_stats": adj_stats,
+            "proxy_stats": proxy_stats,
         }
     except Exception as exc:
         print(f"Warning: N={n:,} {method_name} failed: {exc}", flush=True)
@@ -445,6 +454,26 @@ def print_adj_stats_table(rows):
         )
 
 
+def print_proxy_override_table(rows):
+    print()
+    print("ProxyExact Matrix Overrides (adjacency entries replacing sampled-center proxy)")
+    print(
+        f"  {'N':>6} | {'Samples':>9} | {'Overrides':>12} | "
+        f"{'Total':>12} | {'Override%':>9}"
+    )
+    print("-" * 61)
+    for row in rows:
+        n = row["n"]
+        s = row["results"]["ProxyExact"].get("proxy_stats")
+        if s is None:
+            print(f"  {n:>6,} | {'N/A':>9} | {'N/A':>12} | {'N/A':>12} | {'N/A':>9}")
+            continue
+        print(
+            f"  {n:>6,} | {s['samples']:>9,} | {s['overrides']:>12,} | "
+            f"{s['total_entries']:>12,} | {s['override_pct']:>8.4f}%"
+        )
+
+
 def pick(prompt, options):
     """
     Display a numbered menu and return the user's chosen value.
@@ -563,6 +592,7 @@ def main():
     print_table(rows)
     print_feasibility_table(rows)
     print_adj_stats_table(rows)
+    print_proxy_override_table(rows)
 
 
 if __name__ == "__main__":
