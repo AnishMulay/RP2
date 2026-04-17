@@ -125,6 +125,19 @@ class SimpleGPUSolver:
         N = self.N
         device = self.device
         B_free = torch.arange(N, device=device, dtype=torch.long)
+        diag_set1_proposals_total = 0
+        diag_set1_proposals_bad = 0
+        diag_set2_proposals_total = 0
+        diag_set2_proposals_bad = 0
+
+        diag_set1_accepts_total = 0
+        diag_set1_accepts_bad_pre = 0
+        diag_set2_accepts_total = 0
+        diag_set2_accepts_bad_pre = 0
+
+        diag_accepts_total_post = 0
+        diag_accepts_bad_post = 0
+
         iteration = 0
 
         def _print_progress(iteration, free_before, free_after, status):
@@ -180,10 +193,64 @@ class SimpleGPUSolver:
                 proposal_a_parts.append(a1)
                 proposal_b_parts.append(b1)
 
+            if a1.numel() != 0:
+                s1 = self.nearest_s[b1]
+                triangle_proxy_1 = (
+                    self.d_min_b_int[b1].to(torch.long)
+                    + (
+                        self.y_A[a1].to(torch.long)
+                        - self.V[s1, a1].to(torch.long)
+                    )
+                )
+                lhs1 = self.y_B[b1].to(torch.long) + self.y_A[a1].to(torch.long)
+                bad1 = (lhs1 != (triangle_proxy_1 + 1)).sum().item()
+                diag_set1_proposals_total += int(a1.numel())
+                diag_set1_proposals_bad += int(bad1)
+
             b2, a2 = self._set2_sample(B_free, choose_set2)
             if a2.numel() != 0:
                 proposal_a_parts.append(a2)
                 proposal_b_parts.append(b2)
+
+            if a2.numel() != 0:
+                starts2 = self.adj_ptr[b2]
+                ends2 = self.adj_ptr[b2 + 1]
+                lengths2 = ends2 - starts2
+                total_edges2 = int(lengths2.sum().item())
+
+                edge_range2 = _ensure_long_arange(
+                    self, "_diag_set2_edge_arange", total_edges2, self.device
+                )
+                sel_pos2 = _ensure_long_arange(
+                    self, "_diag_set2_pos", b2.numel(), self.device
+                )
+                cum_len2 = torch.cumsum(lengths2, dim=0)
+                packed_starts2 = cum_len2 - lengths2
+
+                active_sel_pos2 = torch.repeat_interleave(sel_pos2, lengths2)
+                active_b2 = b2[active_sel_pos2]
+                active_edge_idx2 = (
+                    torch.repeat_interleave(starts2, lengths2)
+                    + edge_range2
+                    - torch.repeat_interleave(packed_starts2, lengths2)
+                )
+                active_a2 = self.adj_col[active_edge_idx2]
+
+                target_keys2 = b2.to(torch.long) * self.N + a2.to(torch.long)
+                active_keys2 = active_b2.to(torch.long) * self.N + active_a2.to(torch.long)
+
+                sort_idx2 = torch.argsort(active_keys2)
+                sorted_keys2 = active_keys2[sort_idx2]
+                sorted_edge_idx2 = active_edge_idx2[sort_idx2]
+
+                pos2 = torch.searchsorted(sorted_keys2, target_keys2)
+                matched_edge_idx2 = sorted_edge_idx2[pos2]
+
+                direct_proxy_2 = self.adj_dist_int[matched_edge_idx2].to(torch.long)
+                lhs2 = self.y_B[b2].to(torch.long) + self.y_A[a2].to(torch.long)
+                bad2 = (lhs2 != (direct_proxy_2 + 1)).sum().item()
+                diag_set2_proposals_total += int(a2.numel())
+                diag_set2_proposals_bad += int(bad2)
 
             if not proposal_a_parts:
                 delta = self._compute_delta(
@@ -196,7 +263,37 @@ class SimpleGPUSolver:
             proposal_a = torch.cat(proposal_a_parts)
             proposal_b = torch.cat(proposal_b_parts)
 
+            proposal_is_set1_parts = []
+            proposal_proxy_parts = []
+
+            if a1.numel() != 0:
+                proposal_is_set1_parts.append(
+                    torch.ones(a1.numel(), device=device, dtype=torch.bool)
+                )
+                proposal_proxy_parts.append(triangle_proxy_1)
+
+            if a2.numel() != 0:
+                proposal_is_set1_parts.append(
+                    torch.zeros(a2.numel(), device=device, dtype=torch.bool)
+                )
+                proposal_proxy_parts.append(direct_proxy_2)
+
+            proposal_is_set1 = torch.cat(proposal_is_set1_parts)
+            proposal_proxy = torch.cat(proposal_proxy_parts).to(torch.long)
+
             r_new, b_new = self._resolve_conflicts(proposal_a, proposal_b)
+
+            accepted_keys = b_new.to(torch.long) * self.N + r_new.to(torch.long)
+            proposal_keys = proposal_b.to(torch.long) * self.N + proposal_a.to(torch.long)
+
+            sort_prop_idx = torch.argsort(proposal_keys)
+            sorted_prop_keys = proposal_keys[sort_prop_idx]
+
+            accepted_pos = torch.searchsorted(sorted_prop_keys, accepted_keys)
+            accepted_prop_idx = sort_prop_idx[accepted_pos]
+
+            accepted_is_set1 = proposal_is_set1[accepted_prop_idx]
+            accepted_proxy = proposal_proxy[accepted_prop_idx].to(torch.long)
 
             if r_new.numel() == 0:
                 delta = self._compute_delta(
@@ -205,6 +302,27 @@ class SimpleGPUSolver:
                 self.y_B[B_free] += delta
                 _print_progress(iteration, num_free, num_free, "no_accepts")
                 continue
+
+            if r_new.numel() != 0:
+                lhs_accept_pre = (
+                    self.y_B[b_new].to(torch.long) + self.y_A[r_new].to(torch.long)
+                )
+
+                if accepted_is_set1.any():
+                    bad_pre_1 = (
+                        lhs_accept_pre[accepted_is_set1]
+                        != (accepted_proxy[accepted_is_set1] + 1)
+                    ).sum().item()
+                    diag_set1_accepts_total += int(accepted_is_set1.sum().item())
+                    diag_set1_accepts_bad_pre += int(bad_pre_1)
+
+                if (~accepted_is_set1).any():
+                    bad_pre_2 = (
+                        lhs_accept_pre[~accepted_is_set1]
+                        != (accepted_proxy[~accepted_is_set1] + 1)
+                    ).sum().item()
+                    diag_set2_accepts_total += int((~accepted_is_set1).sum().item())
+                    diag_set2_accepts_bad_pre += int(bad_pre_2)
 
             F_B_new = self._update_matching(B_free, r_new, b_new)
 
@@ -216,8 +334,47 @@ class SimpleGPUSolver:
             self.y_A[r_new] -= 1
             self.V[:, r_new] -= 1
 
+            if r_new.numel() != 0:
+                lhs_accept_post = (
+                    self.y_B[b_new].to(torch.long) + self.y_A[r_new].to(torch.long)
+                )
+                bad_post = (lhs_accept_post != accepted_proxy).sum().item()
+                diag_accepts_total_post += int(r_new.numel())
+                diag_accepts_bad_post += int(bad_post)
+
             _print_progress(iteration, num_free, F_B_new.numel(), "ok")
             B_free = F_B_new
+
+        print(
+            "[Diag] Set1 proposals: "
+            f"{diag_set1_proposals_total} total, "
+            f"{diag_set1_proposals_bad} bad "
+            f"(lhs != triangle_proxy + 1)"
+        )
+        print(
+            "[Diag] Set2 proposals: "
+            f"{diag_set2_proposals_total} total, "
+            f"{diag_set2_proposals_bad} bad "
+            f"(lhs != direct_proxy + 1)"
+        )
+        print(
+            "[Diag] Set1 accepted pre-update: "
+            f"{diag_set1_accepts_total} total, "
+            f"{diag_set1_accepts_bad_pre} bad "
+            f"(lhs != triangle_proxy + 1)"
+        )
+        print(
+            "[Diag] Set2 accepted pre-update: "
+            f"{diag_set2_accepts_total} total, "
+            f"{diag_set2_accepts_bad_pre} bad "
+            f"(lhs != direct_proxy + 1)"
+        )
+        print(
+            "[Diag] Accepted post-update: "
+            f"{diag_accepts_total_post} total, "
+            f"{diag_accepts_bad_post} bad "
+            f"(lhs != stored_proxy)"
+        )
 
         self.iterations = iteration
         self.cleanup_remaining_points()
