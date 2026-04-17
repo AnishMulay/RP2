@@ -235,8 +235,28 @@ def benchmark_simple(P_red, P_blue, device, epsilon, sample_factor):
     solver.verbose = True
     feasibility = solver.verify_solution()
     solver.verbose = False
+
+    # ── Adjacency list size quantiles ────────────────────────────────────
+    lengths = (solver.adj_ptr[1:] - solver.adj_ptr[:-1]).float()
+    quantiles = torch.quantile(
+        lengths,
+        torch.tensor([0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0],
+                     device=solver.device, dtype=torch.float32)
+    ).cpu().tolist()
+    adj_stats = {
+        "mean"  : float(lengths.mean().item()),
+        "min"   : quantiles[0],
+        "p10"   : quantiles[1],
+        "p25"   : quantiles[2],
+        "p50"   : quantiles[3],
+        "p75"   : quantiles[4],
+        "p90"   : quantiles[5],
+        "p95"   : quantiles[6],
+        "p99"   : quantiles[7],
+        "max"   : quantiles[8],
+    }
     del solver, match_B, P_red_norm, P_blue_norm
-    return (t1 - t0) * 1000.0, total_cost, avg_cost, phases, feasibility
+    return (t1 - t0) * 1000.0, total_cost, avg_cost, phases, feasibility, adj_stats
 
 
 def result_na():
@@ -246,6 +266,7 @@ def result_na():
         "avg_cost": math.nan,
         "phases": math.nan,
         "feasibility": None,
+        "adj_stats": None,
     }
 
 
@@ -254,6 +275,7 @@ def run_method(n, method_name, P_red, P_blue, device, epsilon, sample_factor):
         print(f"  Running {method_name} for N={n:,}...", flush=True)
         phases = math.nan
         feasibility = None
+        adj_stats = None
         if method_name == "Exact":
             time_ms, total_cost, avg_cost = benchmark_exact(P_red, P_blue)
         elif method_name == "ProxyExact":
@@ -261,9 +283,14 @@ def run_method(n, method_name, P_red, P_blue, device, epsilon, sample_factor):
                 P_red, P_blue, device, epsilon, sample_factor
             )
         elif method_name == "Simple":
-            time_ms, total_cost, avg_cost, phases, feasibility = benchmark_simple(
-                P_red, P_blue, device, epsilon, sample_factor
-            )
+            (
+                time_ms,
+                total_cost,
+                avg_cost,
+                phases,
+                feasibility,
+                adj_stats,
+            ) = benchmark_simple(P_red, P_blue, device, epsilon, sample_factor)
         else:
             raise ValueError(f"Unknown method: {method_name}")
         print(
@@ -277,6 +304,7 @@ def run_method(n, method_name, P_red, P_blue, device, epsilon, sample_factor):
             "avg_cost": avg_cost,
             "phases": phases,
             "feasibility": feasibility,
+            "adj_stats": adj_stats,
         }
     except Exception as exc:
         print(f"Warning: N={n:,} {method_name} failed: {exc}", flush=True)
@@ -390,6 +418,27 @@ def print_feasibility_table(rows):
             f"{f['check3_total']:>9} | "
             f"{f['check3_violations']:>14} | "
             f"{fmt_range(f['check3_min'], f['check3_max']):>14}"
+        )
+
+
+def print_adj_stats_table(rows):
+    print()
+    print("Adjacency List Size Quantiles (per blue point, from SimpleClustering)")
+    print(
+        f"  {'N':>6} | {'Mean':>7} | {'Min':>6} | {'P10':>6} | {'P25':>6} | "
+        f"{'P50':>6} | {'P75':>6} | {'P90':>6} | {'P95':>6} | {'P99':>6} | {'Max':>6}"
+    )
+    print("-" * 95)
+    for row in rows:
+        n = row["n"]
+        s = row["results"]["Simple"].get("adj_stats")
+        if s is None:
+            print(f"  {n:>6,} | {'N/A':>7}")
+            continue
+        print(
+            f"  {n:>6,} | {s['mean']:>7.1f} | {s['min']:>6.0f} | {s['p10']:>6.0f} | "
+            f"{s['p25']:>6.0f} | {s['p50']:>6.0f} | {s['p75']:>6.0f} | {s['p90']:>6.0f} | "
+            f"{s['p95']:>6.0f} | {s['p99']:>6.0f} | {s['max']:>6.0f}"
         )
 
 
@@ -510,6 +559,7 @@ def main():
 
     print_table(rows)
     print_feasibility_table(rows)
+    print_adj_stats_table(rows)
 
 
 if __name__ == "__main__":
