@@ -310,7 +310,7 @@ class SimpleGPUSolver2:
         """
         num_free = B_free.numel()
         counts = torch.zeros(num_free, device=self.device, dtype=torch.long)
-        choice = torch.full(num_free, -1, device=self.device, dtype=torch.long)
+        choice = torch.full((num_free,), -1, device=self.device, dtype=torch.long)
 
         active_pos = torch.nonzero(set1_active, as_tuple=True)[0]
         for pos in active_pos.tolist():
@@ -346,7 +346,7 @@ class SimpleGPUSolver2:
         """
         num_free = B_free.numel()
         counts = torch.zeros(num_free, device=self.device, dtype=torch.long)
-        choice = torch.full(num_free, -1, device=self.device, dtype=torch.long)
+        choice = torch.full((num_free,), -1, device=self.device, dtype=torch.long)
 
         for pos in range(num_free):
             b = B_free[pos]
