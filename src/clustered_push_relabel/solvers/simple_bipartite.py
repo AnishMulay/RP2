@@ -128,6 +128,7 @@ class SimpleGPUSolver:
         N = self.N
         device = self.device
         B_free = torch.arange(N, device=device, dtype=torch.long)
+        total_set2_admissible_edges = 0
         iteration = 0
 
         def _print_progress(iteration, free_before, free_after, status):
@@ -152,6 +153,7 @@ class SimpleGPUSolver:
             unique_pairs, delta_pair_inverse = self._set1_delta_groups(B_free)
             set1_count_per_blue = set1_counts[pair_inverse]
             set2_count_per_blue = self._set2_counts(B_free)
+            total_set2_admissible_edges += int(set2_count_per_blue.sum().item())
 
             total_count = (set1_count_per_blue + set2_count_per_blue).float()
             has_any = total_count > 0
@@ -248,6 +250,7 @@ class SimpleGPUSolver:
             _print_progress(iteration, num_free, F_B_new.numel(), "ok")
             B_free = F_B_new
 
+        print(f"[Diag] Total Set 2 admissible edges found across all phases: {total_set2_admissible_edges}")
         self.iterations = iteration
         verify_results = self.verify_solution()
         self._last_verify = verify_results
@@ -255,7 +258,6 @@ class SimpleGPUSolver:
         if self.verbose:
             print(f"[Simple] Matched: {(self.match_B != -1).sum().item()}/{self.N}")
             self.calculate_final_stats()
-            self.verify_solution()
         return self.match_B
 
     def _set1_groups(self, B_free):
@@ -573,110 +575,162 @@ class SimpleGPUSolver:
 
     def verify_solution(self):
         """
-        Feasibility and admissibility check. Run before cleanup.
+        Full N² feasibility and admissibility check. Run before cleanup.
 
-        For all unmatched (b, a) edges:
-            y_B[b] + y_A[a]  <=  proxy_cost(b, a) + 1
-        For phase-matched edges:
-            y_B[b] + y_A[a]  ==  proxy_cost(b, a)
+        For EVERY pair (b, a) — matched or not:
+            y_B[b] + y_A[a]  <=  proxy_cost(b, a) + 1      [feasibility]
+
+        For EVERY phase-matched pair (b, a):
+            y_B[b] + y_A[a]  ==  proxy_cost(b, a)           [admissibility]
 
         Proxy cost:
             a in adj(b)  ->  adj_dist_int[entry]
-            a not in adj ->  d_min_b_int[b] + DR_int[nearest_s[b]][a]
+            otherwise    ->  d_min_b_int[b] + DR_int[nearest_s[b]][a]
                              where DR_int[s][a] = y_A[a] - V[s][a]
+
+        Additionally, for every phase-matched pair that violates admissibility
+        and was matched via Set 1: check whether there is currently a zero-slack
+        edge in b's adjacency list that was missed.
         """
         device = self.device
         N = self.N
+        TILE = 256
 
-        # -- Build sorted adjacency lookup (b*N + a -> adj_dist_int) -------------
-        if self.adj_col.numel() != 0:
+        # Build dense N x N adjacency mask and direct cost matrix
+        in_adj_mask  = torch.zeros(N, N, dtype=torch.bool,  device=device)
+        direct_costs = torch.zeros(N, N, dtype=torch.long,  device=device)
+        if self.adj_col.numel() > 0:
             all_b_for_adj = torch.repeat_interleave(
                 torch.arange(N, device=device, dtype=torch.long),
                 self.adj_ptr[1:] - self.adj_ptr[:-1],
             )
-            adj_keys = all_b_for_adj * N + self.adj_col
-            sort_idx = torch.argsort(adj_keys)
-            sorted_keys = adj_keys[sort_idx]
-            sorted_dists = self.adj_dist_int[sort_idx].to(torch.long)
-        else:
-            all_b_for_adj = torch.empty(0, device=device, dtype=torch.long)
-            sorted_keys = torch.empty(0, device=device, dtype=torch.long)
-            sorted_dists = torch.empty(0, device=device, dtype=torch.long)
+            in_adj_mask[all_b_for_adj, self.adj_col] = True
+            direct_costs[all_b_for_adj, self.adj_col] = self.adj_dist_int.to(torch.long)
 
-        def get_proxy(b_idx, a_idx):
-            """Compute proxy_cost for each (b, a) pair. Returns (K,) long tensor."""
-            # Default: triangle proxy through nearest sampled center
-            s = self.nearest_s[b_idx]
-            dr_int = self.y_A[a_idx].to(torch.long) - self.V[s, a_idx].to(torch.long)
-            proxy = self.d_min_b_int[b_idx].to(torch.long) + dr_int
-
-            # Override with direct proxy where a is in adj(b)
-            if sorted_keys.numel() > 0:
-                keys = b_idx.to(torch.long) * N + a_idx.to(torch.long)
-                pos = torch.searchsorted(sorted_keys, keys)
-                in_bounds = pos < sorted_keys.numel()
-                if in_bounds.any():
-                    hit = in_bounds.clone()
-                    hit[in_bounds] = sorted_keys[pos[in_bounds]] == keys[in_bounds]
-                    if hit.any():
-                        proxy[hit] = sorted_dists[pos[hit]]
-            return proxy
-
-        results = {}
-
-        # -- Check 1: CSR feasibility - all (b, a) where a in adj(b) -------------
-        # Condition: y_B[b] + y_A[a] <= adj_dist_int + 1
-        if self.adj_col.numel() > 0:
-            csr_b = all_b_for_adj
-            csr_a = self.adj_col
-            csr_lhs = self.y_B[csr_b].to(torch.long) + self.y_A[csr_a].to(torch.long)
-            csr_rhs = self.adj_dist_int.to(torch.long) + 1
-            csr_violations = int((csr_lhs > csr_rhs).sum().item())
-            csr_worst = int((csr_lhs - csr_rhs).max().item())
-        else:
-            csr_violations = 0
-            csr_worst = 0
-
-        results["csr_total"] = int(self.adj_col.numel())
-        results["csr_violations"] = csr_violations
-        results["csr_worst_excess"] = csr_worst
-        print(
-            f"[Verify] CSR feasibility ({self.adj_col.numel()} edges): "
-            f"{csr_violations} violations, worst excess = {csr_worst}"
-        )
-
-        # -- Check 2: Phase-matched admissibility - equality ----------------------
-        # Condition: y_B[b] + y_A[a] == proxy_cost(b, a)
+        # Phase-matched blues
         is_cleanup = torch.zeros(N, dtype=torch.bool, device=device)
         if self.cleanup_blues.numel() > 0:
             is_cleanup[self.cleanup_blues] = True
+        matched_b_all = torch.nonzero(self.match_B != -1, as_tuple=True)[0]
+        phase_matched_b = matched_b_all[~is_cleanup[matched_b_all]]
+        is_phase_matched = torch.zeros(N, dtype=torch.bool, device=device)
+        is_phase_matched[phase_matched_b] = True
 
-        matched_b = torch.nonzero(self.match_B != -1, as_tuple=True)[0]
-        matched_a = self.match_B[matched_b]
-        phase_mask = ~is_cleanup[matched_b]
-        phase_b = matched_b[phase_mask]
-        phase_a = matched_a[phase_mask]
+        y_A_long = self.y_A.to(torch.long)
+        y_B_long = self.y_B.to(torch.long)
 
-        if phase_b.numel() > 0:
-            phase_proxy = get_proxy(phase_b, phase_a)
-            phase_lhs = self.y_B[phase_b].to(torch.long) + self.y_A[phase_a].to(torch.long)
-            diff = phase_lhs - phase_proxy
-            phase_violations = int((diff != 0).sum().item())
-            phase_min_diff = int(diff.min().item())
-            phase_max_diff = int(diff.max().item())
-        else:
-            phase_violations = 0
-            phase_min_diff = 0
-            phase_max_diff = 0
+        total_feasibility_violations   = 0
+        total_admissibility_violations = 0
+        worst_feasibility_excess       = 0
+        worst_admissibility_diff       = 0
 
-        results["phase_total"] = int(phase_b.numel())
-        results["phase_violations"] = phase_violations
-        results["phase_min_diff"] = phase_min_diff
-        results["phase_max_diff"] = phase_max_diff
+        # Collect violating matched pairs for Diagnostic 3
+        viol_matched_b_list = []
+        viol_matched_a_list = []
+        viol_is_set1_list   = []
+
+        for b_start in range(0, N, TILE):
+            b_end = min(b_start + TILE, N)
+            b_idx = torch.arange(b_start, b_end, device=device, dtype=torch.long)
+            tb    = b_end - b_start
+
+            # Triangle proxy for all (b, a) in this tile
+            s_tile    = self.nearest_s[b_idx]
+            V_rows    = self.V[s_tile]
+            tri_proxy = (
+                self.d_min_b_int[b_idx].to(torch.long).unsqueeze(1)
+                + y_A_long.unsqueeze(0)
+                - V_rows.to(torch.long)
+            )  # (tb, N)
+
+            # Override with direct cost where a is in adj(b)
+            proxy = torch.where(in_adj_mask[b_idx], direct_costs[b_idx], tri_proxy)  # (tb, N)
+
+            lhs = y_B_long[b_idx].unsqueeze(1) + y_A_long.unsqueeze(0)  # (tb, N)
+
+            # --- Diagnostic 1: feasibility over all pairs ---
+            excess = lhs - proxy - 1
+            feas_viols = int((excess > 0).sum().item())
+            total_feasibility_violations += feas_viols
+            tile_worst = int(excess.max().item())
+            if tile_worst > worst_feasibility_excess:
+                worst_feasibility_excess = tile_worst
+
+            # --- Diagnostic 2: admissibility for phase-matched pairs ---
+            phase_tile = is_phase_matched[b_idx]
+            if phase_tile.any():
+                local_idx    = phase_tile.nonzero(as_tuple=True)[0]
+                global_b     = b_idx[local_idx]
+                matched_a    = self.match_B[global_b]
+                lhs_matched  = lhs[local_idx, matched_a]
+                prx_matched  = proxy[local_idx, matched_a]
+                diff         = lhs_matched - prx_matched
+                admis_viols  = int((diff != 0).sum().item())
+                total_admissibility_violations += admis_viols
+                tile_worst_a = int(diff.abs().max().item()) if diff.numel() > 0 else 0
+                if tile_worst_a > worst_admissibility_diff:
+                    worst_admissibility_diff = tile_worst_a
+
+                # Collect violating pairs for Diagnostic 3
+                viol_mask = diff != 0
+                if viol_mask.any():
+                    viol_matched_b_list.append(global_b[viol_mask])
+                    viol_matched_a_list.append(matched_a[viol_mask])
+                    viol_is_set1_list.append(self.phase_match_is_set1[global_b[viol_mask]])
+
+        print(f"\n[Verify] Full N² check over all {N}x{N} = {N*N} pairs:")
         print(
-            f"[Verify] Phase admissibility ({phase_b.numel()} edges): "
-            f"{phase_violations} violations, "
-            f"lhs - proxy range = [{phase_min_diff}, {phase_max_diff}]"
+            f"  All pairs     — feasibility  (lhs <= proxy+1): "
+            f"{total_feasibility_violations} violations  "
+            f"(worst excess = {worst_feasibility_excess})"
+        )
+        print(
+            f"  Matched pairs — admissibility (lhs == proxy):  "
+            f"{total_admissibility_violations} violations  "
+            f"(worst |diff| = {worst_admissibility_diff})"
         )
 
-        return results
+        # --- Diagnostic 3: for admissibility-violating matched pairs ---
+        # Check: was it matched via Set 1, and is there a missed zero-slack adj edge?
+        if viol_matched_b_list:
+            viol_b   = torch.cat(viol_matched_b_list)
+            viol_a   = torch.cat(viol_matched_a_list)
+            viol_s1  = torch.cat(viol_is_set1_list)
+
+            set1_viol_b = viol_b[viol_s1]
+            set1_viol_a = viol_a[viol_s1]
+
+            missed_adj_count = 0
+            if set1_viol_b.numel() > 0:
+                for i in range(set1_viol_b.numel()):
+                    b = set1_viol_b[i]
+                    start = int(self.adj_ptr[b].item())
+                    end   = int(self.adj_ptr[b + 1].item())
+                    if end > start:
+                        adj_a    = self.adj_col[start:end]
+                        adj_dist = self.adj_dist_int[start:end].to(torch.long)
+                        lhs_b    = y_B_long[b] + y_A_long[adj_a]
+                        if (lhs_b == adj_dist).any():
+                            missed_adj_count += 1
+
+            print(
+                f"\n[Verify] Of {total_admissibility_violations} admissibility violations:"
+            )
+            print(
+                f"  Matched via Set 1:                        {int(viol_s1.sum().item())}"
+            )
+            print(
+                f"  Matched via Set 2:                        {int((~viol_s1).sum().item())}"
+            )
+            print(
+                f"  Set-1-matched with missed zero-slack adj edge: {missed_adj_count}"
+            )
+        else:
+            print("\n[Verify] No admissibility violations — no Diagnostic 3 needed.")
+
+        return {
+            "feasibility_violations":   total_feasibility_violations,
+            "feasibility_worst_excess": worst_feasibility_excess,
+            "admissibility_violations": total_admissibility_violations,
+            "admissibility_worst_diff": worst_admissibility_diff,
+        }
