@@ -157,7 +157,6 @@ class SimpleGPUSolver:
             pair_inverse, set1_counts, set1_offsets, set1_values = (
                 self._set1_groups(B_free)
             )
-            unique_pairs, delta_pair_inverse = self._set1_delta_groups(B_free)
             set1_count_per_blue = set1_counts[pair_inverse]
             set2_count_per_blue = self._set2_counts(B_free)
             total_set2_admissible_edges += int(set2_count_per_blue.sum().item())
@@ -198,9 +197,6 @@ class SimpleGPUSolver:
                 proposal_b_parts.append(b2)
 
             if not proposal_a_parts:
-                delta = self._compute_delta(
-                    B_free, unique_pairs, delta_pair_inverse
-                )
                 self.y_B[B_free] += 1
                 _print_progress(iteration, num_free, num_free, "no_proposals")
                 continue
@@ -225,10 +221,7 @@ class SimpleGPUSolver:
             r_new, b_new = self._resolve_conflicts(proposal_a, proposal_b)
 
             if r_new.numel() == 0:
-                delta = self._compute_delta(
-                    B_free, unique_pairs, delta_pair_inverse
-                )
-                self.y_B[B_free] += delta
+                self.y_B[B_free] += 1
                 _print_progress(iteration, num_free, num_free, "no_accepts")
                 continue
 
@@ -246,10 +239,6 @@ class SimpleGPUSolver:
 
             F_B_new = self._update_matching(B_free, r_new, b_new)
 
-            unique_pairs_new, pair_inverse_new = self._set1_delta_groups(F_B_new)
-            delta = self._compute_delta(
-                F_B_new, unique_pairs_new, pair_inverse_new
-            )
             self.y_B[F_B_new] += 1
             self.y_A[r_new] -= 1
             self.V[:, r_new] -= 1
@@ -267,9 +256,43 @@ class SimpleGPUSolver:
             self.calculate_final_stats()
         return self.match_B
 
-    def _set1_groups(self, B_free):
+    def _set1_eligible_mask(self, B_free):
+        num_free = B_free.numel()
+        if num_free == 0:
+            return torch.empty(0, device=self.device, dtype=torch.bool)
+
         free_s = self.nearest_s[B_free]
-        free_t = self.d_min_b_int[B_free] + 1 - self.y_B[B_free]
+        free_y_B = self.y_B[B_free].to(torch.long)
+        max_y_B_by_s = torch.full(
+            (self.V.shape[0],),
+            torch.iinfo(torch.int64).min,
+            device=self.device,
+            dtype=torch.long,
+        )
+        max_y_B_by_s.scatter_reduce_(
+            0,
+            free_s,
+            free_y_B,
+            reduce="amax",
+            include_self=True,
+        )
+        return free_y_B == max_y_B_by_s[free_s]
+
+    def _set1_groups(self, B_free):
+        num_free = B_free.numel()
+        eligible = self._set1_eligible_mask(B_free)
+        eligible_pos = torch.nonzero(eligible, as_tuple=True)[0]
+
+        pair_inverse = torch.zeros(num_free, device=self.device, dtype=torch.long)
+        if eligible_pos.numel() == 0:
+            set1_counts = torch.zeros(1, device=self.device, dtype=torch.long)
+            set1_offsets = torch.zeros(2, device=self.device, dtype=torch.long)
+            set1_values = torch.empty(0, device=self.device, dtype=torch.long)
+            return pair_inverse, set1_counts, set1_offsets, set1_values
+
+        B_eligible = B_free[eligible_pos]
+        free_s = self.nearest_s[B_eligible]
+        free_t = self.d_min_b_int[B_eligible] + 1 - self.y_B[B_eligible]
 
         order = torch.argsort(free_s)
         sorted_pairs = torch.stack(
@@ -280,11 +303,14 @@ class SimpleGPUSolver:
             sorted_pairs, dim=0, return_inverse=True
         )
 
-        pair_inverse = torch.empty_like(inverse_sorted)
-        pair_inverse[order] = inverse_sorted
+        eligible_pair_inverse = torch.empty_like(inverse_sorted)
+        eligible_pair_inverse[order] = inverse_sorted
 
         num_pairs = unique_pairs.shape[0]
-        set1_counts = torch.empty(num_pairs, device=self.device, dtype=torch.long)
+        pair_inverse.fill_(num_pairs)
+        pair_inverse[eligible_pos] = eligible_pair_inverse
+
+        set1_counts = torch.zeros(num_pairs + 1, device=self.device, dtype=torch.long)
         set1_value_parts = []
         for start in range(0, unique_pairs.shape[0], self.set1_pair_batch):
             end = min(start + self.set1_pair_batch, unique_pairs.shape[0])
@@ -297,7 +323,7 @@ class SimpleGPUSolver:
             if a_idx.numel() != 0:
                 set1_value_parts.append(a_idx)
 
-        set1_offsets = torch.empty(num_pairs + 1, device=self.device, dtype=torch.long)
+        set1_offsets = torch.empty(num_pairs + 2, device=self.device, dtype=torch.long)
         set1_offsets[0] = 0
         set1_offsets[1:] = torch.cumsum(set1_counts, dim=0)
 
@@ -307,6 +333,33 @@ class SimpleGPUSolver:
             set1_values = torch.empty(0, device=self.device, dtype=torch.long)
 
         return pair_inverse, set1_counts, set1_offsets, set1_values
+
+    def _set1_delta_groups(self, B_free):
+        eligible = self._set1_eligible_mask(B_free)
+        B_eligible = B_free[eligible]
+        if B_eligible.numel() == 0:
+            unique_pairs = torch.empty(0, 2, device=self.device, dtype=torch.long)
+            pair_inverse = torch.zeros(B_free.numel(), device=self.device, dtype=torch.long)
+            return unique_pairs, pair_inverse
+
+        free_s = self.nearest_s[B_eligible]
+        free_t = self.d_min_b_int[B_eligible] + 1 - self.y_B[B_eligible]
+
+        order = torch.argsort(free_s)
+        sorted_pairs = torch.stack(
+            (free_s[order], free_t[order].to(torch.long)),
+            dim=1,
+        )
+        unique_pairs, inverse_sorted = torch.unique(
+            sorted_pairs, dim=0, return_inverse=True
+        )
+
+        eligible_pair_inverse = torch.empty_like(inverse_sorted)
+        eligible_pair_inverse[order] = inverse_sorted
+
+        pair_inverse = torch.zeros(B_free.numel(), device=self.device, dtype=torch.long)
+        pair_inverse[eligible] = eligible_pair_inverse
+        return unique_pairs, pair_inverse
 
     def _sample_set1_choices(
         self,
@@ -332,23 +385,6 @@ class SimpleGPUSolver:
         rand_idx.clamp_(max=selected_counts - 1)
         value_idx = set1_offsets[selected_pair] + rand_idx
         return selected_b, set1_values[value_idx]
-
-    def _set1_delta_groups(self, B_free):
-        free_s = self.nearest_s[B_free]
-        free_t = self.d_min_b_int[B_free] + 1 - self.y_B[B_free]
-
-        order = torch.argsort(free_s)
-        sorted_pairs = torch.stack(
-            (free_s[order], free_t[order].to(torch.long)),
-            dim=1,
-        )
-        unique_pairs, inverse_sorted = torch.unique(
-            sorted_pairs, dim=0, return_inverse=True
-        )
-
-        pair_inverse = torch.empty_like(inverse_sorted)
-        pair_inverse[order] = inverse_sorted
-        return unique_pairs, pair_inverse
 
     def _compute_delta(self, B_free, unique_pairs, pair_inverse):
         num_free = B_free.numel()
