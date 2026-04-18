@@ -249,6 +249,8 @@ class SimpleGPUSolver:
             B_free = F_B_new
 
         self.iterations = iteration
+        verify_results = self.verify_solution()
+        self._last_verify = verify_results
         self.cleanup_remaining_points()
         if self.verbose:
             print(f"[Simple] Matched: {(self.match_B != -1).sum().item()}/{self.N}")
@@ -571,11 +573,22 @@ class SimpleGPUSolver:
 
     def verify_solution(self):
         """
-        Return compact branch-aware admissibility and cleanup feasibility counts.
+        Feasibility and admissibility check. Run before cleanup.
+
+        For all unmatched (b, a) edges:
+            y_B[b] + y_A[a]  <=  proxy_cost(b, a) + 1
+        For phase-matched edges:
+            y_B[b] + y_A[a]  ==  proxy_cost(b, a)
+
+        Proxy cost:
+            a in adj(b)  ->  adj_dist_int[entry]
+            a not in adj ->  d_min_b_int[b] + DR_int[nearest_s[b]][a]
+                             where DR_int[s][a] = y_A[a] - V[s][a]
         """
         device = self.device
         N = self.N
 
+        # -- Build sorted adjacency lookup (b*N + a -> adj_dist_int) -------------
         if self.adj_col.numel() != 0:
             all_b_for_adj = torch.repeat_interleave(
                 torch.arange(N, device=device, dtype=torch.long),
@@ -586,93 +599,84 @@ class SimpleGPUSolver:
             sorted_keys = adj_keys[sort_idx]
             sorted_dists = self.adj_dist_int[sort_idx].to(torch.long)
         else:
+            all_b_for_adj = torch.empty(0, device=device, dtype=torch.long)
             sorted_keys = torch.empty(0, device=device, dtype=torch.long)
             sorted_dists = torch.empty(0, device=device, dtype=torch.long)
 
-        def lookup_direct_cost(query_b, query_a):
-            query_keys = query_b.to(torch.long) * N + query_a.to(torch.long)
-            found = torch.zeros(query_keys.numel(), device=device, dtype=torch.bool)
-            costs = torch.zeros(query_keys.numel(), device=device, dtype=torch.long)
-            if query_keys.numel() == 0 or sorted_keys.numel() == 0:
-                return found, costs
+        def get_proxy(b_idx, a_idx):
+            """Compute proxy_cost for each (b, a) pair. Returns (K,) long tensor."""
+            # Default: triangle proxy through nearest sampled center
+            s = self.nearest_s[b_idx]
+            dr_int = self.y_A[a_idx].to(torch.long) - self.V[s, a_idx].to(torch.long)
+            proxy = self.d_min_b_int[b_idx].to(torch.long) + dr_int
 
-            pos = torch.searchsorted(sorted_keys, query_keys)
-            in_bounds = pos < sorted_keys.numel()
-            if in_bounds.any():
-                idx = torch.nonzero(in_bounds, as_tuple=True)[0]
-                matches = sorted_keys[pos[idx]] == query_keys[idx]
-                if matches.any():
-                    hit_idx = idx[matches]
-                    found[hit_idx] = True
-                    costs[hit_idx] = sorted_dists[pos[hit_idx]]
-            return found, costs
+            # Override with direct proxy where a is in adj(b)
+            if sorted_keys.numel() > 0:
+                keys = b_idx.to(torch.long) * N + a_idx.to(torch.long)
+                pos = torch.searchsorted(sorted_keys, keys)
+                in_bounds = pos < sorted_keys.numel()
+                if in_bounds.any():
+                    hit = in_bounds.clone()
+                    hit[in_bounds] = sorted_keys[pos[in_bounds]] == keys[in_bounds]
+                    if hit.any():
+                        proxy[hit] = sorted_dists[pos[hit]]
+            return proxy
 
-        def triangle_cost(query_b, query_a):
-            s = self.nearest_s[query_b]
-            dr_int = (
-                self.y_A[query_a].to(torch.long)
-                - self.V[s, query_a].to(torch.long)
-            )
-            return self.d_min_b_int[query_b].to(torch.long) + dr_int
+        results = {}
 
-        matched_b = torch.nonzero(self.match_B != -1, as_tuple=True)[0]
-        matched_a = self.match_B[matched_b]
+        # -- Check 1: CSR feasibility - all (b, a) where a in adj(b) -------------
+        # Condition: y_B[b] + y_A[a] <= adj_dist_int + 1
+        if self.adj_col.numel() > 0:
+            csr_b = all_b_for_adj
+            csr_a = self.adj_col
+            csr_lhs = self.y_B[csr_b].to(torch.long) + self.y_A[csr_a].to(torch.long)
+            csr_rhs = self.adj_dist_int.to(torch.long) + 1
+            csr_violations = int((csr_lhs > csr_rhs).sum().item())
+            csr_worst = int((csr_lhs - csr_rhs).max().item())
+        else:
+            csr_violations = 0
+            csr_worst = 0
 
+        results["csr_total"] = int(self.adj_col.numel())
+        results["csr_violations"] = csr_violations
+        results["csr_worst_excess"] = csr_worst
+        print(
+            f"[Verify] CSR feasibility ({self.adj_col.numel()} edges): "
+            f"{csr_violations} violations, worst excess = {csr_worst}"
+        )
+
+        # -- Check 2: Phase-matched admissibility - equality ----------------------
+        # Condition: y_B[b] + y_A[a] == proxy_cost(b, a)
         is_cleanup = torch.zeros(N, dtype=torch.bool, device=device)
         if self.cleanup_blues.numel() > 0:
             is_cleanup[self.cleanup_blues] = True
 
+        matched_b = torch.nonzero(self.match_B != -1, as_tuple=True)[0]
+        matched_a = self.match_B[matched_b]
         phase_mask = ~is_cleanup[matched_b]
         phase_b = matched_b[phase_mask]
         phase_a = matched_a[phase_mask]
-        phase_proxy = torch.empty(phase_b.numel(), device=device, dtype=torch.long)
 
-        if phase_b.numel() != 0:
-            phase_is_set1 = self.phase_match_is_set1[phase_b]
-            if phase_is_set1.any():
-                phase_proxy[phase_is_set1] = triangle_cost(
-                    phase_b[phase_is_set1], phase_a[phase_is_set1]
-                )
-            if (~phase_is_set1).any():
-                direct_found, direct_cost = lookup_direct_cost(
-                    phase_b[~phase_is_set1], phase_a[~phase_is_set1]
-                )
-                direct_proxy = torch.full_like(
-                    direct_cost, torch.iinfo(torch.int64).min // 4
-                )
-                direct_proxy[direct_found] = direct_cost[direct_found]
-                phase_proxy[~phase_is_set1] = direct_proxy
+        if phase_b.numel() > 0:
+            phase_proxy = get_proxy(phase_b, phase_a)
+            phase_lhs = self.y_B[phase_b].to(torch.long) + self.y_A[phase_a].to(torch.long)
+            diff = phase_lhs - phase_proxy
+            phase_violations = int((diff != 0).sum().item())
+            phase_min_diff = int(diff.min().item())
+            phase_max_diff = int(diff.max().item())
+        else:
+            phase_violations = 0
+            phase_min_diff = 0
+            phase_max_diff = 0
 
-        phase_lhs = self.y_B[phase_b].to(torch.long) + self.y_A[phase_a].to(torch.long)
-        phase_violations = int((phase_lhs != phase_proxy).sum().item())
-
-        cleanup_b = self.cleanup_blues
-        if cleanup_b.numel() != 0:
-            cleanup_b = cleanup_b[self.match_B[cleanup_b] != -1]
-        cleanup_a = self.match_B[cleanup_b]
-        cleanup_proxy = torch.empty(cleanup_b.numel(), device=device, dtype=torch.long)
-
-        if cleanup_b.numel() != 0:
-            cleanup_proxy[:] = triangle_cost(cleanup_b, cleanup_a)
-            direct_candidates = ~self.phase_match_is_set1[cleanup_b]
-            if direct_candidates.any():
-                candidate_pos = torch.nonzero(direct_candidates, as_tuple=True)[0]
-                direct_found, direct_cost = lookup_direct_cost(
-                    cleanup_b[candidate_pos], cleanup_a[candidate_pos]
-                )
-                if direct_found.any():
-                    cleanup_proxy[candidate_pos[direct_found]] = direct_cost[
-                        direct_found
-                    ]
-
-        cleanup_lhs = (
-            self.y_B[cleanup_b].to(torch.long) + self.y_A[cleanup_a].to(torch.long)
+        results["phase_total"] = int(phase_b.numel())
+        results["phase_violations"] = phase_violations
+        results["phase_min_diff"] = phase_min_diff
+        results["phase_max_diff"] = phase_max_diff
+        print(
+            f"[Verify] Phase admissibility ({phase_b.numel()} edges): "
+            f"{phase_violations} violations, "
+            f"lhs - proxy range = [{phase_min_diff}, {phase_max_diff}]"
         )
-        cleanup_violations = int((cleanup_lhs > cleanup_proxy).sum().item())
 
-        return {
-            "phase_total": int(phase_b.numel()),
-            "phase_violations": phase_violations,
-            "cleanup_total": int(cleanup_b.numel()),
-            "cleanup_violations": cleanup_violations,
-        }
+        return results
