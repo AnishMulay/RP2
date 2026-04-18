@@ -435,29 +435,29 @@ def diff_or_nan(a, b):
 def print_violation_table(rows):
     print()
     print(
-        "  N    | PhaseTotal | PhaseViol | CleanupTotal | CleanupViol"
+        "  N    | FeasViol | FeasWorst | AdmisViol | AdmisWorst"
     )
     print(
-        "-------|------------|-----------|--------------|------------"
+        "-------|----------|-----------|-----------|------------"
     )
 
     for row in rows:
         n = row["n"]
         f = row["results"]["Simple"].get("feasibility")
         if f is None:
-            phase_total = phase_violations = cleanup_total = cleanup_violations = None
+            feas_viol = feas_worst = admis_viol = admis_worst = None
         else:
-            phase_total = f["phase_total"]
-            phase_violations = f["phase_violations"]
-            cleanup_total = f["cleanup_total"]
-            cleanup_violations = f["cleanup_violations"]
+            feas_viol   = f["feasibility_violations"]
+            feas_worst  = f["feasibility_worst_excess"]
+            admis_viol  = f["admissibility_violations"]
+            admis_worst = f["admissibility_worst_diff"]
 
         print(
             f"{n:>6,} | "
-            f"{format_count(phase_total):>10} | "
-            f"{format_count(phase_violations):>9} | "
-            f"{format_count(cleanup_total):>12} | "
-            f"{format_count(cleanup_violations):>10}"
+            f"{format_count(feas_viol):>8} | "
+            f"{format_count(feas_worst):>9} | "
+            f"{format_count(admis_viol):>9} | "
+            f"{format_count(admis_worst):>10}"
         )
 
 

@@ -194,7 +194,7 @@ class SimpleGPUSolver:
                 delta = self._compute_delta(
                     B_free, unique_pairs, delta_pair_inverse
                 )
-                self.y_B[B_free] += delta
+                self.y_B[B_free] += 1
                 _print_progress(iteration, num_free, num_free, "no_proposals")
                 continue
 
@@ -243,7 +243,7 @@ class SimpleGPUSolver:
             delta = self._compute_delta(
                 F_B_new, unique_pairs_new, pair_inverse_new
             )
-            self.y_B[F_B_new] += delta
+            self.y_B[F_B_new] += 1
             self.y_A[r_new] -= 1
             self.V[:, r_new] -= 1
 
