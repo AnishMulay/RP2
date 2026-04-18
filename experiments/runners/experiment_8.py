@@ -28,7 +28,7 @@ SEED = 42
 BATCH_SIZE = 512
 WARMUP_RUNS = 0
 TIMED_RUNS = 1
-METHODS = ("Exact", "ProxyExact", "Simple")
+METHODS = ("Exact", "ProxyExact", "DiscreteProxyExact", "Simple")
 SAMPLE_FACTOR_DEFAULT = 1.0
 
 
@@ -107,6 +107,40 @@ def build_proxy_matrix(clustering, N, epsilon):
         C[adj_col, b_indices] = adj_dist_float
 
     return C.cpu().to(torch.float64).numpy()
+
+
+def build_discrete_proxy_matrix(clustering, N, epsilon):
+    """
+    Build an (N, N) proxy matrix from discretized integer proxy costs.
+
+    The returned matrix uses normalized real units:
+        epsilon * integer_proxy_cost
+
+    Shape/orientation matches build_proxy_matrix(): rows are red points and
+    columns are blue points.
+    """
+    device = clustering["DR_int"].device
+    DR_int = clustering["DR_int"]
+    d_min_b_int = clustering["d_min_b_int"]
+    nearest_s = clustering["nearest_s"]
+    adj_ptr = clustering["adj_ptr"]
+    adj_col = clustering["adj_col"]
+    adj_dist_int = clustering["adj_dist_int"]
+
+    C = (
+        d_min_b_int.to(torch.float64).unsqueeze(1)
+        + DR_int[nearest_s, :].to(torch.float64)
+    ).T
+    C.mul_(float(epsilon))
+
+    if adj_col.numel() > 0:
+        b_indices = torch.repeat_interleave(
+            torch.arange(N, device=device, dtype=torch.long),
+            adj_ptr[1:] - adj_ptr[:-1],
+        )
+        C[adj_col, b_indices] = adj_dist_int.to(torch.float64) * float(epsilon)
+
+    return C.cpu().numpy()
 
 
 def matching_from_plan(plan):
@@ -194,6 +228,38 @@ def benchmark_proxy_exact(P_red, P_blue, device, epsilon, sample_factor):
 
     del plan, match_B, C, clustering, cluster_engine
     return (t1 - t0) * 1000.0, total_cost, avg_cost, proxy_stats
+
+
+def benchmark_discrete_proxy_exact(P_red, P_blue, device, epsilon, sample_factor):
+    if ot is None:
+        raise RuntimeError("POT is not installed; exact solver unavailable.")
+
+    P_red_norm, P_blue_norm, diameter = normalize_points(P_red, P_blue)
+    N = P_red_norm.shape[0]
+
+    cluster_engine = SimpleClustering(
+        epsilon=epsilon, tile_size=BATCH_SIZE, sample_factor=sample_factor
+    )
+    clustering = cluster_engine.run(P_red_norm, P_blue_norm)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    C = build_discrete_proxy_matrix(clustering, N, epsilon)
+
+    a = np.full(N, 1.0 / N, dtype=np.float64)
+    b = np.full(N, 1.0 / N, dtype=np.float64)
+
+    t0 = time.perf_counter()
+    plan = ot.emd(a, b, C, numItermax=10**6)
+    t1 = time.perf_counter()
+
+    match_B = matching_from_plan(plan)
+    total_cost, avg_cost = matching_costs(P_red_norm, P_blue_norm, match_B)
+    total_cost *= diameter
+    avg_cost *= diameter
+
+    del plan, match_B, C, clustering, cluster_engine
+    return (t1 - t0) * 1000.0, total_cost, avg_cost
 
 
 def benchmark_simple(P_red, P_blue, device, epsilon, sample_factor):
@@ -291,6 +357,10 @@ def run_method(n, method_name, P_red, P_blue, device, epsilon, sample_factor):
             time_ms, total_cost, avg_cost, proxy_stats = benchmark_proxy_exact(
                 P_red, P_blue, device, epsilon, sample_factor
             )
+        elif method_name == "DiscreteProxyExact":
+            time_ms, total_cost, avg_cost = benchmark_discrete_proxy_exact(
+                P_red, P_blue, device, epsilon, sample_factor
+            )
         elif method_name == "Simple":
             (
                 time_ms,
@@ -344,133 +414,131 @@ def format_phases(value):
     return f"{int(value)}"
 
 
-def format_speedup(exact_result, simple_result):
-    exact_time = exact_result["time_ms"]
-    simple_time = simple_result["time_ms"]
-    if (
-        not is_available(exact_time)
-        or not is_available(simple_time)
-        or simple_time == 0
-    ):
+def format_count(value):
+    if value is None:
         return "N/A"
-    return f"{exact_time / simple_time:.2f}x"
+    return f"{int(value)}"
 
 
-def format_add_err(exact_result, simple_result):
-    exact_avg = exact_result["avg_cost"]
-    simple_avg = simple_result["avg_cost"]
-    if not is_available(exact_avg) or not is_available(simple_avg):
+def format_diff(value):
+    if not is_available(value):
         return "N/A"
-    return f"{simple_avg - exact_avg:.4f}"
+    return f"{value:.6f}"
 
 
-def print_table(rows):
+def diff_or_nan(a, b):
+    if not is_available(a) or not is_available(b):
+        return math.nan
+    return a - b
+
+
+def print_violation_table(rows):
     print()
     print(
-        "  N    | ExactT(ms) | ProxyT(ms) | SimpleT(ms) | Phases | Speedup | "
-        "ExactAvg | ProxyAvg | SimpleAvg | ProxyAddErr | SimpleAddErr"
+        "  N    | PhaseTotal | PhaseViol | CleanupTotal | CleanupViol"
     )
     print(
-        "-------|------------|------------|-------------|--------|---------|"
-        "----------|----------|-----------|-------------|-------------"
+        "-------|------------|-----------|--------------|------------"
+    )
+
+    for row in rows:
+        n = row["n"]
+        f = row["results"]["Simple"].get("feasibility")
+        if f is None:
+            phase_total = phase_violations = cleanup_total = cleanup_violations = None
+        else:
+            phase_total = f["phase_total"]
+            phase_violations = f["phase_violations"]
+            cleanup_total = f["cleanup_total"]
+            cleanup_violations = f["cleanup_violations"]
+
+        print(
+            f"{n:>6,} | "
+            f"{format_count(phase_total):>10} | "
+            f"{format_count(phase_violations):>9} | "
+            f"{format_count(cleanup_total):>12} | "
+            f"{format_count(cleanup_violations):>10}"
+        )
+
+
+def print_timing_table(rows):
+    print()
+    print(
+        "  N    | ExactT(ms) | ProxyT(ms) | DiscProxyT(ms) | SimpleT(ms) | Phases"
+    )
+    print(
+        "-------|------------|------------|----------------|-------------|-------"
     )
 
     for row in rows:
         n = row["n"]
         exact = row["results"]["Exact"]
         proxy = row["results"]["ProxyExact"]
+        disc = row["results"]["DiscreteProxyExact"]
         simple = row["results"]["Simple"]
 
         print(
             f"{n:>6,} | "
             f"{format_time(exact['time_ms']):>10} | "
             f"{format_time(proxy['time_ms']):>10} | "
+            f"{format_time(disc['time_ms']):>14} | "
             f"{format_time(simple['time_ms']):>11} | "
-            f"{format_phases(simple['phases']):>6} | "
-            f"{format_speedup(exact, simple):>7} | "
-            f"{format_avg_cost(exact['avg_cost']):>8} | "
-            f"{format_avg_cost(proxy['avg_cost']):>8} | "
-            f"{format_avg_cost(simple['avg_cost']):>9} | "
-            f"{format_add_err(exact, proxy):>11} | "
-            f"{format_add_err(proxy, simple):>11}"
+            f"{format_phases(simple['phases']):>6}"
         )
 
 
-def print_feasibility_table(rows):
+def print_cost_table(rows):
     print()
-    print("Feasibility Verification Table (Simple solver)")
     print(
-        "  N    | Ch1 Violations | Ch1 WorstSlack | "
-        "Ch2 Total | Ch2 Violations | Ch2 SlackRange | "
-        "Ch3 Total | Ch3 Violations | Ch3 SlackRange"
+        "  N    | ExactAvg | ProxyAvg | DiscProxyAvg | SimpleAvg"
     )
-    print("-" * 120)
+    print(
+        "-------|----------|----------|--------------|----------"
+    )
 
     for row in rows:
         n = row["n"]
-        f = row["results"]["Simple"].get("feasibility")
-        if f is None:
-            print(f"{n:>6,} | {'N/A':>14} | {'N/A':>14} | {'N/A':>9} | {'N/A':>14} | {'N/A':>14} | {'N/A':>9} | {'N/A':>14} | {'N/A':>14}")
-            continue
-
-        def fmt_range(mn, mx):
-            if mn is None or mx is None:
-                return "N/A"
-            return f"[{mn}, {mx}]"
+        exact = row["results"]["Exact"]
+        proxy = row["results"]["ProxyExact"]
+        disc = row["results"]["DiscreteProxyExact"]
+        simple = row["results"]["Simple"]
 
         print(
             f"{n:>6,} | "
-            f"{f['check1_violations']:>14} | "
-            f"{f['check1_worst_slack']:>14} | "
-            f"{f['check2_total']:>9} | "
-            f"{f['check2_violations']:>14} | "
-            f"{fmt_range(f['check2_min'], f['check2_max']):>14} | "
-            f"{f['check3_total']:>9} | "
-            f"{f['check3_violations']:>14} | "
-            f"{fmt_range(f['check3_min'], f['check3_max']):>14}"
+            f"{format_avg_cost(exact['avg_cost']):>8} | "
+            f"{format_avg_cost(proxy['avg_cost']):>8} | "
+            f"{format_avg_cost(disc['avg_cost']):>12} | "
+            f"{format_avg_cost(simple['avg_cost']):>8}"
         )
 
 
-def print_adj_stats_table(rows):
+def print_error_breakdown_table(rows):
     print()
-    print("Adjacency List Size Quantiles (per blue point, from SimpleClustering)")
     print(
-        f"  {'N':>6} | {'Mean':>7} | {'Min':>6} | {'P10':>6} | {'P25':>6} | "
-        f"{'P50':>6} | {'P75':>6} | {'P90':>6} | {'P95':>6} | {'P99':>6} | "
-        f"{'Max':>6} | {'Samples':>9}"
+        "  N    | ProxyErr | DiscErr | SolverErr | TotalErr"
     )
-    print("-" * 107)
+    print(
+        "-------|----------|---------|-----------|---------"
+    )
+
     for row in rows:
         n = row["n"]
-        s = row["results"]["Simple"].get("adj_stats")
-        if s is None:
-            print(f"  {n:>6,} | {'N/A':>7} | {'N/A':>9}")
-            continue
-        print(
-            f"  {n:>6,} | {s['mean']:>7.1f} | {s['min']:>6.0f} | {s['p10']:>6.0f} | "
-            f"{s['p25']:>6.0f} | {s['p50']:>6.0f} | {s['p75']:>6.0f} | {s['p90']:>6.0f} | "
-            f"{s['p95']:>6.0f} | {s['p99']:>6.0f} | {s['max']:>6.0f} | "
-            f"{s['samples']:>9,}"
-        )
+        exact_avg = row["results"]["Exact"]["avg_cost"]
+        proxy_avg = row["results"]["ProxyExact"]["avg_cost"]
+        disc_avg = row["results"]["DiscreteProxyExact"]["avg_cost"]
+        simple_avg = row["results"]["Simple"]["avg_cost"]
 
+        proxy_err = diff_or_nan(proxy_avg, exact_avg)
+        disc_err = diff_or_nan(disc_avg, proxy_avg)
+        solver_err = diff_or_nan(simple_avg, disc_avg)
+        total_err = diff_or_nan(simple_avg, exact_avg)
 
-def print_proxy_override_table(rows):
-    print()
-    print("ProxyExact Matrix Overrides (adjacency entries replacing sampled-center proxy)")
-    print(
-        f"  {'N':>6} | {'Samples':>9} | {'Overrides':>12} | "
-        f"{'Total':>12} | {'Override%':>9}"
-    )
-    print("-" * 61)
-    for row in rows:
-        n = row["n"]
-        s = row["results"]["ProxyExact"].get("proxy_stats")
-        if s is None:
-            print(f"  {n:>6,} | {'N/A':>9} | {'N/A':>12} | {'N/A':>12} | {'N/A':>9}")
-            continue
         print(
-            f"  {n:>6,} | {s['samples']:>9,} | {s['overrides']:>12,} | "
-            f"{s['total_entries']:>12,} | {s['override_pct']:>8.4f}%"
+            f"{n:>6,} | "
+            f"{format_diff(proxy_err):>8} | "
+            f"{format_diff(disc_err):>7} | "
+            f"{format_diff(solver_err):>9} | "
+            f"{format_diff(total_err):>7}"
         )
 
 
@@ -589,10 +657,10 @@ def main():
         del P_red, P_blue
         empty_cache_if_cuda(device)
 
-    print_table(rows)
-    print_feasibility_table(rows)
-    print_adj_stats_table(rows)
-    print_proxy_override_table(rows)
+    print_violation_table(rows)
+    print_timing_table(rows)
+    print_cost_table(rows)
+    print_error_breakdown_table(rows)
 
 
 if __name__ == "__main__":

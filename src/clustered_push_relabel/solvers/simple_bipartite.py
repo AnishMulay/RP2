@@ -113,6 +113,9 @@ class SimpleGPUSolver:
         self.match_A = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
         self.match_B = torch.full((self.N,), -1, device=self.device, dtype=torch.long)
         self.cleanup_blues = torch.empty(0, device=self.device, dtype=torch.long)
+        self.phase_match_is_set1 = torch.zeros(
+            self.N, device=self.device, dtype=torch.bool
+        )
 
         # Existing experiment code uses MA/MB and yA/yB naming.
         self.yA = self.y_A
@@ -125,19 +128,6 @@ class SimpleGPUSolver:
         N = self.N
         device = self.device
         B_free = torch.arange(N, device=device, dtype=torch.long)
-        diag_set1_proposals_total = 0
-        diag_set1_proposals_bad = 0
-        diag_set2_proposals_total = 0
-        diag_set2_proposals_bad = 0
-
-        diag_set1_accepts_total = 0
-        diag_set1_accepts_bad_pre = 0
-        diag_set2_accepts_total = 0
-        diag_set2_accepts_bad_pre = 0
-
-        diag_accepts_total_post = 0
-        diag_accepts_bad_post = 0
-
         iteration = 0
 
         def _print_progress(iteration, free_before, free_after, status):
@@ -193,64 +183,10 @@ class SimpleGPUSolver:
                 proposal_a_parts.append(a1)
                 proposal_b_parts.append(b1)
 
-            if a1.numel() != 0:
-                s1 = self.nearest_s[b1]
-                triangle_proxy_1 = (
-                    self.d_min_b_int[b1].to(torch.long)
-                    + (
-                        self.y_A[a1].to(torch.long)
-                        - self.V[s1, a1].to(torch.long)
-                    )
-                )
-                lhs1 = self.y_B[b1].to(torch.long) + self.y_A[a1].to(torch.long)
-                bad1 = (lhs1 != (triangle_proxy_1 + 1)).sum().item()
-                diag_set1_proposals_total += int(a1.numel())
-                diag_set1_proposals_bad += int(bad1)
-
             b2, a2 = self._set2_sample(B_free, choose_set2)
             if a2.numel() != 0:
                 proposal_a_parts.append(a2)
                 proposal_b_parts.append(b2)
-
-            if a2.numel() != 0:
-                starts2 = self.adj_ptr[b2]
-                ends2 = self.adj_ptr[b2 + 1]
-                lengths2 = ends2 - starts2
-                total_edges2 = int(lengths2.sum().item())
-
-                edge_range2 = _ensure_long_arange(
-                    self, "_diag_set2_edge_arange", total_edges2, self.device
-                )
-                sel_pos2 = _ensure_long_arange(
-                    self, "_diag_set2_pos", b2.numel(), self.device
-                )
-                cum_len2 = torch.cumsum(lengths2, dim=0)
-                packed_starts2 = cum_len2 - lengths2
-
-                active_sel_pos2 = torch.repeat_interleave(sel_pos2, lengths2)
-                active_b2 = b2[active_sel_pos2]
-                active_edge_idx2 = (
-                    torch.repeat_interleave(starts2, lengths2)
-                    + edge_range2
-                    - torch.repeat_interleave(packed_starts2, lengths2)
-                )
-                active_a2 = self.adj_col[active_edge_idx2]
-
-                target_keys2 = b2.to(torch.long) * self.N + a2.to(torch.long)
-                active_keys2 = active_b2.to(torch.long) * self.N + active_a2.to(torch.long)
-
-                sort_idx2 = torch.argsort(active_keys2)
-                sorted_keys2 = active_keys2[sort_idx2]
-                sorted_edge_idx2 = active_edge_idx2[sort_idx2]
-
-                pos2 = torch.searchsorted(sorted_keys2, target_keys2)
-                matched_edge_idx2 = sorted_edge_idx2[pos2]
-
-                direct_proxy_2 = self.adj_dist_int[matched_edge_idx2].to(torch.long)
-                lhs2 = self.y_B[b2].to(torch.long) + self.y_A[a2].to(torch.long)
-                bad2 = (lhs2 != (direct_proxy_2 + 1)).sum().item()
-                diag_set2_proposals_total += int(a2.numel())
-                diag_set2_proposals_bad += int(bad2)
 
             if not proposal_a_parts:
                 delta = self._compute_delta(
@@ -264,24 +200,28 @@ class SimpleGPUSolver:
             proposal_b = torch.cat(proposal_b_parts)
 
             proposal_is_set1_parts = []
-            proposal_proxy_parts = []
 
             if a1.numel() != 0:
                 proposal_is_set1_parts.append(
                     torch.ones(a1.numel(), device=device, dtype=torch.bool)
                 )
-                proposal_proxy_parts.append(triangle_proxy_1)
 
             if a2.numel() != 0:
                 proposal_is_set1_parts.append(
                     torch.zeros(a2.numel(), device=device, dtype=torch.bool)
                 )
-                proposal_proxy_parts.append(direct_proxy_2)
 
             proposal_is_set1 = torch.cat(proposal_is_set1_parts)
-            proposal_proxy = torch.cat(proposal_proxy_parts).to(torch.long)
 
             r_new, b_new = self._resolve_conflicts(proposal_a, proposal_b)
+
+            if r_new.numel() == 0:
+                delta = self._compute_delta(
+                    B_free, unique_pairs, delta_pair_inverse
+                )
+                self.y_B[B_free] += delta
+                _print_progress(iteration, num_free, num_free, "no_accepts")
+                continue
 
             accepted_keys = b_new.to(torch.long) * self.N + r_new.to(torch.long)
             proposal_keys = proposal_b.to(torch.long) * self.N + proposal_a.to(torch.long)
@@ -293,36 +233,7 @@ class SimpleGPUSolver:
             accepted_prop_idx = sort_prop_idx[accepted_pos]
 
             accepted_is_set1 = proposal_is_set1[accepted_prop_idx]
-            accepted_proxy = proposal_proxy[accepted_prop_idx].to(torch.long)
-
-            if r_new.numel() == 0:
-                delta = self._compute_delta(
-                    B_free, unique_pairs, delta_pair_inverse
-                )
-                self.y_B[B_free] += delta
-                _print_progress(iteration, num_free, num_free, "no_accepts")
-                continue
-
-            if r_new.numel() != 0:
-                lhs_accept_pre = (
-                    self.y_B[b_new].to(torch.long) + self.y_A[r_new].to(torch.long)
-                )
-
-                if accepted_is_set1.any():
-                    bad_pre_1 = (
-                        lhs_accept_pre[accepted_is_set1]
-                        != (accepted_proxy[accepted_is_set1] + 1)
-                    ).sum().item()
-                    diag_set1_accepts_total += int(accepted_is_set1.sum().item())
-                    diag_set1_accepts_bad_pre += int(bad_pre_1)
-
-                if (~accepted_is_set1).any():
-                    bad_pre_2 = (
-                        lhs_accept_pre[~accepted_is_set1]
-                        != (accepted_proxy[~accepted_is_set1] + 1)
-                    ).sum().item()
-                    diag_set2_accepts_total += int((~accepted_is_set1).sum().item())
-                    diag_set2_accepts_bad_pre += int(bad_pre_2)
+            self.phase_match_is_set1[b_new] = accepted_is_set1
 
             F_B_new = self._update_matching(B_free, r_new, b_new)
 
@@ -334,47 +245,8 @@ class SimpleGPUSolver:
             self.y_A[r_new] -= 1
             self.V[:, r_new] -= 1
 
-            if r_new.numel() != 0:
-                lhs_accept_post = (
-                    self.y_B[b_new].to(torch.long) + self.y_A[r_new].to(torch.long)
-                )
-                bad_post = (lhs_accept_post != accepted_proxy).sum().item()
-                diag_accepts_total_post += int(r_new.numel())
-                diag_accepts_bad_post += int(bad_post)
-
             _print_progress(iteration, num_free, F_B_new.numel(), "ok")
             B_free = F_B_new
-
-        print(
-            "[Diag] Set1 proposals: "
-            f"{diag_set1_proposals_total} total, "
-            f"{diag_set1_proposals_bad} bad "
-            f"(lhs != triangle_proxy + 1)"
-        )
-        print(
-            "[Diag] Set2 proposals: "
-            f"{diag_set2_proposals_total} total, "
-            f"{diag_set2_proposals_bad} bad "
-            f"(lhs != direct_proxy + 1)"
-        )
-        print(
-            "[Diag] Set1 accepted pre-update: "
-            f"{diag_set1_accepts_total} total, "
-            f"{diag_set1_accepts_bad_pre} bad "
-            f"(lhs != triangle_proxy + 1)"
-        )
-        print(
-            "[Diag] Set2 accepted pre-update: "
-            f"{diag_set2_accepts_total} total, "
-            f"{diag_set2_accepts_bad_pre} bad "
-            f"(lhs != direct_proxy + 1)"
-        )
-        print(
-            "[Diag] Accepted post-update: "
-            f"{diag_accepts_total_post} total, "
-            f"{diag_accepts_bad_post} bad "
-            f"(lhs != stored_proxy)"
-        )
 
         self.iterations = iteration
         self.cleanup_remaining_points()
@@ -663,6 +535,7 @@ class SimpleGPUSolver:
         evicted_b = self.match_A[r_new[was_matched]].clone()
         if evicted_b.numel() != 0:
             self.match_B[evicted_b] = -1
+            self.phase_match_is_set1[evicted_b] = False
 
         self.match_A[r_new] = b_new
         self.match_B[b_new] = r_new
@@ -698,113 +571,108 @@ class SimpleGPUSolver:
 
     def verify_solution(self):
         """
-        Admissibility check for phase-matched edges only.
-
-        For every (b, a) pair matched during the phase loop (not cleanup),
-        the admissibility condition requires:
-            y_B[b] + y_A[a] == proxy_cost(b, a)
-
-        Proxy cost is:
-            - adj_dist_int[entry]                       if a is in b's adjacency list
-            - d_min_b_int[b] + DR_int[nearest_s[b]][a]  otherwise (two-hop bridge)
-
-        Reports the number of violations of this condition.
+        Return compact branch-aware admissibility and cleanup feasibility counts.
         """
         device = self.device
         N = self.N
 
-        print("\n[Verify] Checking admissibility of phase-matched edges...")
-
-        matched_b_mask = self.match_B != -1
-        matched_b = torch.nonzero(matched_b_mask, as_tuple=True)[0]
-        matched_a = self.match_B[matched_b]
-
-        if matched_b.numel() == 0:
-            print("[Verify] No matched edges to check.")
-            return {"phase_total": 0, "phase_violations": 0}
-
-        # Exclude cleanup-matched blues
-        is_cleanup = torch.zeros(N, dtype=torch.bool, device=device)
-        if self.cleanup_blues.numel() > 0:
-            is_cleanup[self.cleanup_blues] = True
-        phase_mask = ~is_cleanup[matched_b]
-        phase_b = matched_b[phase_mask]
-        phase_a = matched_a[phase_mask]
-
-        if phase_b.numel() == 0:
-            print("[Verify] No phase-matched edges to check.")
-            return {"phase_total": 0, "phase_violations": 0}
-
-        # Build proxy cost for each phase-matched edge
-        # Encode all CSR entries as b*N + a for membership lookup
-        all_b_for_adj = torch.repeat_interleave(
-            torch.arange(N, device=device, dtype=torch.long),
-            self.adj_ptr[1:] - self.adj_ptr[:-1],
-        )
-        adj_keys = all_b_for_adj * N + self.adj_col  # (M,)
-        matched_keys = phase_b * N + phase_a         # (num_phase,)
-        in_adj = torch.isin(matched_keys, adj_keys)  # (num_phase,) bool
-
-        proxy_cost = torch.zeros(phase_b.numel(), device=device, dtype=torch.long)
-
-        # In-adjacency-list edges: use stored direct distance
-        if in_adj.any():
+        if self.adj_col.numel() != 0:
+            all_b_for_adj = torch.repeat_interleave(
+                torch.arange(N, device=device, dtype=torch.long),
+                self.adj_ptr[1:] - self.adj_ptr[:-1],
+            )
+            adj_keys = all_b_for_adj * N + self.adj_col
             sort_idx = torch.argsort(adj_keys)
             sorted_keys = adj_keys[sort_idx]
             sorted_dists = self.adj_dist_int[sort_idx].to(torch.long)
-            pos = torch.searchsorted(sorted_keys, matched_keys[in_adj])
-            proxy_cost[in_adj] = sorted_dists[pos]
+        else:
+            sorted_keys = torch.empty(0, device=device, dtype=torch.long)
+            sorted_dists = torch.empty(0, device=device, dtype=torch.long)
 
-        # Diagnostic: for in-adj edges, also compute the triangle proxy and compare
-        if in_adj.any():
-            in_b = phase_b[in_adj]
-            in_a = phase_a[in_adj]
-            s_in = self.nearest_s[in_b]
-            dr_int_in = (
-                self.y_A[in_a].to(torch.long)
-                - self.V[s_in, in_a].to(torch.long)
-            )
-            triangle_proxy_for_in_adj = (
-                self.d_min_b_int[in_b].to(torch.long) + dr_int_in
-            )
-            direct_proxy_for_in_adj = proxy_cost[in_adj]
-            lhs_in = (
-                self.y_B[in_b].to(torch.long)
-                + self.y_A[in_a].to(torch.long)
-            )
-            matches_direct   = (lhs_in == direct_proxy_for_in_adj).sum().item()
-            matches_triangle = (lhs_in == triangle_proxy_for_in_adj).sum().item()
-            matches_neither  = int(in_adj.sum().item()) - matches_direct - matches_triangle
-            print(
-                f"[Diag] In-adj edges: {int(in_adj.sum().item())} total. "
-                f"Match direct proxy: {matches_direct}, "
-                f"match triangle proxy: {matches_triangle}, "
-                f"match neither: {matches_neither}"
-            )
+        def lookup_direct_cost(query_b, query_a):
+            query_keys = query_b.to(torch.long) * N + query_a.to(torch.long)
+            found = torch.zeros(query_keys.numel(), device=device, dtype=torch.bool)
+            costs = torch.zeros(query_keys.numel(), device=device, dtype=torch.long)
+            if query_keys.numel() == 0 or sorted_keys.numel() == 0:
+                return found, costs
 
-        # Not in adjacency list: use two-hop bridge through nearest sampled center
-        # DR_int[s][a] = y_A[a] - V[s][a]  (since V[s][a] = y_A[a] - DR_int[s][a])
-        if (~in_adj).any():
-            na_b = phase_b[~in_adj]
-            na_a = phase_a[~in_adj]
-            s_na = self.nearest_s[na_b]
-            dr_int_na = (
-                self.y_A[na_a].to(torch.long)
-                - self.V[s_na, na_a].to(torch.long)
+            pos = torch.searchsorted(sorted_keys, query_keys)
+            in_bounds = pos < sorted_keys.numel()
+            if in_bounds.any():
+                idx = torch.nonzero(in_bounds, as_tuple=True)[0]
+                matches = sorted_keys[pos[idx]] == query_keys[idx]
+                if matches.any():
+                    hit_idx = idx[matches]
+                    found[hit_idx] = True
+                    costs[hit_idx] = sorted_dists[pos[hit_idx]]
+            return found, costs
+
+        def triangle_cost(query_b, query_a):
+            s = self.nearest_s[query_b]
+            dr_int = (
+                self.y_A[query_a].to(torch.long)
+                - self.V[s, query_a].to(torch.long)
             )
-            proxy_cost[~in_adj] = self.d_min_b_int[na_b].to(torch.long) + dr_int_na
+            return self.d_min_b_int[query_b].to(torch.long) + dr_int
 
-        # Admissibility condition: y_B[b] + y_A[a] == proxy_cost
-        lhs = self.y_B[phase_b].to(torch.long) + self.y_A[phase_a].to(torch.long)
-        violations = int((lhs != proxy_cost).sum().item())
+        matched_b = torch.nonzero(self.match_B != -1, as_tuple=True)[0]
+        matched_a = self.match_B[matched_b]
 
-        print(
-            f"[Verify] Phase-matched edges: {phase_b.numel()} total, "
-            f"{violations} admissibility violations "
-            f"(y_B[b] + y_A[a] != proxy_cost)"
+        is_cleanup = torch.zeros(N, dtype=torch.bool, device=device)
+        if self.cleanup_blues.numel() > 0:
+            is_cleanup[self.cleanup_blues] = True
+
+        phase_mask = ~is_cleanup[matched_b]
+        phase_b = matched_b[phase_mask]
+        phase_a = matched_a[phase_mask]
+        phase_proxy = torch.empty(phase_b.numel(), device=device, dtype=torch.long)
+
+        if phase_b.numel() != 0:
+            phase_is_set1 = self.phase_match_is_set1[phase_b]
+            if phase_is_set1.any():
+                phase_proxy[phase_is_set1] = triangle_cost(
+                    phase_b[phase_is_set1], phase_a[phase_is_set1]
+                )
+            if (~phase_is_set1).any():
+                direct_found, direct_cost = lookup_direct_cost(
+                    phase_b[~phase_is_set1], phase_a[~phase_is_set1]
+                )
+                direct_proxy = torch.full_like(
+                    direct_cost, torch.iinfo(torch.int64).min // 4
+                )
+                direct_proxy[direct_found] = direct_cost[direct_found]
+                phase_proxy[~phase_is_set1] = direct_proxy
+
+        phase_lhs = self.y_B[phase_b].to(torch.long) + self.y_A[phase_a].to(torch.long)
+        phase_violations = int((phase_lhs != phase_proxy).sum().item())
+
+        cleanup_b = self.cleanup_blues
+        if cleanup_b.numel() != 0:
+            cleanup_b = cleanup_b[self.match_B[cleanup_b] != -1]
+        cleanup_a = self.match_B[cleanup_b]
+        cleanup_proxy = torch.empty(cleanup_b.numel(), device=device, dtype=torch.long)
+
+        if cleanup_b.numel() != 0:
+            cleanup_proxy[:] = triangle_cost(cleanup_b, cleanup_a)
+            direct_candidates = ~self.phase_match_is_set1[cleanup_b]
+            if direct_candidates.any():
+                candidate_pos = torch.nonzero(direct_candidates, as_tuple=True)[0]
+                direct_found, direct_cost = lookup_direct_cost(
+                    cleanup_b[candidate_pos], cleanup_a[candidate_pos]
+                )
+                if direct_found.any():
+                    cleanup_proxy[candidate_pos[direct_found]] = direct_cost[
+                        direct_found
+                    ]
+
+        cleanup_lhs = (
+            self.y_B[cleanup_b].to(torch.long) + self.y_A[cleanup_a].to(torch.long)
         )
+        cleanup_violations = int((cleanup_lhs > cleanup_proxy).sum().item())
 
         return {
-            "phase_total": phase_b.numel(),
-            "phase_violations": violations,
+            "phase_total": int(phase_b.numel()),
+            "phase_violations": phase_violations,
+            "cleanup_total": int(cleanup_b.numel()),
+            "cleanup_violations": cleanup_violations,
         }
