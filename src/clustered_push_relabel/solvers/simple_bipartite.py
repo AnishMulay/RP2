@@ -250,7 +250,11 @@ class SimpleGPUSolver:
                         iteration,
                         require_matched_equality=True,
                     )
-                self.y_B[B_free] += 1
+                unique_delta_pairs, delta_pair_inverse = self._set1_delta_groups(B_free)
+                delta = self._compute_delta(
+                    B_free, unique_delta_pairs, delta_pair_inverse
+                )
+                self.y_B[B_free] += delta
                 if self.debug_audit:
                     self.audit_full_feasibility(
                         "after_dual_updates",
@@ -314,7 +318,11 @@ class SimpleGPUSolver:
                         iteration,
                         require_matched_equality=True,
                     )
-                self.y_B[B_free] += 1
+                unique_delta_pairs, delta_pair_inverse = self._set1_delta_groups(B_free)
+                delta = self._compute_delta(
+                    B_free, unique_delta_pairs, delta_pair_inverse
+                )
+                self.y_B[B_free] += delta
                 if self.debug_audit:
                     self.audit_full_feasibility(
                         "after_dual_updates",
@@ -345,7 +353,11 @@ class SimpleGPUSolver:
                     require_matched_equality=False,
                 )
 
-            self.y_B[F_B_new] += 1
+            unique_delta_pairs, delta_pair_inverse = self._set1_delta_groups(F_B_new)
+            delta = self._compute_delta(
+                F_B_new, unique_delta_pairs, delta_pair_inverse
+            )
+            self.y_B[F_B_new] += delta
             self.y_A[r_new] -= 1
             self.V[:, r_new] -= 1
             if self.debug_audit:
@@ -501,16 +513,25 @@ class SimpleGPUSolver:
     def _compute_delta(self, B_free, unique_pairs, pair_inverse):
         num_free = B_free.numel()
         if num_free == 0:
-            return 1
+            return 0
 
-        pair_s = unique_pairs[:, 0].to(torch.long)
-        v_pair_row_max = self.V[pair_s].max(dim=1).values.to(torch.long)
+        sentinel = torch.iinfo(torch.int64).max // 4
         target1 = (
             self.d_min_b_int[B_free] + 1 - self.y_B[B_free]
         ).to(torch.long)
-        min_slack1_per_blue = target1 - v_pair_row_max[pair_inverse]
+        min_slack1_per_blue = torch.full(
+            (num_free,), sentinel, device=self.device, dtype=torch.long
+        )
+        if unique_pairs.numel() != 0:
+            set1_eligible = self._set1_eligible_mask(B_free)
+            if set1_eligible.any().item():
+                pair_s = unique_pairs[:, 0].to(torch.long)
+                v_pair_row_max = self.V[pair_s].max(dim=1).values.to(torch.long)
+                min_slack1_per_blue[set1_eligible] = (
+                    target1[set1_eligible]
+                    - v_pair_row_max[pair_inverse[set1_eligible]]
+                )
 
-        sentinel = torch.iinfo(torch.int64).max // 4
         min_adj_term = torch.full(
             (num_free,), sentinel, device=self.device, dtype=torch.long
         )
@@ -545,18 +566,25 @@ class SimpleGPUSolver:
                 0, active_free_pos, adj_term, reduce="amin", include_self=True
             )
 
-        min_slack2_per_blue = (
-            1 - self.y_B[B_free].to(torch.long) + min_adj_term
+        min_slack2_per_blue = torch.full(
+            (num_free,), sentinel, device=self.device, dtype=torch.long
         )
+        has_set2_edges = min_adj_term != sentinel
+        if has_set2_edges.any().item():
+            min_slack2_per_blue[has_set2_edges] = (
+                1
+                - self.y_B[B_free[has_set2_edges]].to(torch.long)
+                + min_adj_term[has_set2_edges]
+            )
         min_slack_per_blue = torch.minimum(
             min_slack1_per_blue, min_slack2_per_blue
         )
 
-        positive_mask = min_slack_per_blue > 0
-        if positive_mask.any().item():
-            delta = int(min_slack_per_blue[positive_mask].min().item())
-            return max(delta, 1)
-        return 1
+        valid_mask = min_slack_per_blue != sentinel
+        if valid_mask.any().item():
+            delta = int(min_slack_per_blue[valid_mask].min().item())
+            return max(delta, 0)
+        return 0
 
     def _set2_counts(self, B_free):
         num_free = B_free.numel()
