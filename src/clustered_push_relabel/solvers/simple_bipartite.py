@@ -132,6 +132,24 @@ class SimpleGPUSolver:
         self._debug_last_b_new = None
         self._debug_last_F_B_new = None
         self._debug_last_evicted_b = None
+        self._debug_last_iteration = None
+        self._debug_last_choose_set1_by_b = None
+        self._debug_last_choose_set2_by_b = None
+        self._debug_last_set1_count_by_b = None
+        self._debug_last_set2_count_by_b = None
+        self._debug_last_set1_eligible_by_b = None
+        self._debug_last_proposal_a = None
+        self._debug_last_proposal_b = None
+        self._debug_last_proposal_is_set1 = None
+        self._debug_last_proposal_keys = None
+        self._debug_last_proposed_any_by_b = None
+        self._debug_last_proposed_a_by_b = None
+        self._debug_last_proposed_is_set1_by_b = None
+        self._debug_last_accepted_by_b = None
+        self._debug_last_lost_conflict_by_b = None
+        self._debug_last_y_A_at_proposal = None
+        self._debug_last_y_B_at_proposal = None
+        self._debug_last_V_at_proposal = None
 
     def solve(self):
         N = self.N
@@ -154,18 +172,20 @@ class SimpleGPUSolver:
                 break
             iteration += 1
             if self.debug_audit:
-                self._snapshot_phase_context(B_free=B_free, reset_phase=True)
                 self.audit_full_feasibility(
                     "phase_start",
                     iteration,
                     require_matched_equality=True,
                 )
+                self._snapshot_phase_context(B_free=B_free, reset_phase=True)
 
             pair_inverse, set1_counts, set1_offsets, set1_values = (
                 self._set1_groups(B_free)
             )
             set1_count_per_blue = set1_counts[pair_inverse]
             set2_count_per_blue = self._set2_counts(B_free)
+            if self.debug_audit:
+                set1_eligible = self._set1_eligible_mask(B_free)
             total_set2_admissible_edges += int(set2_count_per_blue.sum().item())
 
             total_count = (set1_count_per_blue + set2_count_per_blue).float()
@@ -205,6 +225,20 @@ class SimpleGPUSolver:
 
             if not proposal_a_parts:
                 if self.debug_audit:
+                    empty_long = torch.empty(0, device=device, dtype=torch.long)
+                    empty_bool = torch.empty(0, device=device, dtype=torch.bool)
+                    self._snapshot_proposal_context(
+                        iteration,
+                        B_free,
+                        choose_set1,
+                        choose_set2,
+                        set1_count_per_blue,
+                        set2_count_per_blue,
+                        set1_eligible,
+                        empty_long,
+                        empty_long,
+                        empty_bool,
+                    )
                     self.audit_full_feasibility(
                         "after_proposal_generation_before_conflict_resolution",
                         iteration,
@@ -244,6 +278,18 @@ class SimpleGPUSolver:
             proposal_is_set1 = torch.cat(proposal_is_set1_parts)
 
             if self.debug_audit:
+                self._snapshot_proposal_context(
+                    iteration,
+                    B_free,
+                    choose_set1,
+                    choose_set2,
+                    set1_count_per_blue,
+                    set2_count_per_blue,
+                    set1_eligible,
+                    proposal_a,
+                    proposal_b,
+                    proposal_is_set1,
+                )
                 self.audit_full_feasibility(
                     "after_proposal_generation_before_conflict_resolution",
                     iteration,
@@ -253,6 +299,7 @@ class SimpleGPUSolver:
             r_new, b_new = self._resolve_conflicts(proposal_a, proposal_b)
             if self.debug_audit:
                 self._snapshot_phase_context(r_new=r_new, b_new=b_new)
+                self._snapshot_conflict_context(r_new, b_new)
                 self.audit_full_feasibility(
                     "after_conflict_resolution_before_matching_update",
                     iteration,
@@ -695,6 +742,79 @@ class SimpleGPUSolver:
         if evicted_b is not None:
             self._debug_last_evicted_b = self._clone_debug_indices(evicted_b)
 
+    def _snapshot_proposal_context(
+        self,
+        iteration,
+        B_free,
+        choose_set1,
+        choose_set2,
+        set1_count_per_blue,
+        set2_count_per_blue,
+        set1_eligible,
+        proposal_a,
+        proposal_b,
+        proposal_is_set1,
+    ):
+        N = self.N
+        device = self.device
+
+        self._debug_last_iteration = int(iteration)
+        self._debug_last_y_A_at_proposal = self.y_A.detach().clone()
+        self._debug_last_y_B_at_proposal = self.y_B.detach().clone()
+        self._debug_last_V_at_proposal = self.V.detach().clone()
+
+        choose_set1_by_b = torch.zeros(N, device=device, dtype=torch.bool)
+        choose_set2_by_b = torch.zeros(N, device=device, dtype=torch.bool)
+        set1_count_by_b = torch.full((N,), -1, device=device, dtype=torch.long)
+        set2_count_by_b = torch.full((N,), -1, device=device, dtype=torch.long)
+        set1_eligible_by_b = torch.zeros(N, device=device, dtype=torch.bool)
+
+        choose_set1_by_b[B_free] = choose_set1
+        choose_set2_by_b[B_free] = choose_set2
+        set1_count_by_b[B_free] = set1_count_per_blue.to(torch.long)
+        set2_count_by_b[B_free] = set2_count_per_blue.to(torch.long)
+        set1_eligible_by_b[B_free] = set1_eligible
+
+        proposed_any_by_b = torch.zeros(N, device=device, dtype=torch.bool)
+        proposed_a_by_b = torch.full((N,), -1, device=device, dtype=torch.long)
+        proposed_is_set1_by_b = torch.zeros(N, device=device, dtype=torch.bool)
+
+        if proposal_b.numel() != 0:
+            proposal_b_long = proposal_b.to(torch.long)
+            proposed_any_by_b[proposal_b_long] = True
+            proposed_a_by_b[proposal_b_long] = proposal_a.to(torch.long)
+            proposed_is_set1_by_b[proposal_b_long] = proposal_is_set1
+
+        self._debug_last_choose_set1_by_b = choose_set1_by_b
+        self._debug_last_choose_set2_by_b = choose_set2_by_b
+        self._debug_last_set1_count_by_b = set1_count_by_b
+        self._debug_last_set2_count_by_b = set2_count_by_b
+        self._debug_last_set1_eligible_by_b = set1_eligible_by_b
+        self._debug_last_proposal_a = proposal_a.detach().to(torch.long).clone()
+        self._debug_last_proposal_b = proposal_b.detach().to(torch.long).clone()
+        self._debug_last_proposal_is_set1 = proposal_is_set1.detach().clone()
+        self._debug_last_proposal_keys = (
+            self._debug_last_proposal_b * N + self._debug_last_proposal_a
+        )
+        self._debug_last_proposed_any_by_b = proposed_any_by_b
+        self._debug_last_proposed_a_by_b = proposed_a_by_b
+        self._debug_last_proposed_is_set1_by_b = proposed_is_set1_by_b
+        self._debug_last_accepted_by_b = torch.zeros(N, device=device, dtype=torch.bool)
+        self._debug_last_lost_conflict_by_b = torch.zeros(
+            N, device=device, dtype=torch.bool
+        )
+
+    def _snapshot_conflict_context(self, r_new, b_new):
+        if self._debug_last_proposed_any_by_b is None:
+            return
+        accepted_by_b = torch.zeros(self.N, device=self.device, dtype=torch.bool)
+        if b_new.numel() != 0:
+            accepted_by_b[b_new.to(torch.long)] = True
+        self._debug_last_accepted_by_b = accepted_by_b
+        self._debug_last_lost_conflict_by_b = (
+            self._debug_last_proposed_any_by_b & ~accepted_by_b
+        )
+
     def _debug_membership_mask(self, values):
         if values is None:
             return None
@@ -726,6 +846,105 @@ class SimpleGPUSolver:
         indices = [i for i, count in enumerate(counts_cpu.tolist()) if count > 0]
         indices.sort(key=lambda i: (-int(counts_cpu[i].item()), i))
         return indices[:limit]
+
+    def _debug_bool_at(self, values, idx):
+        if values is None:
+            return "N/A"
+        return bool(values[idx].item())
+
+    def _debug_int_at(self, values, idx):
+        if values is None:
+            return "N/A"
+        return int(values[idx].item())
+
+    def _debug_adj_info(self, b, a):
+        start = int(self.adj_ptr[b].item())
+        end = int(self.adj_ptr[b + 1].item())
+        if end <= start:
+            return False, None
+        adj_a = self.adj_col[start:end]
+        matches = torch.nonzero(adj_a == a, as_tuple=True)[0]
+        if matches.numel() == 0:
+            return False, None
+        edge_idx = start + int(matches[0].item())
+        return True, int(self.adj_dist_int[edge_idx].item())
+
+    def _proposal_time_context_available(self):
+        return (
+            self._debug_last_y_A_at_proposal is not None
+            and self._debug_last_y_B_at_proposal is not None
+            and self._debug_last_V_at_proposal is not None
+            and self._debug_last_proposed_any_by_b is not None
+        )
+
+    def _proposal_time_set2_candidates(self, b):
+        if not self._proposal_time_context_available():
+            return None, []
+
+        y_A_snap = self._debug_last_y_A_at_proposal.to(torch.long)
+        y_B_b = int(self._debug_last_y_B_at_proposal[b].item())
+        start = int(self.adj_ptr[b].item())
+        end = int(self.adj_ptr[b + 1].item())
+        if end <= start:
+            return 0, []
+
+        adj_a = self.adj_col[start:end]
+        adj_dist = self.adj_dist_int[start:end].to(torch.long)
+        is_candidate = y_A_snap[adj_a] == (adj_dist + 1 - y_B_b)
+        cand_a = adj_a[is_candidate]
+        return int(cand_a.numel()), [int(x.item()) for x in cand_a[:10]]
+
+    def _proposal_time_set1_candidates(self, b):
+        if not self._proposal_time_context_available():
+            return None, []
+        last_B_free_mask = self._debug_membership_mask(self._debug_last_B_free)
+        if last_B_free_mask is None:
+            return None, []
+        if not bool(last_B_free_mask[b].item()):
+            return 0, []
+        if self._debug_last_set1_eligible_by_b is None:
+            return None, []
+        if not bool(self._debug_last_set1_eligible_by_b[b].item()):
+            return 0, []
+
+        y_B_b = int(self._debug_last_y_B_at_proposal[b].item())
+        s = int(self.nearest_s[b].item())
+        target = int(self.d_min_b_int[b].item()) + 1 - y_B_b
+        row = self._debug_last_V_at_proposal[s].to(torch.long)
+        cand_a = torch.nonzero(row == target, as_tuple=True)[0]
+        return int(cand_a.numel()), [int(x.item()) for x in cand_a[:10]]
+
+    def _proposal_time_edge_set2_admissible(self, b, a):
+        if not self._proposal_time_context_available():
+            return "N/A"
+        in_adj, adj_dist = self._debug_adj_info(b, a)
+        if not in_adj:
+            return False
+        y_A_a = int(self._debug_last_y_A_at_proposal[a].item())
+        y_B_b = int(self._debug_last_y_B_at_proposal[b].item())
+        return y_A_a == adj_dist + 1 - y_B_b
+
+    def _proposal_time_edge_set1_admissible(self, b, a):
+        if not self._proposal_time_context_available():
+            return "N/A"
+        if self._debug_last_set1_eligible_by_b is None:
+            return "N/A"
+        if self._debug_last_B_free is None:
+            return "N/A"
+        in_B_free = bool(self._debug_membership_mask(self._debug_last_B_free)[b].item())
+        if not in_B_free or not bool(self._debug_last_set1_eligible_by_b[b].item()):
+            return False
+
+        y_B_b = int(self._debug_last_y_B_at_proposal[b].item())
+        s = int(self.nearest_s[b].item())
+        target = int(self.d_min_b_int[b].item()) + 1 - y_B_b
+        return int(self._debug_last_V_at_proposal[s, a].item()) == target
+
+    def _debug_small_candidate_list_text(self, count, candidates):
+        if count is None:
+            return "N/A"
+        suffix = "" if count <= len(candidates) else " ..."
+        return f"{candidates}{suffix}"
 
     def _print_sampled_feasibility_edges(
         self,
@@ -784,6 +1003,175 @@ class SimpleGPUSolver:
             print(
                 f"    feas_slack={slack_value} matched_diff={matched_diff} "
                 f"nearest_s={nearest_s} d_min_b_int={d_min}"
+            )
+
+    def _classify_violating_edge_backtrace(
+        self,
+        context_available,
+        was_b_in_last_B_free,
+        did_propose,
+        proposed_this_edge,
+        proposal_accepted,
+        proposal_lost_conflict,
+        edge_set1_admissible,
+        edge_set2_admissible,
+        set1_count,
+        set2_count,
+    ):
+        if not context_available:
+            return "cannot determine from retained phase context"
+        if was_b_in_last_B_free is not True:
+            return "cannot determine from retained phase context"
+        edge_was_admissible = (
+            edge_set1_admissible is True or edge_set2_admissible is True
+        )
+        if did_propose is not True:
+            if edge_was_admissible:
+                return "zero-slack edge existed but blue made no proposal"
+            if set1_count == 0 and set2_count == 0:
+                return "blue had no admissible edges at proposal time"
+            return "blue had admissible edges but made no proposal"
+        if proposed_this_edge:
+            if proposal_accepted is True:
+                return "blue proposed this edge and it was accepted"
+            if proposal_lost_conflict is True:
+                return "blue proposed this edge and lost conflict"
+            return "blue proposed this edge; conflict result unknown"
+        return "blue proposed a different edge"
+
+    def _print_violating_edge_backtrace(
+        self,
+        sample_idx,
+        b,
+        a,
+        proxy,
+        feas_slack,
+        y_B_long,
+        y_A_long,
+    ):
+        context_available = self._proposal_time_context_available()
+        last_B_free_mask = self._debug_membership_mask(self._debug_last_B_free)
+        last_F_B_new_mask = self._debug_membership_mask(self._debug_last_F_B_new)
+        was_b_in_last_B_free = self._debug_mask_value(last_B_free_mask, b)
+        was_b_in_last_F_B_new = self._debug_mask_value(last_F_B_new_mask, b)
+
+        did_propose = self._debug_bool_at(self._debug_last_proposed_any_by_b, b)
+        choose_set1 = self._debug_bool_at(self._debug_last_choose_set1_by_b, b)
+        choose_set2 = self._debug_bool_at(self._debug_last_choose_set2_by_b, b)
+        proposed_red = self._debug_int_at(self._debug_last_proposed_a_by_b, b)
+        proposed_is_set1 = self._debug_bool_at(
+            self._debug_last_proposed_is_set1_by_b, b
+        )
+        proposal_kind = "N/A"
+        if did_propose is True:
+            proposal_kind = "Set1" if proposed_is_set1 else "Set2"
+        proposal_accepted = self._debug_bool_at(self._debug_last_accepted_by_b, b)
+        proposal_lost_conflict = self._debug_bool_at(
+            self._debug_last_lost_conflict_by_b, b
+        )
+
+        in_adj, _ = self._debug_adj_info(b, a)
+        edge_set2_admissible = self._proposal_time_edge_set2_admissible(b, a)
+        edge_set1_admissible = self._proposal_time_edge_set1_admissible(b, a)
+        proposed_this_edge = did_propose is True and proposed_red == a
+        proposed_this_accepted = proposal_accepted if proposed_this_edge else "N/A"
+
+        set1_count, set1_candidates = self._proposal_time_set1_candidates(b)
+        set2_count, set2_candidates = self._proposal_time_set2_candidates(b)
+        set1_eligible = self._debug_bool_at(self._debug_last_set1_eligible_by_b, b)
+        set1_contains_edge = edge_set1_admissible is True
+        set2_contains_edge = edge_set2_admissible is True
+
+        not_proposed_but_admissible = (
+            not proposed_this_edge
+            and (edge_set1_admissible is True or edge_set2_admissible is True)
+        )
+        classification = self._classify_violating_edge_backtrace(
+            context_available,
+            was_b_in_last_B_free,
+            did_propose,
+            proposed_this_edge,
+            proposal_accepted,
+            proposal_lost_conflict,
+            edge_set1_admissible,
+            edge_set2_admissible,
+            set1_count,
+            set2_count,
+        )
+
+        current_y_B = int(y_B_long[b].item())
+        current_y_A = int(y_A_long[a].item())
+        current_proxy = int(proxy[b, a].item())
+        current_slack = int(feas_slack[b, a].item())
+
+        proposal_y_B = self._debug_int_at(self._debug_last_y_B_at_proposal, b)
+        proposal_y_A = self._debug_int_at(self._debug_last_y_A_at_proposal, a)
+
+        print(f"\n[Audit] Backtrace for violating edge[{sample_idx}] (b={b}, a={a})")
+        print(
+            "  current_bad_state: "
+            f"y_B={current_y_B} y_A={current_y_A} "
+            f"chosen_proxy={current_proxy} feas_slack={current_slack}"
+        )
+        print(
+            "  proposal_time_state: "
+            f"retained_iteration={self._debug_last_iteration} "
+            f"proposal_y_B={proposal_y_B} proposal_y_A={proposal_y_A}"
+        )
+        print(
+            "  blue_proposal_status: "
+            f"in_last_B_free={was_b_in_last_B_free} "
+            f"in_last_F_B_new={was_b_in_last_F_B_new} "
+            f"choose_set1={choose_set1} choose_set2={choose_set2} "
+            f"did_propose={did_propose} proposed_red={proposed_red} "
+            f"proposal_kind={proposal_kind} accepted={proposal_accepted} "
+            f"lost_conflict={proposal_lost_conflict}"
+        )
+        print(
+            "  specific_edge_status: "
+            f"in_adj={in_adj} "
+            f"set2_admissible_at_proposal={edge_set2_admissible} "
+            f"set1_admissible_at_proposal={edge_set1_admissible} "
+            f"actually_proposed={proposed_this_edge} "
+            f"proposed_edge_accepted={proposed_this_accepted} "
+            f"not_proposed_but_admissible={not_proposed_but_admissible}"
+        )
+        print(
+            "  candidate_summary_for_b: "
+            f"set1_eligible={set1_eligible} set1_count={set1_count} "
+            f"set1_candidates_cap10={self._debug_small_candidate_list_text(set1_count, set1_candidates)} "
+            f"set1_contains_edge={set1_contains_edge}"
+        )
+        print(
+            "  candidate_summary_for_b: "
+            f"set2_count={set2_count} "
+            f"set2_candidates_cap10={self._debug_small_candidate_list_text(set2_count, set2_candidates)} "
+            f"set2_contains_edge={set2_contains_edge}"
+        )
+        print(f"  classification={classification}")
+
+    def _print_sampled_edge_backtraces(
+        self,
+        violation_b,
+        violation_a,
+        proxy,
+        feas_slack,
+        y_B_long,
+        y_A_long,
+    ):
+        sample_count = min(10, int(violation_b.numel()))
+        print("\n[Audit] Proposal-time backtrace for sampled violating edges")
+        for sample_idx in range(sample_count):
+            b = int(violation_b[sample_idx].item())
+            a = int(violation_a[sample_idx].item())
+            self._print_violating_edge_backtrace(
+                sample_idx,
+                b,
+                a,
+                proxy,
+                feas_slack,
+                y_B_long,
+                y_A_long,
             )
 
     def _print_feasibility_concentration(
@@ -926,6 +1314,14 @@ class SimpleGPUSolver:
             triangle_proxy,
             direct_costs,
             in_adj_mask,
+            feas_slack,
+            y_B_long,
+            y_A_long,
+        )
+        self._print_sampled_edge_backtraces(
+            violation_b,
+            violation_a,
+            proxy,
             feas_slack,
             y_B_long,
             y_A_long,
