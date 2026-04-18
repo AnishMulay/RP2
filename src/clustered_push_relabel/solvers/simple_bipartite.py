@@ -123,6 +123,9 @@ class SimpleGPUSolver:
         self.MA = self.match_A
         self.MB = self.match_B
         self.iterations = 0
+        self.debug_audit = False
+        self.debug_stop_on_first_violation = True
+        self.debug_audit = True
 
     def solve(self):
         N = self.N
@@ -143,9 +146,13 @@ class SimpleGPUSolver:
             num_free = B_free.numel()
             if num_free <= self.epsilon_int:
                 break
-            if iteration >= self.max_iters:
-                break
             iteration += 1
+            if self.debug_audit:
+                self.audit_full_feasibility(
+                    "phase_start",
+                    iteration,
+                    require_matched_equality=True,
+                )
 
             pair_inverse, set1_counts, set1_offsets, set1_values = (
                 self._set1_groups(B_free)
@@ -195,6 +202,12 @@ class SimpleGPUSolver:
                     B_free, unique_pairs, delta_pair_inverse
                 )
                 self.y_B[B_free] += 1
+                if self.debug_audit:
+                    self.audit_full_feasibility(
+                        "after_no_proposals_delta",
+                        iteration,
+                        require_matched_equality=True,
+                    )
                 _print_progress(iteration, num_free, num_free, "no_proposals")
                 continue
 
@@ -222,6 +235,12 @@ class SimpleGPUSolver:
                     B_free, unique_pairs, delta_pair_inverse
                 )
                 self.y_B[B_free] += delta
+                if self.debug_audit:
+                    self.audit_full_feasibility(
+                        "after_no_accepts_delta",
+                        iteration,
+                        require_matched_equality=True,
+                    )
                 _print_progress(iteration, num_free, num_free, "no_accepts")
                 continue
 
@@ -238,14 +257,32 @@ class SimpleGPUSolver:
             self.phase_match_is_set1[b_new] = accepted_is_set1
 
             F_B_new = self._update_matching(B_free, r_new, b_new)
+            if self.debug_audit:
+                self.audit_full_feasibility(
+                    "after_matching_update_before_duals",
+                    iteration,
+                    require_matched_equality=False,
+                )
 
             unique_pairs_new, pair_inverse_new = self._set1_delta_groups(F_B_new)
             delta = self._compute_delta(
                 F_B_new, unique_pairs_new, pair_inverse_new
             )
             self.y_B[F_B_new] += 1
+            if self.debug_audit:
+                self.audit_full_feasibility(
+                    "after_free_blue_delta_before_yA",
+                    iteration,
+                    require_matched_equality=False,
+                )
             self.y_A[r_new] -= 1
             self.V[:, r_new] -= 1
+            if self.debug_audit:
+                self.audit_full_feasibility(
+                    "after_yA_and_V_update",
+                    iteration,
+                    require_matched_equality=True,
+                )
 
             _print_progress(iteration, num_free, F_B_new.numel(), "ok")
             B_free = F_B_new
@@ -555,6 +592,160 @@ class SimpleGPUSolver:
             return still_free
         F_B_new, _ = torch.sort(torch.cat([still_free, evicted_b]))
         return F_B_new
+
+    def audit_full_feasibility(self, label, iteration, require_matched_equality=False):
+        device = self.device
+        N = self.N
+        total_pairs = N * N
+
+        in_adj_mask = torch.zeros(N, N, dtype=torch.bool, device=device)
+        direct_costs = torch.zeros(N, N, dtype=torch.long, device=device)
+        if self.adj_col.numel() > 0:
+            all_b_for_adj = torch.repeat_interleave(
+                torch.arange(N, device=device, dtype=torch.long),
+                self.adj_ptr[1:] - self.adj_ptr[:-1],
+            )
+            in_adj_mask[all_b_for_adj, self.adj_col] = True
+            direct_costs[all_b_for_adj, self.adj_col] = self.adj_dist_int.to(torch.long)
+
+        y_A_long = self.y_A.to(torch.long)
+        y_B_long = self.y_B.to(torch.long)
+        V_rows = self.V[self.nearest_s].to(torch.long)
+        triangle_proxy = (
+            self.d_min_b_int.to(torch.long).unsqueeze(1)
+            + y_A_long.unsqueeze(0)
+            - V_rows
+        )
+        proxy = torch.where(in_adj_mask, direct_costs, triangle_proxy)
+        feas_slack = proxy + 1 - y_B_long.unsqueeze(1) - y_A_long.unsqueeze(0)
+
+        min_feas_slack = int(feas_slack.min().item())
+        num_feas_violations = int((feas_slack < 0).sum().item())
+        worst_feas_flat = int(torch.argmin(feas_slack).item())
+        worst_feas_b = worst_feas_flat // N
+        worst_feas_a = worst_feas_flat % N
+        worst_feas_pair = (worst_feas_b, worst_feas_a)
+
+        matched_b = torch.nonzero(self.match_B != -1, as_tuple=True)[0]
+        if matched_b.numel() > 0:
+            matched_a = self.match_B[matched_b]
+            matched_proxy = proxy[matched_b, matched_a]
+            matched_diff = (
+                matched_proxy
+                - y_B_long[matched_b]
+                - y_A_long[matched_a]
+            )
+            num_match_violations = int((matched_diff != 0).sum().item())
+            matched_abs_diff = matched_diff.abs()
+            worst_match_idx = int(torch.argmax(matched_abs_diff).item())
+            worst_abs_matched_diff = int(matched_abs_diff[worst_match_idx].item())
+            worst_matched_pair = (
+                int(matched_b[worst_match_idx].item()),
+                int(matched_a[worst_match_idx].item()),
+            )
+        else:
+            matched_diff = torch.empty(0, device=device, dtype=torch.long)
+            num_match_violations = 0
+            worst_abs_matched_diff = 0
+            worst_matched_pair = None
+
+        print(
+            f"[Audit] iter={iteration} step={label} "
+            f"feas_viol={num_feas_violations} "
+            f"min_feas_slack={min_feas_slack} "
+            f"matched_viol={num_match_violations}"
+        )
+
+        def _print_pair_details(title, b, a, matched_diff_value=None):
+            b_match = int(self.match_B[b].item())
+            b_state = "free" if b_match == -1 else f"matched_to={b_match}"
+            phase_set1 = (
+                "N/A"
+                if b_match == -1
+                else str(bool(self.phase_match_is_set1[b].item()))
+            )
+            in_adj = bool(in_adj_mask[b, a].item())
+            direct_proxy = int(direct_costs[b, a].item()) if in_adj else "N/A"
+            triangle_value = int(triangle_proxy[b, a].item())
+            chosen_proxy = int(proxy[b, a].item())
+            slack_value = int(feas_slack[b, a].item())
+            current_match = b_match == a
+            y_b_value = int(y_B_long[b].item())
+            y_a_value = int(y_A_long[a].item())
+            match_diff_text = "N/A" if matched_diff_value is None else matched_diff_value
+
+            print(f"[Audit] {title}")
+            print(
+                f"  iter={iteration} step={label} b={b} a={a} "
+                f"in_adj={in_adj} b_state={b_state} phase_set1={phase_set1}"
+            )
+            print(
+                f"  y_B={y_b_value} y_A={y_a_value} "
+                f"direct_proxy={direct_proxy} triangle_proxy={triangle_value} "
+                f"proxy={chosen_proxy}"
+            )
+            print(
+                f"  feas_slack={slack_value} current_matched_edge={current_match} "
+                f"matched_diff={match_diff_text}"
+            )
+
+        if num_feas_violations > 0 and self.debug_stop_on_first_violation:
+            _print_pair_details(
+                "worst feasibility pair",
+                worst_feas_b,
+                worst_feas_a,
+            )
+            if require_matched_equality and num_match_violations > 0:
+                worst_match_b, worst_match_a = worst_matched_pair
+                worst_match_diff = (
+                    int(
+                        proxy[worst_match_b, worst_match_a].item()
+                        - y_B_long[worst_match_b].item()
+                        - y_A_long[worst_match_a].item()
+                    )
+                )
+                _print_pair_details(
+                    "worst matched pair",
+                    worst_match_b,
+                    worst_match_a,
+                    matched_diff_value=worst_match_diff,
+                )
+            raise RuntimeError(
+                f"Feasibility violation at iteration {iteration}, step {label}"
+            )
+
+        if (
+            require_matched_equality
+            and num_match_violations > 0
+            and self.debug_stop_on_first_violation
+        ):
+            worst_match_b, worst_match_a = worst_matched_pair
+            worst_match_diff = (
+                int(
+                    proxy[worst_match_b, worst_match_a].item()
+                    - y_B_long[worst_match_b].item()
+                    - y_A_long[worst_match_a].item()
+                )
+            )
+            _print_pair_details(
+                "worst matched pair",
+                worst_match_b,
+                worst_match_a,
+                matched_diff_value=worst_match_diff,
+            )
+            raise RuntimeError(
+                f"Matched equality violation at iteration {iteration}, step {label}"
+            )
+
+        return {
+            "total_pairs": total_pairs,
+            "min_feas_slack": min_feas_slack,
+            "num_feas_violations": num_feas_violations,
+            "worst_feas_pair": worst_feas_pair,
+            "num_match_violations": num_match_violations,
+            "worst_matched_pair": worst_matched_pair,
+            "worst_abs_matched_diff": worst_abs_matched_diff,
+        }
 
     def cleanup_remaining_points(self):
         free_b = torch.nonzero(self.match_B == -1).squeeze(1)
