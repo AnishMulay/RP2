@@ -126,6 +126,12 @@ class SimpleGPUSolver:
         self.debug_audit = False
         self.debug_stop_on_first_violation = True
         self.debug_audit = True
+        self._debug_bad_checkpoint_seen = False
+        self._debug_last_B_free = None
+        self._debug_last_r_new = None
+        self._debug_last_b_new = None
+        self._debug_last_F_B_new = None
+        self._debug_last_evicted_b = None
 
     def solve(self):
         N = self.N
@@ -148,6 +154,7 @@ class SimpleGPUSolver:
                 break
             iteration += 1
             if self.debug_audit:
+                self._snapshot_phase_context(B_free=B_free, reset_phase=True)
                 self.audit_full_feasibility(
                     "phase_start",
                     iteration,
@@ -197,7 +204,25 @@ class SimpleGPUSolver:
                 proposal_b_parts.append(b2)
 
             if not proposal_a_parts:
+                if self.debug_audit:
+                    self.audit_full_feasibility(
+                        "after_proposal_generation_before_conflict_resolution",
+                        iteration,
+                        require_matched_equality=True,
+                    )
+                    self._snapshot_phase_context(F_B_new=B_free)
+                    self.audit_full_feasibility(
+                        "after_matching_update_before_dual_updates",
+                        iteration,
+                        require_matched_equality=True,
+                    )
                 self.y_B[B_free] += 1
+                if self.debug_audit:
+                    self.audit_full_feasibility(
+                        "after_dual_updates",
+                        iteration,
+                        require_matched_equality=True,
+                    )
                 _print_progress(iteration, num_free, num_free, "no_proposals")
                 continue
 
@@ -218,10 +243,37 @@ class SimpleGPUSolver:
 
             proposal_is_set1 = torch.cat(proposal_is_set1_parts)
 
+            if self.debug_audit:
+                self.audit_full_feasibility(
+                    "after_proposal_generation_before_conflict_resolution",
+                    iteration,
+                    require_matched_equality=True,
+                )
+
             r_new, b_new = self._resolve_conflicts(proposal_a, proposal_b)
+            if self.debug_audit:
+                self._snapshot_phase_context(r_new=r_new, b_new=b_new)
+                self.audit_full_feasibility(
+                    "after_conflict_resolution_before_matching_update",
+                    iteration,
+                    require_matched_equality=True,
+                )
 
             if r_new.numel() == 0:
+                if self.debug_audit:
+                    self._snapshot_phase_context(F_B_new=B_free)
+                    self.audit_full_feasibility(
+                        "after_matching_update_before_dual_updates",
+                        iteration,
+                        require_matched_equality=True,
+                    )
                 self.y_B[B_free] += 1
+                if self.debug_audit:
+                    self.audit_full_feasibility(
+                        "after_dual_updates",
+                        iteration,
+                        require_matched_equality=True,
+                    )
                 _print_progress(iteration, num_free, num_free, "no_accepts")
                 continue
 
@@ -238,10 +290,23 @@ class SimpleGPUSolver:
             self.phase_match_is_set1[b_new] = accepted_is_set1
 
             F_B_new = self._update_matching(B_free, r_new, b_new)
+            if self.debug_audit:
+                self._snapshot_phase_context(F_B_new=F_B_new)
+                self.audit_full_feasibility(
+                    "after_matching_update_before_dual_updates",
+                    iteration,
+                    require_matched_equality=False,
+                )
 
             self.y_B[F_B_new] += 1
             self.y_A[r_new] -= 1
             self.V[:, r_new] -= 1
+            if self.debug_audit:
+                self.audit_full_feasibility(
+                    "after_dual_updates",
+                    iteration,
+                    require_matched_equality=True,
+                )
 
             _print_progress(iteration, num_free, F_B_new.numel(), "ok")
             B_free = F_B_new
@@ -580,6 +645,7 @@ class SimpleGPUSolver:
     def _update_matching(self, B_free, r_new, b_new):
         was_matched = self.match_A[r_new] != -1
         evicted_b = self.match_A[r_new[was_matched]].clone()
+        self._debug_last_evicted_b = evicted_b.detach().clone()
         if evicted_b.numel() != 0:
             self.match_B[evicted_b] = -1
             self.phase_match_is_set1[evicted_b] = False
@@ -598,6 +664,315 @@ class SimpleGPUSolver:
             return still_free
         F_B_new, _ = torch.sort(torch.cat([still_free, evicted_b]))
         return F_B_new
+
+    def _clone_debug_indices(self, values):
+        if values is None:
+            return None
+        return values.detach().to(device=self.device, dtype=torch.long).clone()
+
+    def _snapshot_phase_context(
+        self,
+        B_free=None,
+        r_new=None,
+        b_new=None,
+        F_B_new=None,
+        evicted_b=None,
+        reset_phase=False,
+    ):
+        if reset_phase:
+            self._debug_last_r_new = None
+            self._debug_last_b_new = None
+            self._debug_last_F_B_new = None
+            self._debug_last_evicted_b = None
+        if B_free is not None:
+            self._debug_last_B_free = self._clone_debug_indices(B_free)
+        if r_new is not None:
+            self._debug_last_r_new = self._clone_debug_indices(r_new)
+        if b_new is not None:
+            self._debug_last_b_new = self._clone_debug_indices(b_new)
+        if F_B_new is not None:
+            self._debug_last_F_B_new = self._clone_debug_indices(F_B_new)
+        if evicted_b is not None:
+            self._debug_last_evicted_b = self._clone_debug_indices(evicted_b)
+
+    def _debug_membership_mask(self, values):
+        if values is None:
+            return None
+        mask = torch.zeros(self.N, device=self.device, dtype=torch.bool)
+        if values.numel() != 0:
+            mask[values.to(torch.long)] = True
+        return mask
+
+    def _debug_set_size(self, values):
+        return "N/A" if values is None else int(values.numel())
+
+    def _debug_mask_value(self, mask, idx):
+        if mask is None:
+            return "N/A"
+        return bool(mask[idx].item())
+
+    def _debug_node_intersection_count(self, node_mask, context_mask):
+        if context_mask is None:
+            return "N/A"
+        return int((node_mask & context_mask).sum().item())
+
+    def _debug_edge_touch_count(self, edge_nodes, context_mask):
+        if context_mask is None:
+            return "N/A"
+        return int(context_mask[edge_nodes].sum().item())
+
+    def _debug_top_count_indices(self, counts, limit=10):
+        counts_cpu = counts.detach().cpu()
+        indices = [i for i, count in enumerate(counts_cpu.tolist()) if count > 0]
+        indices.sort(key=lambda i: (-int(counts_cpu[i].item()), i))
+        return indices[:limit]
+
+    def _print_sampled_feasibility_edges(
+        self,
+        violation_b,
+        violation_a,
+        proxy,
+        triangle_proxy,
+        direct_costs,
+        in_adj_mask,
+        feas_slack,
+        y_B_long,
+        y_A_long,
+    ):
+        sample_count = min(10, int(violation_b.numel()))
+        print("\n[Audit] Sample violating feasibility edges")
+        for sample_idx in range(sample_count):
+            b = int(violation_b[sample_idx].item())
+            a = int(violation_a[sample_idx].item())
+            matched_red = int(self.match_B[b].item())
+            b_is_free = matched_red == -1
+            current_matched_edge = matched_red == a
+            phase_set1 = (
+                "N/A"
+                if b_is_free
+                else str(bool(self.phase_match_is_set1[b].item()))
+            )
+            in_adj = bool(in_adj_mask[b, a].item())
+            direct_proxy = int(direct_costs[b, a].item()) if in_adj else "N/A"
+            triangle_value = int(triangle_proxy[b, a].item())
+            chosen_proxy = int(proxy[b, a].item())
+            y_b_value = int(y_B_long[b].item())
+            y_a_value = int(y_A_long[a].item())
+            slack_value = int(feas_slack[b, a].item())
+            matched_diff = (
+                int(proxy[b, a].item() - y_b_value - y_a_value)
+                if current_matched_edge
+                else "N/A"
+            )
+            matched_red_text = "N/A" if b_is_free else matched_red
+            b_state = "free" if b_is_free else "matched"
+            nearest_s = int(self.nearest_s[b].item())
+            d_min = int(self.d_min_b_int[b].item())
+
+            print(f"  edge[{sample_idx}] b={b} a={a}")
+            print(
+                f"    in_adj={in_adj} b_state={b_state} "
+                f"matched_red={matched_red_text} "
+                f"current_matched_edge={current_matched_edge} "
+                f"phase_match_is_set1={phase_set1}"
+            )
+            print(
+                f"    y_B={y_b_value} y_A={y_a_value} "
+                f"direct_proxy={direct_proxy} triangle_proxy={triangle_value} "
+                f"chosen_proxy={chosen_proxy}"
+            )
+            print(
+                f"    feas_slack={slack_value} matched_diff={matched_diff} "
+                f"nearest_s={nearest_s} d_min_b_int={d_min}"
+            )
+
+    def _print_feasibility_concentration(
+        self,
+        violation_b,
+        violation_a,
+        y_B_long,
+        y_A_long,
+        last_B_free_mask,
+        last_b_new_mask,
+        last_F_B_new_mask,
+        last_evicted_b_mask,
+        last_r_new_mask,
+    ):
+        N = self.N
+        blue_counts = torch.bincount(violation_b, minlength=N)
+        red_counts = torch.bincount(violation_a, minlength=N)
+        distinct_blue_count = int((blue_counts > 0).sum().item())
+        distinct_red_count = int((red_counts > 0).sum().item())
+
+        print("\n[Audit] Concentration summary")
+        print(f"  distinct_violating_blues={distinct_blue_count}")
+        print(f"  distinct_violating_reds={distinct_red_count}")
+
+        print("  top_violating_blues:")
+        for b in self._debug_top_count_indices(blue_counts, limit=10):
+            count = int(blue_counts[b].item())
+            matched_red = int(self.match_B[b].item())
+            b_state = "free" if matched_red == -1 else "matched"
+            matched_red_text = "N/A" if matched_red == -1 else matched_red
+            adj_size = int((self.adj_ptr[b + 1] - self.adj_ptr[b]).item())
+            print(
+                f"    b={b} count={count} y_B={int(y_B_long[b].item())} "
+                f"state={b_state} matched_red={matched_red_text} "
+                f"nearest_s={int(self.nearest_s[b].item())} "
+                f"d_min_b_int={int(self.d_min_b_int[b].item())} "
+                f"adj_size={adj_size} "
+                f"in_last_B_free={self._debug_mask_value(last_B_free_mask, b)} "
+                f"in_last_F_B_new={self._debug_mask_value(last_F_B_new_mask, b)} "
+                f"was_accepted_this_phase={self._debug_mask_value(last_b_new_mask, b)} "
+                f"was_evicted_this_phase={self._debug_mask_value(last_evicted_b_mask, b)}"
+            )
+
+        print("  top_violating_reds:")
+        for a in self._debug_top_count_indices(red_counts, limit=10):
+            count = int(red_counts[a].item())
+            matched_blue = int(self.match_A[a].item())
+            a_state = "free" if matched_blue == -1 else "matched"
+            matched_blue_text = "N/A" if matched_blue == -1 else matched_blue
+            print(
+                f"    a={a} count={count} y_A={int(y_A_long[a].item())} "
+                f"state={a_state} matched_blue={matched_blue_text} "
+                f"in_last_r_new={self._debug_mask_value(last_r_new_mask, a)}"
+            )
+
+    def _print_phase_relation(
+        self,
+        violation_b,
+        violation_a,
+        last_B_free_mask,
+        last_b_new_mask,
+        last_F_B_new_mask,
+        last_evicted_b_mask,
+        last_r_new_mask,
+    ):
+        N = self.N
+        violating_blue_mask = torch.zeros(N, device=self.device, dtype=torch.bool)
+        violating_red_mask = torch.zeros(N, device=self.device, dtype=torch.bool)
+        violating_blue_mask[violation_b] = True
+        violating_red_mask[violation_a] = True
+
+        print("\n[Audit] Relation to most recent phase update")
+        print(
+            "  latest_set_sizes: "
+            f"B_free={self._debug_set_size(self._debug_last_B_free)} "
+            f"r_new={self._debug_set_size(self._debug_last_r_new)} "
+            f"b_new={self._debug_set_size(self._debug_last_b_new)} "
+            f"F_B_new={self._debug_set_size(self._debug_last_F_B_new)} "
+            f"evicted_b={self._debug_set_size(self._debug_last_evicted_b)}"
+        )
+        print(
+            "  distinct_violating_blues_in_last_B_free="
+            f"{self._debug_node_intersection_count(violating_blue_mask, last_B_free_mask)}"
+        )
+        print(
+            "  distinct_violating_blues_in_last_F_B_new="
+            f"{self._debug_node_intersection_count(violating_blue_mask, last_F_B_new_mask)}"
+        )
+        print(
+            "  distinct_violating_reds_in_last_r_new="
+            f"{self._debug_node_intersection_count(violating_red_mask, last_r_new_mask)}"
+        )
+        print(
+            "  violating_edges_touch_blue_in_last_F_B_new="
+            f"{self._debug_edge_touch_count(violation_b, last_F_B_new_mask)}"
+        )
+        print(
+            "  violating_edges_touch_red_in_last_r_new="
+            f"{self._debug_edge_touch_count(violation_a, last_r_new_mask)}"
+        )
+
+    def _print_first_bad_feasibility_report(
+        self,
+        label,
+        iteration,
+        first_bad_checkpoint,
+        num_feas_violations,
+        min_feas_slack,
+        num_match_violations,
+        violation_b,
+        violation_a,
+        proxy,
+        triangle_proxy,
+        direct_costs,
+        in_adj_mask,
+        feas_slack,
+        y_B_long,
+        y_A_long,
+    ):
+        last_B_free_mask = self._debug_membership_mask(self._debug_last_B_free)
+        last_r_new_mask = self._debug_membership_mask(self._debug_last_r_new)
+        last_b_new_mask = self._debug_membership_mask(self._debug_last_b_new)
+        last_F_B_new_mask = self._debug_membership_mask(self._debug_last_F_B_new)
+        last_evicted_b_mask = self._debug_membership_mask(self._debug_last_evicted_b)
+
+        print("\n" + "=" * 80)
+        print("[Audit] FIRST BAD STATE: feasibility violation detected")
+        print(
+            f"  iteration={iteration} checkpoint={label} "
+            f"feasibility_violating_edges={num_feas_violations} "
+            f"min_feasibility_slack={min_feas_slack} "
+            f"admissibility_violating_matched_edges={num_match_violations} "
+            f"first_detected_bad_checkpoint={first_bad_checkpoint}"
+        )
+
+        self._print_sampled_feasibility_edges(
+            violation_b,
+            violation_a,
+            proxy,
+            triangle_proxy,
+            direct_costs,
+            in_adj_mask,
+            feas_slack,
+            y_B_long,
+            y_A_long,
+        )
+        self._print_feasibility_concentration(
+            violation_b,
+            violation_a,
+            y_B_long,
+            y_A_long,
+            last_B_free_mask,
+            last_b_new_mask,
+            last_F_B_new_mask,
+            last_evicted_b_mask,
+            last_r_new_mask,
+        )
+        self._print_phase_relation(
+            violation_b,
+            violation_a,
+            last_B_free_mask,
+            last_b_new_mask,
+            last_F_B_new_mask,
+            last_evicted_b_mask,
+            last_r_new_mask,
+        )
+        print("=" * 80)
+
+    def _print_matched_equality_violation(
+        self,
+        label,
+        iteration,
+        proxy,
+        y_B_long,
+        y_A_long,
+        worst_matched_pair,
+    ):
+        b, a = worst_matched_pair
+        diff = int(proxy[b, a].item() - y_B_long[b].item() - y_A_long[a].item())
+        print("\n" + "=" * 80)
+        print("[Audit] MATCHED ADMISSIBILITY VIOLATION")
+        print(
+            f"  iteration={iteration} checkpoint={label} "
+            f"b={b} a={a} matched_diff={diff} "
+            f"y_B={int(y_B_long[b].item())} y_A={int(y_A_long[a].item())} "
+            f"proxy={int(proxy[b, a].item())} "
+            f"phase_match_is_set1={bool(self.phase_match_is_set1[b].item())}"
+        )
+        print("=" * 80)
 
     def audit_full_feasibility(self, label, iteration, require_matched_equality=False):
         device = self.device
@@ -626,7 +1001,8 @@ class SimpleGPUSolver:
         feas_slack = proxy + 1 - y_B_long.unsqueeze(1) - y_A_long.unsqueeze(0)
 
         min_feas_slack = int(feas_slack.min().item())
-        num_feas_violations = int((feas_slack < 0).sum().item())
+        feasibility_violating = feas_slack < 0
+        num_feas_violations = int(feasibility_violating.sum().item())
         worst_feas_flat = int(torch.argmin(feas_slack).item())
         worst_feas_b = worst_feas_flat // N
         worst_feas_a = worst_feas_flat % N
@@ -655,89 +1031,47 @@ class SimpleGPUSolver:
             worst_abs_matched_diff = 0
             worst_matched_pair = None
 
-        print(
-            f"[Audit] iter={iteration} step={label} "
-            f"feas_viol={num_feas_violations} "
-            f"min_feas_slack={min_feas_slack} "
-            f"matched_viol={num_match_violations}"
-        )
-
-        def _print_pair_details(title, b, a, matched_diff_value=None):
-            b_match = int(self.match_B[b].item())
-            b_state = "free" if b_match == -1 else f"matched_to={b_match}"
-            phase_set1 = (
-                "N/A"
-                if b_match == -1
-                else str(bool(self.phase_match_is_set1[b].item()))
-            )
-            in_adj = bool(in_adj_mask[b, a].item())
-            direct_proxy = int(direct_costs[b, a].item()) if in_adj else "N/A"
-            triangle_value = int(triangle_proxy[b, a].item())
-            chosen_proxy = int(proxy[b, a].item())
-            slack_value = int(feas_slack[b, a].item())
-            current_match = b_match == a
-            y_b_value = int(y_B_long[b].item())
-            y_a_value = int(y_A_long[a].item())
-            match_diff_text = "N/A" if matched_diff_value is None else matched_diff_value
-
-            print(f"[Audit] {title}")
-            print(
-                f"  iter={iteration} step={label} b={b} a={a} "
-                f"in_adj={in_adj} b_state={b_state} phase_set1={phase_set1}"
-            )
-            print(
-                f"  y_B={y_b_value} y_A={y_a_value} "
-                f"direct_proxy={direct_proxy} triangle_proxy={triangle_value} "
-                f"proxy={chosen_proxy}"
-            )
-            print(
-                f"  feas_slack={slack_value} current_matched_edge={current_match} "
-                f"matched_diff={match_diff_text}"
-            )
-
-        if num_feas_violations > 0 and self.debug_stop_on_first_violation:
-            _print_pair_details(
-                "worst feasibility pair",
-                worst_feas_b,
-                worst_feas_a,
-            )
-            if require_matched_equality and num_match_violations > 0:
-                worst_match_b, worst_match_a = worst_matched_pair
-                worst_match_diff = (
-                    int(
-                        proxy[worst_match_b, worst_match_a].item()
-                        - y_B_long[worst_match_b].item()
-                        - y_A_long[worst_match_a].item()
-                    )
+        if num_feas_violations > 0:
+            if not self._debug_bad_checkpoint_seen:
+                violation_b, violation_a = torch.nonzero(
+                    feasibility_violating, as_tuple=True
                 )
-                _print_pair_details(
-                    "worst matched pair",
-                    worst_match_b,
-                    worst_match_a,
-                    matched_diff_value=worst_match_diff,
+                first_bad_checkpoint = not self._debug_bad_checkpoint_seen
+                self._debug_bad_checkpoint_seen = True
+                self._print_first_bad_feasibility_report(
+                    label,
+                    iteration,
+                    first_bad_checkpoint,
+                    num_feas_violations,
+                    min_feas_slack,
+                    num_match_violations,
+                    violation_b,
+                    violation_a,
+                    proxy,
+                    triangle_proxy,
+                    direct_costs,
+                    in_adj_mask,
+                    feas_slack,
+                    y_B_long,
+                    y_A_long,
                 )
-            raise RuntimeError(
-                f"Feasibility violation at iteration {iteration}, step {label}"
-            )
+            if self.debug_stop_on_first_violation:
+                raise RuntimeError(
+                    f"Feasibility violation at iteration {iteration}, step {label}"
+                )
 
         if (
             require_matched_equality
             and num_match_violations > 0
             and self.debug_stop_on_first_violation
         ):
-            worst_match_b, worst_match_a = worst_matched_pair
-            worst_match_diff = (
-                int(
-                    proxy[worst_match_b, worst_match_a].item()
-                    - y_B_long[worst_match_b].item()
-                    - y_A_long[worst_match_a].item()
-                )
-            )
-            _print_pair_details(
-                "worst matched pair",
-                worst_match_b,
-                worst_match_a,
-                matched_diff_value=worst_match_diff,
+            self._print_matched_equality_violation(
+                label,
+                iteration,
+                proxy,
+                y_B_long,
+                y_A_long,
+                worst_matched_pair,
             )
             raise RuntimeError(
                 f"Matched equality violation at iteration {iteration}, step {label}"
