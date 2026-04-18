@@ -202,12 +202,6 @@ class SimpleGPUSolver:
                     B_free, unique_pairs, delta_pair_inverse
                 )
                 self.y_B[B_free] += 1
-                if self.debug_audit:
-                    self.audit_full_feasibility(
-                        "after_no_proposals_delta",
-                        iteration,
-                        require_matched_equality=True,
-                    )
                 _print_progress(iteration, num_free, num_free, "no_proposals")
                 continue
 
@@ -235,12 +229,6 @@ class SimpleGPUSolver:
                     B_free, unique_pairs, delta_pair_inverse
                 )
                 self.y_B[B_free] += delta
-                if self.debug_audit:
-                    self.audit_full_feasibility(
-                        "after_no_accepts_delta",
-                        iteration,
-                        require_matched_equality=True,
-                    )
                 _print_progress(iteration, num_free, num_free, "no_accepts")
                 continue
 
@@ -257,32 +245,14 @@ class SimpleGPUSolver:
             self.phase_match_is_set1[b_new] = accepted_is_set1
 
             F_B_new = self._update_matching(B_free, r_new, b_new)
-            if self.debug_audit:
-                self.audit_full_feasibility(
-                    "after_matching_update_before_duals",
-                    iteration,
-                    require_matched_equality=False,
-                )
 
             unique_pairs_new, pair_inverse_new = self._set1_delta_groups(F_B_new)
             delta = self._compute_delta(
                 F_B_new, unique_pairs_new, pair_inverse_new
             )
             self.y_B[F_B_new] += 1
-            if self.debug_audit:
-                self.audit_full_feasibility(
-                    "after_free_blue_delta_before_yA",
-                    iteration,
-                    require_matched_equality=False,
-                )
             self.y_A[r_new] -= 1
             self.V[:, r_new] -= 1
-            if self.debug_audit:
-                self.audit_full_feasibility(
-                    "after_yA_and_V_update",
-                    iteration,
-                    require_matched_equality=True,
-                )
 
             _print_progress(iteration, num_free, F_B_new.numel(), "ok")
             B_free = F_B_new
