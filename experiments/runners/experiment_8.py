@@ -28,7 +28,7 @@ SEED = 42
 BATCH_SIZE = 512
 WARMUP_RUNS = 0
 TIMED_RUNS = 1
-METHODS = ("Exact", "ProxyExact", "DiscreteProxyExact", "Simple")
+METHODS = ("Exact", "ProxyExact", "Simple")
 SAMPLE_FACTOR_DEFAULT = 1.0
 
 
@@ -304,30 +304,32 @@ def benchmark_simple(P_red, P_blue, device, epsilon, sample_factor):
     total_cost, avg_cost = matching_costs(P_red_norm, P_blue_norm, match_B)
     total_cost *= diameter
     avg_cost *= diameter
-    solver.verbose = True
-    feasibility = solver.verify_solution()
-    solver.verbose = False
-
-    # ── Adjacency list size quantiles ────────────────────────────────────
-    lengths = (solver.adj_ptr[1:] - solver.adj_ptr[:-1]).float()
-    quantiles = torch.quantile(
-        lengths,
-        torch.tensor([0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0],
-                     device=solver.device, dtype=torch.float32)
-    ).cpu().tolist()
-    adj_stats = {
-        "samples": int(solver.V.shape[0]),
-        "mean"  : float(lengths.mean().item()),
-        "min"   : quantiles[0],
-        "p10"   : quantiles[1],
-        "p25"   : quantiles[2],
-        "p50"   : quantiles[3],
-        "p75"   : quantiles[4],
-        "p90"   : quantiles[5],
-        "p95"   : quantiles[6],
-        "p99"   : quantiles[7],
-        "max"   : quantiles[8],
-    }
+    feasibility = None
+    adj_stats = None
+    # solver.verbose = True
+    # feasibility = solver.verify_solution()
+    # solver.verbose = False
+    #
+    # # ── Adjacency list size quantiles ────────────────────────────────────
+    # lengths = (solver.adj_ptr[1:] - solver.adj_ptr[:-1]).float()
+    # quantiles = torch.quantile(
+    #     lengths,
+    #     torch.tensor([0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0],
+    #                  device=solver.device, dtype=torch.float32)
+    # ).cpu().tolist()
+    # adj_stats = {
+    #     "samples": int(solver.V.shape[0]),
+    #     "mean"  : float(lengths.mean().item()),
+    #     "min"   : quantiles[0],
+    #     "p10"   : quantiles[1],
+    #     "p25"   : quantiles[2],
+    #     "p50"   : quantiles[3],
+    #     "p75"   : quantiles[4],
+    #     "p90"   : quantiles[5],
+    #     "p95"   : quantiles[6],
+    #     "p99"   : quantiles[7],
+    #     "max"   : quantiles[8],
+    # }
     del solver, match_B, P_red_norm, P_blue_norm
     return (t1 - t0) * 1000.0, total_cost, avg_cost, phases, feasibility, adj_stats
 
@@ -355,10 +357,6 @@ def run_method(n, method_name, P_red, P_blue, device, epsilon, sample_factor):
             time_ms, total_cost, avg_cost = benchmark_exact(P_red, P_blue)
         elif method_name == "ProxyExact":
             time_ms, total_cost, avg_cost, proxy_stats = benchmark_proxy_exact(
-                P_red, P_blue, device, epsilon, sample_factor
-            )
-        elif method_name == "DiscreteProxyExact":
-            time_ms, total_cost, avg_cost = benchmark_discrete_proxy_exact(
                 P_red, P_blue, device, epsilon, sample_factor
             )
         elif method_name == "Simple":
@@ -464,24 +462,22 @@ def print_violation_table(rows):
 def print_timing_table(rows):
     print()
     print(
-        "  N    | ExactT(ms) | ProxyT(ms) | DiscProxyT(ms) | SimpleT(ms) | Phases"
+        "  N    | ExactT(ms) | ProxyT(ms) | SimpleT(ms) | Phases"
     )
     print(
-        "-------|------------|------------|----------------|-------------|-------"
+        "-------|------------|------------|-------------|-------"
     )
 
     for row in rows:
         n = row["n"]
         exact = row["results"]["Exact"]
         proxy = row["results"]["ProxyExact"]
-        disc = row["results"]["DiscreteProxyExact"]
         simple = row["results"]["Simple"]
 
         print(
             f"{n:>6,} | "
             f"{format_time(exact['time_ms']):>10} | "
             f"{format_time(proxy['time_ms']):>10} | "
-            f"{format_time(disc['time_ms']):>14} | "
             f"{format_time(simple['time_ms']):>11} | "
             f"{format_phases(simple['phases']):>6}"
         )
@@ -490,53 +486,75 @@ def print_timing_table(rows):
 def print_cost_table(rows):
     print()
     print(
-        "  N    | ExactAvg | ProxyAvg | DiscProxyAvg | SimpleAvg"
+        "  N    | ExactAvg | ProxyAvg | SimpleAvg"
     )
     print(
-        "-------|----------|----------|--------------|----------"
+        "-------|----------|----------|----------"
     )
 
     for row in rows:
         n = row["n"]
         exact = row["results"]["Exact"]
         proxy = row["results"]["ProxyExact"]
-        disc = row["results"]["DiscreteProxyExact"]
         simple = row["results"]["Simple"]
 
         print(
             f"{n:>6,} | "
             f"{format_avg_cost(exact['avg_cost']):>8} | "
             f"{format_avg_cost(proxy['avg_cost']):>8} | "
-            f"{format_avg_cost(disc['avg_cost']):>12} | "
             f"{format_avg_cost(simple['avg_cost']):>8}"
+        )
+
+
+def print_final_table(rows):
+    print()
+    print(
+        "  N    | ExactT(ms) | ExactAvg | ProxyT(ms) | ProxyAvg | SimpleT(ms) | SimpleAvg | Phases"
+    )
+    print(
+        "-------|------------|----------|------------|----------|-------------|-----------|-------"
+    )
+
+    for row in rows:
+        n = row["n"]
+        exact = row["results"]["Exact"]
+        proxy = row["results"]["ProxyExact"]
+        simple = row["results"]["Simple"]
+
+        print(
+            f"{n:>6,} | "
+            f"{format_time(exact['time_ms']):>10} | "
+            f"{format_avg_cost(exact['avg_cost']):>8} | "
+            f"{format_time(proxy['time_ms']):>10} | "
+            f"{format_avg_cost(proxy['avg_cost']):>8} | "
+            f"{format_time(simple['time_ms']):>11} | "
+            f"{format_avg_cost(simple['avg_cost']):>9} | "
+            f"{format_phases(simple['phases']):>6}"
         )
 
 
 def print_error_breakdown_table(rows):
     print()
     print(
-        "  N    | ProxyErr | DiscErr | SolverErr | TotalErr"
+        "  N    | ProxyErr | SolverErr | TotalErr"
     )
     print(
-        "-------|----------|---------|-----------|---------"
+        "-------|----------|-----------|---------"
     )
 
     for row in rows:
         n = row["n"]
         exact_avg = row["results"]["Exact"]["avg_cost"]
         proxy_avg = row["results"]["ProxyExact"]["avg_cost"]
-        disc_avg = row["results"]["DiscreteProxyExact"]["avg_cost"]
         simple_avg = row["results"]["Simple"]["avg_cost"]
 
         proxy_err = diff_or_nan(proxy_avg, exact_avg)
-        disc_err = diff_or_nan(disc_avg, proxy_avg)
-        solver_err = diff_or_nan(simple_avg, disc_avg)
+        solver_err = diff_or_nan(simple_avg, proxy_avg)
         total_err = diff_or_nan(simple_avg, exact_avg)
 
         print(
             f"{n:>6,} | "
             f"{format_diff(proxy_err):>8} | "
-            f"{format_diff(disc_err):>7} | "
             f"{format_diff(solver_err):>9} | "
             f"{format_diff(total_err):>7}"
         )
@@ -657,10 +675,11 @@ def main():
         del P_red, P_blue
         empty_cache_if_cuda(device)
 
-    print_violation_table(rows)
-    print_timing_table(rows)
-    print_cost_table(rows)
-    print_error_breakdown_table(rows)
+    print_final_table(rows)
+    # print_violation_table(rows)
+    # print_timing_table(rows)
+    # print_cost_table(rows)
+    # print_error_breakdown_table(rows)
 
 
 if __name__ == "__main__":

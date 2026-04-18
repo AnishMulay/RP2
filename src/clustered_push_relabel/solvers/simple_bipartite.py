@@ -125,7 +125,7 @@ class SimpleGPUSolver:
         self.iterations = 0
         self.debug_audit = False
         self.debug_stop_on_first_violation = True
-        self.debug_audit = True
+        # self.debug_audit = True
         self._debug_bad_checkpoint_seen = False
         self._debug_last_B_free = None
         self._debug_last_r_new = None
@@ -370,9 +370,11 @@ class SimpleGPUSolver:
             _print_progress(iteration, num_free, F_B_new.numel(), "ok")
             B_free = F_B_new
 
-        print(f"[Diag] Total Set 2 admissible edges found across all phases: {total_set2_admissible_edges}")
+        # print(f"[Diag] Total Set 2 admissible edges found across all phases: {total_set2_admissible_edges}")
         self.iterations = iteration
-        verify_results = self.verify_solution()
+        verify_results = None
+        if self.debug_audit:
+            verify_results = self.verify_solution()
         self._last_verify = verify_results
         self.cleanup_remaining_points()
         if self.verbose:
