@@ -386,21 +386,24 @@ class SimpleGPUSolver:
             return torch.empty(0, device=self.device, dtype=torch.bool)
 
         free_s = self.nearest_s[B_free]
-        free_y_B = self.y_B[B_free].to(torch.long)
-        max_y_B_by_s = torch.full(
+        free_score = (
+            self.y_B[B_free].to(torch.long)
+            - self.d_min_b_int[B_free].to(torch.long)
+        )
+        max_score_by_s = torch.full(
             (self.V.shape[0],),
             torch.iinfo(torch.int64).min,
             device=self.device,
             dtype=torch.long,
         )
-        max_y_B_by_s.scatter_reduce_(
+        max_score_by_s.scatter_reduce_(
             0,
             free_s,
-            free_y_B,
+            free_score,
             reduce="amax",
             include_self=True,
         )
-        return free_y_B == max_y_B_by_s[free_s]
+        return free_score == max_score_by_s[free_s]
 
     def _set1_groups(self, B_free):
         num_free = B_free.numel()
