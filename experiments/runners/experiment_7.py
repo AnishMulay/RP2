@@ -29,8 +29,8 @@ EPSILON = 0.01
 SYNTHETIC_DIM = 2
 SEED = 42
 BATCH_SIZE = 512
-WARMUP_RUNS = 1
-TIMED_RUNS = 3
+WARMUP_RUNS = 0
+TIMED_RUNS = 1
 
 
 def resolve_mnist_paths(data_dir=None):
