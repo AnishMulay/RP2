@@ -21,7 +21,6 @@ try:
 except ImportError:
     ot = None
 
-from clustered_push_relabel.solvers.color_aware_bipartite import ColorAwareTwoLevelSolver
 from clustered_push_relabel.solvers.simple_bipartite import SimpleGPUSolver
 
 
@@ -32,7 +31,6 @@ SEED = 42
 BATCH_SIZE = 512
 WARMUP_RUNS = 1
 TIMED_RUNS = 3
-METHODS = ["Exact", "ColorAware", "Simple"]
 
 
 def resolve_mnist_paths(data_dir=None):
@@ -139,12 +137,6 @@ def average_l2_matching_cost(P_red, P_blue, matching):
     return torch.norm(P_blue - matched_red, p=2, dim=1).mean().item()
 
 
-def solver_matching(solver):
-    if hasattr(solver, "match_B"):
-        return solver.match_B
-    return solver.MB
-
-
 def benchmark_exact(P_red, P_blue):
     if ot is None:
         raise RuntimeError("POT is not installed; exact solver unavailable.")
@@ -174,10 +166,10 @@ def benchmark_exact(P_red, P_blue):
     return statistics.median(times_ms), statistics.median(costs)
 
 
-def benchmark_solver(P_red, P_blue, device, factory):
+def benchmark_simple(P_red, P_blue, device):
     for _ in range(WARMUP_RUNS):
         empty_cache_if_cuda(device)
-        solver = factory()
+        solver = SimpleGPUSolver(P_red, P_blue, EPSILON, batch_size=BATCH_SIZE, verbose=False)
         synchronize_if_cuda(device)
         solver.solve()
         synchronize_if_cuda(device)
@@ -185,52 +177,42 @@ def benchmark_solver(P_red, P_blue, device, factory):
 
     times_ms = []
     costs = []
+    iterations_list = []
     for _ in range(TIMED_RUNS):
         empty_cache_if_cuda(device)
-        solver = factory()
+        solver = SimpleGPUSolver(P_red, P_blue, EPSILON, batch_size=BATCH_SIZE, verbose=False)
         synchronize_if_cuda(device)
         t0 = time.perf_counter()
         solver.solve()
         synchronize_if_cuda(device)
         t1 = time.perf_counter()
-        costs.append(average_l2_matching_cost(P_red, P_blue, solver_matching(solver)))
+        costs.append(average_l2_matching_cost(P_red, P_blue, solver.match_B))
         times_ms.append((t1 - t0) * 1000.0)
+        iterations_list.append(solver.iterations)
         del solver
 
-    return statistics.median(times_ms), statistics.median(costs)
+    return statistics.median(times_ms), statistics.median(costs), statistics.median(iterations_list)
 
 
 def result_na():
-    return {"time_ms": math.nan, "cost": math.nan, "status": "fail"}
+    return {"time_ms": math.nan, "cost": math.nan, "iterations": math.nan, "status": "fail"}
 
 
-def run_method(method_name, P_red, P_blue, device):
+def run_exact(P_red, P_blue, device):
     try:
-        if method_name == "Exact":
-            time_ms, cost = benchmark_exact(P_red, P_blue)
-        elif method_name == "ColorAware":
-            time_ms, cost = benchmark_solver(
-                P_red,
-                P_blue,
-                device,
-                lambda: ColorAwareTwoLevelSolver(
-                    P_red, P_blue, EPSILON, metric="L2", verbose=True
-                ),
-            )
-        elif method_name == "Simple":
-            time_ms, cost = benchmark_solver(
-                P_red,
-                P_blue,
-                device,
-                lambda: SimpleGPUSolver(
-                    P_red, P_blue, EPSILON, batch_size=BATCH_SIZE, verbose=True
-                ),
-            )
-        else:
-            raise ValueError(f"Unknown method: {method_name}")
+        time_ms, cost = benchmark_exact(P_red, P_blue)
         return {"time_ms": time_ms, "cost": cost, "status": "success"}
     except Exception as exc:
-        print(f"Warning: {method_name} failed: {exc}", flush=True)
+        print(f"Warning: Exact failed: {exc}", flush=True)
+        return {"time_ms": math.nan, "cost": math.nan, "status": "fail"}
+
+
+def run_simple(P_red, P_blue, device):
+    try:
+        time_ms, cost, iterations = benchmark_simple(P_red, P_blue, device)
+        return {"time_ms": time_ms, "cost": cost, "iterations": iterations, "status": "success"}
+    except Exception as exc:
+        print(f"Warning: Simple failed: {exc}", flush=True)
         empty_cache_if_cuda(device)
         return result_na()
 
@@ -239,39 +221,64 @@ def is_available(value):
     return value == value
 
 
-def format_time(value):
+def fmt_time(value):
     if not is_available(value):
         return "N/A"
     return f"{value:.1f} ms"
 
 
-def format_cost(value):
+def fmt_cost(value):
     if not is_available(value):
         return "N/A"
     return f"{value:.4f}"
 
 
-def print_table(rows, metric_key, title, formatter):
-    headers = [("Dataset", 11), ("N", 7)]
-    headers.extend((method_name, 13) for method_name in METHODS)
-    print()
-    print(title)
+def fmt_iter(value):
+    if not is_available(value):
+        return "N/A"
+    return f"{int(value):,}"
+
+
+def print_results_table(rows):
+    col_widths = {
+        "dataset": 11,
+        "n": 7,
+        "exact_time": 14,
+        "simple_time": 14,
+        "exact_cost": 16,
+        "simple_cost": 16,
+        "simple_iters": 14,
+    }
+    headers = [
+        ("Dataset",       col_widths["dataset"],   "<"),
+        ("N",             col_widths["n"],          ">"),
+        ("Exact Time",    col_widths["exact_time"], ">"),
+        ("Simple Time",   col_widths["simple_time"],">"),
+        ("Exact Avg Cost",col_widths["exact_cost"], ">"),
+        ("Simple Avg Cost",col_widths["simple_cost"],">"),
+        ("Simple Iters",  col_widths["simple_iters"],">"),
+    ]
+
     header_line = " | ".join(
-        f"{label:<{width}}" if label == "Dataset" else f"{label:>{width}}"
-        for label, width in headers
+        f"{label:{align}{width}}" for label, width, align in headers
     )
-    separator = "-+-".join("-" * width for _, width in headers)
+    separator = "-+-".join("-" * width for _, width, _ in headers)
+
+    print()
     print(header_line)
     print(separator)
     for row in rows:
+        exact = row["exact"]
+        simple = row["simple"]
         cells = [
-            f"{row['dataset']:<11}",
-            f"{row['n']:>7,}",
+            f"{row['dataset']:<{col_widths['dataset']}}",
+            f"{row['n']:>{col_widths['n']},}",
+            f"{fmt_time(exact['time_ms']):>{col_widths['exact_time']}}",
+            f"{fmt_time(simple['time_ms']):>{col_widths['simple_time']}}",
+            f"{fmt_cost(exact['cost']):>{col_widths['exact_cost']}}",
+            f"{fmt_cost(simple['cost']):>{col_widths['simple_cost']}}",
+            f"{fmt_iter(simple['iterations']):>{col_widths['simple_iters']}}",
         ]
-        cells.extend(
-            f"{formatter(row['results'][method_name][metric_key]):>13}"
-            for method_name in METHODS
-        )
         print(" | ".join(cells))
 
 
@@ -297,24 +304,23 @@ def main():
         for n in N_VALUES:
             print(f"\nPreparing {dataset_name} N={n:,}", flush=True)
             P_red, P_blue = loader(n, device)
-            row = {
+
+            print("  Running Exact...", flush=True)
+            exact_result = run_exact(P_red, P_blue, device)
+
+            print("  Running Simple...", flush=True)
+            simple_result = run_simple(P_red, P_blue, device)
+
+            rows.append({
                 "dataset": dataset_name,
                 "n": n,
-                "results": {},
-            }
-
-            for method_name in METHODS:
-                print(f"  Running {method_name}...", flush=True)
-                row["results"][method_name] = run_method(
-                    method_name, P_red, P_blue, device
-                )
-
-            rows.append(row)
+                "exact": exact_result,
+                "simple": simple_result,
+            })
             del P_red, P_blue
             empty_cache_if_cuda(device)
 
-    print_table(rows, "time_ms", "Time", format_time)
-    print_table(rows, "cost", "Matching Cost (Average L2 Per Pair)", format_cost)
+    print_results_table(rows)
 
 
 if __name__ == "__main__":
