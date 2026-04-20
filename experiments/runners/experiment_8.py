@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import math
+import os
 import pathlib
+import statistics
 import sys
 import time
 
@@ -20,16 +22,86 @@ except ImportError:
     ot = None
 
 from clustered_push_relabel.solvers.simple_bipartite import SimpleGPUSolver
-from clustered_push_relabel.clustering.simple import SimpleClustering
+from clustered_push_relabel.clustering.simple_l1 import SimpleL1Clustering
 
 
+N_VALUES = [1_000, 5_000, 10_000]
+EPSILON = 0.01
 SYNTHETIC_DIM = 2
 SEED = 42
 BATCH_SIZE = 512
 WARMUP_RUNS = 0
 TIMED_RUNS = 1
-METHODS = ("Exact", "ProxyExact", "Simple")
-SAMPLE_FACTOR_DEFAULT = 1.0
+
+
+def resolve_mnist_paths(data_dir=None):
+    """Resolve MNIST image/label file paths from common repo locations."""
+    candidate_dirs = []
+    if data_dir:
+        candidate_dirs.append(pathlib.Path(data_dir))
+
+    env_data_dir = os.environ.get("MNIST_DATA_DIR")
+    if env_data_dir:
+        candidate_dirs.append(pathlib.Path(env_data_dir))
+
+    candidate_dirs.extend([
+        BASE_DIR / "data",
+        BASE_DIR / "experiments" / "data",
+        pathlib.Path.cwd() / "data",
+        pathlib.Path.cwd() / "experiments" / "data",
+    ])
+
+    seen = set()
+    deduped_dirs = []
+    for directory in candidate_dirs:
+        resolved = directory.expanduser().resolve()
+        if resolved not in seen:
+            deduped_dirs.append(resolved)
+            seen.add(resolved)
+
+    for directory in deduped_dirs:
+        img_path = directory / "train-images-idx3-ubyte.gz"
+        lbl_path = directory / "train-labels-idx1-ubyte.gz"
+        if img_path.is_file() and lbl_path.is_file():
+            return img_path, lbl_path
+
+    searched = ", ".join(str(path) for path in deduped_dirs)
+    raise FileNotFoundError(
+        "MNIST data files not found. Searched: "
+        f"{searched}. Expected train-images-idx3-ubyte.gz and "
+        "train-labels-idx1-ubyte.gz."
+    )
+
+
+def load_mnist_flat(n_samples, seed=0, data_dir=None):
+    """Load MNIST images, normalize pixels to [0,1], sample red and blue sets."""
+    import gzip
+
+    img_path, lbl_path = resolve_mnist_paths(data_dir=data_dir)
+    with gzip.open(img_path, "rb") as f:
+        images = np.frombuffer(f.read(), dtype=np.uint8, offset=16).reshape(-1, 784)
+    with gzip.open(lbl_path, "rb") as f:
+        _ = np.frombuffer(f.read(), dtype=np.uint8, offset=8)
+    images = images.astype(np.float32) / 255.0
+    # Normalize each image to a probability distribution (sum to 1)
+    row_sums = images.sum(axis=1, keepdims=True)
+    row_sums = np.maximum(row_sums, 1e-8)  # guard against all-black images
+    images = images / row_sums
+    # Divide by 2 so max L1 distance is guaranteed <= 1 (probability simplex bound)
+    images = images / 2.0
+    total = images.shape[0]
+    if 2 * n_samples > total:
+        raise ValueError(
+            f"Not enough MNIST images to sample {2*n_samples} "
+            f"(only {total} available)."
+        )
+    rng = np.random.RandomState(seed)
+    perm = rng.permutation(total)
+    red_idx = perm[:n_samples]
+    blue_idx = perm[n_samples:2*n_samples]
+    red = torch.from_numpy(images[red_idx]).float()
+    blue = torch.from_numpy(images[blue_idx]).float()
+    return red, blue
 
 
 def generate_synthetic_2d(n, device):
@@ -40,18 +112,9 @@ def generate_synthetic_2d(n, device):
     return P_red, P_blue
 
 
-def normalize_points(P_red, P_blue):
-    """
-    Normalize red and blue points jointly by the diameter of their union.
-    Returns (P_red_norm, P_blue_norm, diameter).
-    diameter is a Python float for passing to SimpleGPUSolver.
-    """
-    all_points = torch.cat([P_red, P_blue], dim=0)
-    mean = all_points.mean(dim=0, keepdim=True)
-    centered = all_points - mean
-    diameter = float(2.0 * centered.norm(dim=1).max().item())
-    diameter = max(diameter, 1e-8)
-    return P_red / diameter, P_blue / diameter, diameter
+def load_mnist_pair(n, device):
+    red, blue = load_mnist_flat(n, seed=SEED)
+    return red.to(device), blue.to(device)
 
 
 def synchronize_if_cuda(device):
@@ -71,76 +134,11 @@ def compute_cost_matrix_L2(red, blue):
     return torch.cdist(X, Y, p=2).cpu().numpy()
 
 
-def build_proxy_matrix(clustering, N, epsilon):
-    """
-    Build an (N, N) proxy cost matrix from SimpleClustering output.
-
-    For every (b, a) pair the proxy cost is:
-        d_min_b[b] + DR[nearest_s[b], a]   (triangle proxy through nearest center)
-
-    For pairs where a is in b's adjacency list, overwrite with the exact
-    stored float distance adj_dist_float[entry].
-
-    NOTE: Allocates an (N x N) float32 tensor on GPU. Only valid for N up to
-    roughly 10,000 (400 MB at float32). Do not use for larger N.
-
-    Returns a CPU float64 numpy array of shape (N, N) ready for ot.emd.
-    """
-    device = clustering["DR"].device
-    DR = clustering["DR"]           # (S, N) float
-    d_min_b = clustering["d_min_b"] # (N,)   float
-    nearest_s = clustering["nearest_s"]  # (N,) int64
-    adj_ptr = clustering["adj_ptr"]      # (N+1,) int64
-    adj_col = clustering["adj_col"]      # (M,) int64
-    adj_dist_float = clustering["adj_dist_float"]  # (M,) float
-
-    # Triangle proxy for all (b, a): d_min_b[b] + DR[nearest_s[b], a]
-    # DR[nearest_s, :] selects one row of DR per blue -> (N, N)
-    C = (d_min_b.unsqueeze(1) + DR[nearest_s, :]).T  # (N_red × N_blue)
-
-    # Overwrite adjacency-list entries with exact stored distances
-    if adj_col.numel() > 0:
-        b_indices = torch.repeat_interleave(
-            torch.arange(N, device=device, dtype=torch.long),
-            adj_ptr[1:] - adj_ptr[:-1],
-        )
-        C[adj_col, b_indices] = adj_dist_float
-
-    return C.cpu().to(torch.float64).numpy()
-
-
-def build_discrete_proxy_matrix(clustering, N, epsilon):
-    """
-    Build an (N, N) proxy matrix from discretized integer proxy costs.
-
-    The returned matrix uses normalized real units:
-        epsilon * integer_proxy_cost
-
-    Shape/orientation matches build_proxy_matrix(): rows are red points and
-    columns are blue points.
-    """
-    device = clustering["DR_int"].device
-    DR_int = clustering["DR_int"]
-    d_min_b_int = clustering["d_min_b_int"]
-    nearest_s = clustering["nearest_s"]
-    adj_ptr = clustering["adj_ptr"]
-    adj_col = clustering["adj_col"]
-    adj_dist_int = clustering["adj_dist_int"]
-
-    C = (
-        d_min_b_int.to(torch.float64).unsqueeze(1)
-        + DR_int[nearest_s, :].to(torch.float64)
-    ).T
-    C.mul_(float(epsilon))
-
-    if adj_col.numel() > 0:
-        b_indices = torch.repeat_interleave(
-            torch.arange(N, device=device, dtype=torch.long),
-            adj_ptr[1:] - adj_ptr[:-1],
-        )
-        C[adj_col, b_indices] = adj_dist_int.to(torch.float64) * float(epsilon)
-
-    return C.cpu().numpy()
+def compute_cost_matrix_l1(red, blue):
+    """Compute full Manhattan distance matrix between two point sets on CPU."""
+    X = torch.as_tensor(red, dtype=torch.float64).contiguous()
+    Y = torch.as_tensor(blue, dtype=torch.float64).contiguous()
+    return torch.cdist(X, Y, p=1).cpu().numpy()
 
 
 def matching_from_plan(plan):
@@ -148,32 +146,26 @@ def matching_from_plan(plan):
     return torch.from_numpy(plan.argmax(axis=0).astype(np.int64, copy=False))
 
 
-def matching_costs(P_red, P_blue, match_B):
-    match_B = match_B.to(device=P_red.device, dtype=torch.long)
-    if match_B.numel() != P_blue.shape[0] or (match_B < 0).any():
-        raise RuntimeError("matching is incomplete")
-
-    matched_red = P_red[match_B]
-    dists = torch.norm(P_blue - matched_red, p=2, dim=1)
-    total_cost = dists.sum().item()
-    avg_cost = total_cost / P_blue.shape[0]
-    return total_cost, avg_cost
+def average_matching_cost(P_red, P_blue, matching, p=2):
+    matched_red = P_red[matching.to(device=P_red.device, dtype=torch.long)]
+    if p == 1:
+        return (P_blue - matched_red).abs().sum(dim=1).mean().item()
+    return torch.norm(P_blue - matched_red, p=2, dim=1).mean().item()
 
 
-def solver_matching(solver):
-    if hasattr(solver, "match_B"):
-        return solver.match_B
-    return solver.MB
-
-
-def benchmark_exact(P_red, P_blue):
+def benchmark_exact(P_red, P_blue, metric="l2"):
     if ot is None:
         raise RuntimeError("POT is not installed; exact solver unavailable.")
 
     red_cpu = P_red.detach().cpu()
     blue_cpu = P_blue.detach().cpu()
     n = red_cpu.shape[0]
-    C = compute_cost_matrix_L2(red_cpu, blue_cpu)
+    C = (
+        compute_cost_matrix_l1(red_cpu, blue_cpu)
+        if metric == "l1"
+        else compute_cost_matrix_L2(red_cpu, blue_cpu)
+    )
+    p = 1 if metric == "l1" else 2
     a = np.full(n, 1.0 / n, dtype=np.float64)
     b = np.full(n, 1.0 / n, dtype=np.float64)
 
@@ -181,211 +173,88 @@ def benchmark_exact(P_red, P_blue):
         plan = ot.emd(a, b, C, numItermax=10**6)
         del plan
 
+    times_ms = []
+    costs = []
     for _ in range(TIMED_RUNS):
         t0 = time.perf_counter()
         plan = ot.emd(a, b, C, numItermax=10**6)
         t1 = time.perf_counter()
+        match_B = matching_from_plan(plan)
+        costs.append(average_matching_cost(red_cpu, blue_cpu, match_B, p=p))
+        times_ms.append((t1 - t0) * 1000.0)
+        del plan, match_B
 
-    match_B = matching_from_plan(plan)
-    total_cost, avg_cost = matching_costs(red_cpu, blue_cpu, match_B)
-    del plan, match_B, C
-    return (t1 - t0) * 1000.0, total_cost, avg_cost
-
-
-def benchmark_proxy_exact(P_red, P_blue, device, epsilon, sample_factor):
-    if ot is None:
-        raise RuntimeError("POT is not installed; exact solver unavailable.")
-
-    P_red_norm, P_blue_norm, diameter = normalize_points(P_red, P_blue)
-    N = P_red_norm.shape[0]
-
-    cluster_engine = SimpleClustering(
-        epsilon=epsilon, tile_size=BATCH_SIZE, sample_factor=sample_factor
-    )
-    clustering = cluster_engine.run(P_red_norm, P_blue_norm)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-
-    proxy_stats = {
-        "samples": int(clustering["DR"].shape[0]),
-        "overrides": int(clustering["adj_col"].numel()),
-        "total_entries": N * N,
-        "override_pct": 100.0 * int(clustering["adj_col"].numel()) / (N * N),
-    }
-    C = build_proxy_matrix(clustering, N, epsilon)
-
-    a = np.full(N, 1.0 / N, dtype=np.float64)
-    b = np.full(N, 1.0 / N, dtype=np.float64)
-
-    t0 = time.perf_counter()
-    plan = ot.emd(a, b, C, numItermax=10**6)
-    t1 = time.perf_counter()
-
-    match_B = matching_from_plan(plan)
-    total_cost, avg_cost = matching_costs(P_red_norm, P_blue_norm, match_B)
-    total_cost *= diameter
-    avg_cost *= diameter
-
-    del plan, match_B, C, clustering, cluster_engine
-    return (t1 - t0) * 1000.0, total_cost, avg_cost, proxy_stats
+    return statistics.median(times_ms), statistics.median(costs)
 
 
-def benchmark_discrete_proxy_exact(P_red, P_blue, device, epsilon, sample_factor):
-    if ot is None:
-        raise RuntimeError("POT is not installed; exact solver unavailable.")
-
-    P_red_norm, P_blue_norm, diameter = normalize_points(P_red, P_blue)
-    N = P_red_norm.shape[0]
-
-    cluster_engine = SimpleClustering(
-        epsilon=epsilon, tile_size=BATCH_SIZE, sample_factor=sample_factor
-    )
-    clustering = cluster_engine.run(P_red_norm, P_blue_norm)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-
-    C = build_discrete_proxy_matrix(clustering, N, epsilon)
-
-    a = np.full(N, 1.0 / N, dtype=np.float64)
-    b = np.full(N, 1.0 / N, dtype=np.float64)
-
-    t0 = time.perf_counter()
-    plan = ot.emd(a, b, C, numItermax=10**6)
-    t1 = time.perf_counter()
-
-    match_B = matching_from_plan(plan)
-    total_cost, avg_cost = matching_costs(P_red_norm, P_blue_norm, match_B)
-    total_cost *= diameter
-    avg_cost *= diameter
-
-    del plan, match_B, C, clustering, cluster_engine
-    return (t1 - t0) * 1000.0, total_cost, avg_cost
-
-
-def benchmark_simple(P_red, P_blue, device, epsilon, sample_factor):
-    P_red_norm, P_blue_norm, diameter = normalize_points(P_red, P_blue)
-
+def benchmark_simple(P_red, P_blue, device, clustering_class=None, metric="l2"):
+    p = 1 if metric == "l1" else 2
     for _ in range(WARMUP_RUNS):
         empty_cache_if_cuda(device)
         solver = SimpleGPUSolver(
-            P_red_norm,
-            P_blue_norm,
-            epsilon,
+            P_red,
+            P_blue,
+            EPSILON,
             batch_size=BATCH_SIZE,
             verbose=False,
-            diameter=diameter,
-            sample_factor=sample_factor,
+            clustering_class=clustering_class,
         )
         synchronize_if_cuda(device)
         solver.solve()
         synchronize_if_cuda(device)
         del solver
 
-    empty_cache_if_cuda(device)
-    solver = SimpleGPUSolver(
-        P_red_norm,
-        P_blue_norm,
-        epsilon,
-        batch_size=BATCH_SIZE,
-        verbose=False,
-        diameter=diameter,
-        sample_factor=sample_factor,
-    )
-
+    times_ms = []
+    costs = []
+    iterations_list = []
     for _ in range(TIMED_RUNS):
+        empty_cache_if_cuda(device)
+        solver = SimpleGPUSolver(
+            P_red,
+            P_blue,
+            EPSILON,
+            batch_size=BATCH_SIZE,
+            verbose=False,
+            clustering_class=clustering_class,
+        )
         synchronize_if_cuda(device)
         t0 = time.perf_counter()
-        result = solver.solve()
+        solver.solve()
         synchronize_if_cuda(device)
         t1 = time.perf_counter()
+        costs.append(average_matching_cost(P_red, P_blue, solver.match_B, p=p))
+        times_ms.append((t1 - t0) * 1000.0)
+        iterations_list.append(solver.iterations)
+        del solver
 
-    match_B = result if result is not None else solver_matching(solver)
-    phases = solver.iterations
-    total_cost, avg_cost = matching_costs(P_red_norm, P_blue_norm, match_B)
-    total_cost *= diameter
-    avg_cost *= diameter
-    feasibility = None
-    adj_stats = None
-    # solver.verbose = True
-    # feasibility = solver.verify_solution()
-    # solver.verbose = False
-    #
-    # # ── Adjacency list size quantiles ────────────────────────────────────
-    # lengths = (solver.adj_ptr[1:] - solver.adj_ptr[:-1]).float()
-    # quantiles = torch.quantile(
-    #     lengths,
-    #     torch.tensor([0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0],
-    #                  device=solver.device, dtype=torch.float32)
-    # ).cpu().tolist()
-    # adj_stats = {
-    #     "samples": int(solver.V.shape[0]),
-    #     "mean"  : float(lengths.mean().item()),
-    #     "min"   : quantiles[0],
-    #     "p10"   : quantiles[1],
-    #     "p25"   : quantiles[2],
-    #     "p50"   : quantiles[3],
-    #     "p75"   : quantiles[4],
-    #     "p90"   : quantiles[5],
-    #     "p95"   : quantiles[6],
-    #     "p99"   : quantiles[7],
-    #     "max"   : quantiles[8],
-    # }
-    del solver, match_B, P_red_norm, P_blue_norm
-    return (t1 - t0) * 1000.0, total_cost, avg_cost, phases, feasibility, adj_stats
+    return statistics.median(times_ms), statistics.median(costs), statistics.median(iterations_list)
 
 
 def result_na():
-    return {
-        "time_ms": math.nan,
-        "total_cost": math.nan,
-        "avg_cost": math.nan,
-        "phases": math.nan,
-        "feasibility": None,
-        "adj_stats": None,
-        "proxy_stats": None,
-    }
+    return {"time_ms": math.nan, "cost": math.nan, "iterations": math.nan, "status": "fail"}
 
 
-def run_method(n, method_name, P_red, P_blue, device, epsilon, sample_factor):
+def run_exact(P_red, P_blue, device, metric="l2"):
     try:
-        print(f"  Running {method_name} for N={n:,}...", flush=True)
-        phases = math.nan
-        feasibility = None
-        adj_stats = None
-        proxy_stats = None
-        if method_name == "Exact":
-            time_ms, total_cost, avg_cost = benchmark_exact(P_red, P_blue)
-        elif method_name == "ProxyExact":
-            time_ms, total_cost, avg_cost, proxy_stats = benchmark_proxy_exact(
-                P_red, P_blue, device, epsilon, sample_factor
-            )
-        elif method_name == "Simple":
-            (
-                time_ms,
-                total_cost,
-                avg_cost,
-                phases,
-                feasibility,
-                adj_stats,
-            ) = benchmark_simple(P_red, P_blue, device, epsilon, sample_factor)
-        else:
-            raise ValueError(f"Unknown method: {method_name}")
-        print(
-            f"  Completed {method_name} for N={n:,}: "
-            f"{time_ms:.1f} ms, avg_cost={avg_cost:.4f}",
-            flush=True,
-        )
-        return {
-            "time_ms": time_ms,
-            "total_cost": total_cost,
-            "avg_cost": avg_cost,
-            "phases": phases,
-            "feasibility": feasibility,
-            "adj_stats": adj_stats,
-            "proxy_stats": proxy_stats,
-        }
+        time_ms, cost = benchmark_exact(P_red, P_blue, metric=metric)
+        return {"time_ms": time_ms, "cost": cost, "status": "success"}
     except Exception as exc:
-        print(f"Warning: N={n:,} {method_name} failed: {exc}", flush=True)
+        print(f"Warning: Exact failed: {exc}", flush=True)
+        return {"time_ms": math.nan, "cost": math.nan, "status": "fail"}
+
+
+def run_simple(P_red, P_blue, device, clustering_class=None, metric="l2"):
+    try:
+        time_ms, cost, iterations = benchmark_simple(
+            P_red,
+            P_blue,
+            device,
+            clustering_class=clustering_class,
+            metric=metric,
+        )
+        return {"time_ms": time_ms, "cost": cost, "iterations": iterations, "status": "success"}
+    except Exception as exc:
+        print(f"Warning: Simple failed: {exc}", flush=True)
         empty_cache_if_cuda(device)
         return result_na()
 
@@ -394,292 +263,112 @@ def is_available(value):
     return value == value
 
 
-def format_time(value):
+def fmt_time(value):
     if not is_available(value):
         return "N/A"
-    return f"{value:.1f}"
+    return f"{value:.1f} ms"
 
 
-def format_avg_cost(value):
+def fmt_cost(value):
     if not is_available(value):
         return "N/A"
     return f"{value:.4f}"
 
 
-def format_phases(value):
+def fmt_iter(value):
     if not is_available(value):
         return "N/A"
-    return f"{int(value)}"
+    return f"{int(value):,}"
 
 
-def format_count(value):
-    if value is None:
-        return "N/A"
-    return f"{int(value)}"
+def print_results_table(rows):
+    col_widths = {
+        "dataset": 11,
+        "n": 7,
+        "exact_time": 14,
+        "simple_time": 14,
+        "exact_cost": 16,
+        "simple_cost": 16,
+        "simple_iters": 14,
+    }
+    headers = [
+        ("Dataset",       col_widths["dataset"],   "<"),
+        ("N",             col_widths["n"],          ">"),
+        ("Exact Time",    col_widths["exact_time"], ">"),
+        ("Simple Time",   col_widths["simple_time"],">"),
+        ("Exact Avg Cost",col_widths["exact_cost"], ">"),
+        ("Simple Avg Cost",col_widths["simple_cost"],">"),
+        ("Simple Iters",  col_widths["simple_iters"],">"),
+    ]
 
+    header_line = " | ".join(
+        f"{label:{align}{width}}" for label, width, align in headers
+    )
+    separator = "-+-".join("-" * width for _, width, _ in headers)
 
-def format_diff(value):
-    if not is_available(value):
-        return "N/A"
-    return f"{value:.6f}"
-
-
-def diff_or_nan(a, b):
-    if not is_available(a) or not is_available(b):
-        return math.nan
-    return a - b
-
-
-def print_violation_table(rows):
     print()
-    print(
-        "  N    | FeasViol | FeasWorst | AdmisViol | AdmisWorst"
-    )
-    print(
-        "-------|----------|-----------|-----------|------------"
-    )
-
+    print(header_line)
+    print(separator)
     for row in rows:
-        n = row["n"]
-        f = row["results"]["Simple"].get("feasibility")
-        if f is None:
-            feas_viol = feas_worst = admis_viol = admis_worst = None
-        else:
-            feas_viol   = f["feasibility_violations"]
-            feas_worst  = f["feasibility_worst_excess"]
-            admis_viol  = f["admissibility_violations"]
-            admis_worst = f["admissibility_worst_diff"]
-
-        print(
-            f"{n:>6,} | "
-            f"{format_count(feas_viol):>8} | "
-            f"{format_count(feas_worst):>9} | "
-            f"{format_count(admis_viol):>9} | "
-            f"{format_count(admis_worst):>10}"
-        )
-
-
-def print_timing_table(rows):
-    print()
-    print(
-        "  N    | ExactT(ms) | ProxyT(ms) | SimpleT(ms) | Phases"
-    )
-    print(
-        "-------|------------|------------|-------------|-------"
-    )
-
-    for row in rows:
-        n = row["n"]
-        exact = row["results"]["Exact"]
-        proxy = row["results"]["ProxyExact"]
-        simple = row["results"]["Simple"]
-
-        print(
-            f"{n:>6,} | "
-            f"{format_time(exact['time_ms']):>10} | "
-            f"{format_time(proxy['time_ms']):>10} | "
-            f"{format_time(simple['time_ms']):>11} | "
-            f"{format_phases(simple['phases']):>6}"
-        )
-
-
-def print_cost_table(rows):
-    print()
-    print(
-        "  N    | ExactAvg | ProxyAvg | SimpleAvg"
-    )
-    print(
-        "-------|----------|----------|----------"
-    )
-
-    for row in rows:
-        n = row["n"]
-        exact = row["results"]["Exact"]
-        proxy = row["results"]["ProxyExact"]
-        simple = row["results"]["Simple"]
-
-        print(
-            f"{n:>6,} | "
-            f"{format_avg_cost(exact['avg_cost']):>8} | "
-            f"{format_avg_cost(proxy['avg_cost']):>8} | "
-            f"{format_avg_cost(simple['avg_cost']):>8}"
-        )
-
-
-def print_final_table(rows):
-    print()
-    print(
-        "  N    | ExactT(ms) | ExactAvg | ProxyT(ms) | ProxyAvg | SimpleT(ms) | SimpleAvg | Phases"
-    )
-    print(
-        "-------|------------|----------|------------|----------|-------------|-----------|-------"
-    )
-
-    for row in rows:
-        n = row["n"]
-        exact = row["results"]["Exact"]
-        proxy = row["results"]["ProxyExact"]
-        simple = row["results"]["Simple"]
-
-        print(
-            f"{n:>6,} | "
-            f"{format_time(exact['time_ms']):>10} | "
-            f"{format_avg_cost(exact['avg_cost']):>8} | "
-            f"{format_time(proxy['time_ms']):>10} | "
-            f"{format_avg_cost(proxy['avg_cost']):>8} | "
-            f"{format_time(simple['time_ms']):>11} | "
-            f"{format_avg_cost(simple['avg_cost']):>9} | "
-            f"{format_phases(simple['phases']):>6}"
-        )
-
-
-def print_error_breakdown_table(rows):
-    print()
-    print(
-        "  N    | ProxyErr | SolverErr | TotalErr"
-    )
-    print(
-        "-------|----------|-----------|---------"
-    )
-
-    for row in rows:
-        n = row["n"]
-        exact_avg = row["results"]["Exact"]["avg_cost"]
-        proxy_avg = row["results"]["ProxyExact"]["avg_cost"]
-        simple_avg = row["results"]["Simple"]["avg_cost"]
-
-        proxy_err = diff_or_nan(proxy_avg, exact_avg)
-        solver_err = diff_or_nan(simple_avg, proxy_avg)
-        total_err = diff_or_nan(simple_avg, exact_avg)
-
-        print(
-            f"{n:>6,} | "
-            f"{format_diff(proxy_err):>8} | "
-            f"{format_diff(solver_err):>9} | "
-            f"{format_diff(total_err):>7}"
-        )
-
-
-def pick(prompt, options):
-    """
-    Display a numbered menu and return the user's chosen value.
-    options is a list of (label, value) tuples.
-    Loops until a valid integer is entered.
-    """
-    print(f"\n{prompt}")
-    for i, (label, _) in enumerate(options, 1):
-        print(f"  {i}. {label}")
-    while True:
-        raw = input("Enter number: ").strip()
-        if raw.isdigit():
-            idx = int(raw)
-            if 1 <= idx <= len(options):
-                chosen_label, chosen_value = options[idx - 1]
-                print(f"  → {chosen_label}")
-                return chosen_value
-        print(f"  Please enter a number between 1 and {len(options)}.")
-
-
-def configure_experiment():
-    """
-    Interactive CLI picker for experiment configuration.
-    Returns (n_values, epsilon, sample_factor).
-    """
-    print("\n" + "=" * 50)
-    print("  Experiment 8 Configuration")
-    print("=" * 50)
-
-    n_values = pick(
-        "Select N values:",
-        [
-            ("1,000 → 10,000 in steps of 1,000",
-             list(range(1_000, 11_000, 1_000))),
-            ("5,000 only",
-             [5_000]),
-        ],
-    )
-
-    epsilon = pick(
-        "Select epsilon:",
-        [
-            ("0.01",  0.01),
-            ("0.005", 0.005),
-            ("0.001", 0.001),
-        ],
-    )
-
-    sample_factor = pick(
-        "Select sampling probability:",
-        [
-            ("1 / sqrt(N)    (default)",  SAMPLE_FACTOR_DEFAULT),
-            ("1 / (2*sqrt(N))  (reduced)", 2.0),
-        ],
-    )
-
-    print("\nConfiguration:")
-    print(f"  N values      : {n_values}")
-    print(f"  Epsilon       : {epsilon}")
-    print(f"  Sample factor : 1 / ({int(sample_factor)}*sqrt(N))")
-    print()
-    return n_values, epsilon, sample_factor
+        exact = row["exact"]
+        simple = row["simple"]
+        cells = [
+            f"{row['dataset']:<{col_widths['dataset']}}",
+            f"{row['n']:>{col_widths['n']},}",
+            f"{fmt_time(exact['time_ms']):>{col_widths['exact_time']}}",
+            f"{fmt_time(simple['time_ms']):>{col_widths['simple_time']}}",
+            f"{fmt_cost(exact['cost']):>{col_widths['exact_cost']}}",
+            f"{fmt_cost(simple['cost']):>{col_widths['simple_cost']}}",
+            f"{fmt_iter(simple['iterations']):>{col_widths['simple_iters']}}",
+        ]
+        print(" | ".join(cells))
 
 
 def main():
-    N_VALUES, EPSILON, SAMPLE_FACTOR = configure_experiment()
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(SEED)
 
-    print("Experiment 8: Simple vs Exact, Synthetic 2D", flush=True)
-    print(f"Device: {device}", flush=True)
-    print(f"Seed: {SEED}", flush=True)
-    print(f"N values: {', '.join(f'{n:,}' for n in N_VALUES)}", flush=True)
-    print(f"Epsilon: {EPSILON}", flush=True)
-    print(f"Sample factor: 1 / ({int(SAMPLE_FACTOR)}*sqrt(N))", flush=True)
-    print(f"Warmup runs: {WARMUP_RUNS}  Timed runs: {TIMED_RUNS}", flush=True)
-    print(f"Methods: {', '.join(METHODS)}", flush=True)
+    datasets = [("Synthetic", generate_synthetic_2d, None, "l2")]
+    try:
+        resolve_mnist_paths()
+        datasets.append(("MNIST", load_mnist_pair, SimpleL1Clustering, "l1"))
+    except FileNotFoundError as exc:
+        print(f"Warning: {exc} Skipping MNIST.", flush=True)
+
+    print(f"Device: {device}  epsilon={EPSILON}  batch_size={BATCH_SIZE}")
+    print(f"Warmup runs: {WARMUP_RUNS}  timed runs: {TIMED_RUNS}")
 
     rows = []
-    for n in N_VALUES:
-        print(f"\nPreparing Synthetic 2D data for N={n:,}...", flush=True)
-        try:
-            P_red, P_blue = generate_synthetic_2d(n, device)
-        except Exception as exc:
-            print(f"Warning: N={n:,} data generation failed: {exc}", flush=True)
-            rows.append(
-                {
-                    "n": n,
-                    "results": {method_name: result_na() for method_name in METHODS},
-                }
-            )
-            empty_cache_if_cuda(device)
-            continue
+    for dataset_name, loader, clustering_class, metric in datasets:
+        for n in N_VALUES:
+            print(f"\nPreparing {dataset_name} N={n:,}", flush=True)
+            P_red, P_blue = loader(n, device)
 
-        print(f"Generated Synthetic 2D data for N={n:,}.", flush=True)
-        results = {}
-        for method_name in METHODS:
-            results[method_name] = run_method(
-                n,
-                method_name,
+            print("  Running Exact...", flush=True)
+            exact_result = run_exact(P_red, P_blue, device, metric=metric)
+
+            print("  Running Simple...", flush=True)
+            simple_result = run_simple(
                 P_red,
                 P_blue,
                 device,
-                epsilon=EPSILON,
-                sample_factor=SAMPLE_FACTOR,
+                clustering_class=clustering_class,
+                metric=metric,
             )
 
-        rows.append({"n": n, "results": results})
-        del P_red, P_blue
-        empty_cache_if_cuda(device)
+            rows.append({
+                "dataset": dataset_name,
+                "n": n,
+                "exact": exact_result,
+                "simple": simple_result,
+            })
+            del P_red, P_blue
+            empty_cache_if_cuda(device)
 
-    print_final_table(rows)
-    # print_violation_table(rows)
-    # print_timing_table(rows)
-    # print_cost_table(rows)
-    # print_error_breakdown_table(rows)
+    print_results_table(rows)
 
 
 if __name__ == "__main__":

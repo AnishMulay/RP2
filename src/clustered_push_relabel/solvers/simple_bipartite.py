@@ -42,7 +42,12 @@ class SimpleGPUSolver:
         set1_pair_batch=64,
         diameter: float = 1.0,
         sample_factor: float = 1.0,
+        clustering_class=None,
     ):
+        if clustering_class is None:
+            from ..clustering.simple import SimpleClustering as clustering_class
+        self._clustering_class = clustering_class
+
         if A.device != B.device:
             raise ValueError("A and B must be on the same device")
         if A.device.type != "cuda":
@@ -85,7 +90,7 @@ class SimpleGPUSolver:
             )
 
         t0 = time.time()
-        cluster_engine = SimpleClustering(
+        cluster_engine = self._clustering_class(
             epsilon=self.epsilon,
             tile_size=self.batch_size,
             sample_factor=sample_factor,
