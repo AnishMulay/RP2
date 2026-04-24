@@ -30,15 +30,15 @@ def main():
         if path.is_file():
             print(f"  {path.relative_to(DATA_DIR)}", flush=True)
 
-    base_path = DATA_DIR / "sift" / "sift_base.bvecs"
+    base_path = DATA_DIR / "sift" / "sift_base.fvecs"
     if not base_path.exists():
-        base_path = DATA_DIR / "sift_base.bvecs"
+        base_path = DATA_DIR / "sift_base.fvecs"
 
     with open(base_path, "rb") as f:
         d = int.from_bytes(f.read(4), byteorder="little", signed=True)
     print(f"Sanity check: first descriptor dimension = {d} (expected 128)", flush=True)
     if d != 128:
-        print("WARNING: unexpected descriptor dimension in sift_base.bvecs", flush=True)
+        print("WARNING: unexpected descriptor dimension in sift_base.fvecs", flush=True)
 
     print("Download complete.", flush=True)
 

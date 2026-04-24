@@ -33,23 +33,25 @@ TIMED_RUNS = 1
 SIFT_DIM = 128
 
 DATA_DIR = BASE_DIR / "data" / "sift"
-SIFT_BASE_PATH = DATA_DIR / "sift" / "sift_base.bvecs"
+SIFT_BASE_PATH = DATA_DIR / "sift" / "sift_base.fvecs"
 
 
-def load_bvecs(path):
-    """Load a .bvecs file and return a numpy float32 array of shape (N, D)."""
+def load_fvecs(path):
+    """Load a .fvecs file and return a numpy float32 array of shape (N, D)."""
     with open(path, "rb") as f:
         d = np.frombuffer(f.read(4), dtype=np.int32)[0]
         f.seek(0)
-        data = np.frombuffer(f.read(), dtype=np.uint8)
-    record_size = 4 + d
+        data = np.frombuffer(f.read(), dtype=np.float32)
+    # Each record: 1 int32 (reinterpreted as float32) + d float32 values
+    # Record size in float32 units = 1 + d
+    record_size = 1 + d
     n_vecs = len(data) // record_size
     data = data.reshape(n_vecs, record_size)
-    return data[:, 4:].astype(np.float32)
+    return data[:, 1:].copy()  # skip the first float32 (was the int32 dim header)
 
 
 def load_sift_pair(n_samples, seed):
-    base_vectors = load_bvecs(SIFT_BASE_PATH)
+    base_vectors = load_fvecs(SIFT_BASE_PATH)
     print(f"  Loaded SIFT base descriptors: {base_vectors.shape}", flush=True)
     if base_vectors.shape[1] != SIFT_DIM:
         raise ValueError(
@@ -287,12 +289,12 @@ def main():
     print(f"SIFT base file: {SIFT_BASE_PATH}")
 
     if not SIFT_BASE_PATH.exists():
-        fallback = DATA_DIR / "sift_base.bvecs"
+        fallback = DATA_DIR / "sift_base.fvecs"
         if fallback.exists():
             SIFT_BASE_PATH = fallback
             print(f"Using fallback path: {SIFT_BASE_PATH}")
         else:
-            print("ERROR: sift_base.bvecs not found. Run download_sift.py first.")
+            print("ERROR: sift_base.fvecs not found. Run download_sift.py first.")
             return
 
     rows = []
