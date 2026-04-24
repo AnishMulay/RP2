@@ -71,20 +71,21 @@ def load_sift_pair(n_samples, seed):
     red_idx = perm[:n_samples]
     blue_idx = perm[n_samples : 2 * n_samples]
 
-    red = base_vectors[red_idx].astype(np.float32, copy=False)
-    blue = base_vectors[blue_idx].astype(np.float32, copy=False)
+    red = base_vectors[red_idx]
+    blue = base_vectors[blue_idx]
 
-    red = red / 255.0
-    blue = blue / 255.0
+    red = red.astype(np.float32) / 255.0
+    blue = blue.astype(np.float32) / 255.0
 
     subsample = np.vstack([red[:500], blue[:500]])
     sub_tensor = torch.from_numpy(subsample)
     diameter = float(torch.cdist(sub_tensor, sub_tensor).max().item())
     diameter = max(diameter, 1e-6)
 
-    red_tensor = torch.from_numpy(red).to(dtype=torch.float32)
-    blue_tensor = torch.from_numpy(blue).to(dtype=torch.float32)
-    return red_tensor, blue_tensor, diameter
+    red = red / diameter
+    blue = blue / diameter
+
+    return torch.from_numpy(red).float(), torch.from_numpy(blue).float()
 
 
 def synchronize_if_cuda(device):
@@ -143,7 +144,7 @@ def benchmark_exact_l2(P_red, P_blue):
     return statistics.median(times_ms), statistics.median(costs)
 
 
-def benchmark_simple_sift(P_red, P_blue, diameter, device):
+def benchmark_simple_sift(P_red, P_blue, device):
     for _ in range(WARMUP_RUNS):
         empty_cache_if_cuda(device)
         solver = SimpleGPUSolver(
@@ -152,7 +153,7 @@ def benchmark_simple_sift(P_red, P_blue, diameter, device):
             EPSILON,
             batch_size=BATCH_SIZE,
             verbose=False,
-            diameter=diameter,
+            diameter=1.0,
             clustering_class=SimpleClustering,
         )
         synchronize_if_cuda(device)
@@ -171,7 +172,7 @@ def benchmark_simple_sift(P_red, P_blue, diameter, device):
             EPSILON,
             batch_size=BATCH_SIZE,
             verbose=False,
-            diameter=diameter,
+            diameter=1.0,
             clustering_class=SimpleClustering,
         )
         synchronize_if_cuda(device)
@@ -204,9 +205,9 @@ def run_exact(P_red, P_blue, device):
         return {"time_ms": math.nan, "cost": math.nan, "status": "fail"}
 
 
-def run_simple(P_red, P_blue, diameter, device):
+def run_simple(P_red, P_blue, device):
     try:
-        time_ms, cost, iterations = benchmark_simple_sift(P_red, P_blue, diameter, device)
+        time_ms, cost, iterations = benchmark_simple_sift(P_red, P_blue, device)
         return {"time_ms": time_ms, "cost": cost, "iterations": iterations, "status": "success"}
     except Exception as exc:
         print(f"Warning: Simple failed: {exc}", flush=True)
@@ -301,8 +302,7 @@ def main():
     for n in N_VALUES:
         print(f"\nPreparing SIFT N={n:,}", flush=True)
         try:
-            P_red, P_blue, diameter = load_sift_pair(n, seed=SEED)
-            print(f"  Diameter (subsample estimate): {diameter:.4f}", flush=True)
+            P_red, P_blue = load_sift_pair(n, seed=SEED)
             P_red = P_red.to(device)
             P_blue = P_blue.to(device)
         except Exception as exc:
@@ -313,7 +313,7 @@ def main():
         exact_result = run_exact(P_red, P_blue, device)
 
         print("  Running Simple solver...", flush=True)
-        simple_result = run_simple(P_red, P_blue, diameter, device)
+        simple_result = run_simple(P_red, P_blue, device)
 
         rows.append({"n": n, "exact": exact_result, "simple": simple_result})
 
