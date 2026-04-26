@@ -65,14 +65,15 @@ def load_taxi_data(path, day):
     else:
         raise ValueError(f"Unsupported file format: {path}")
 
-    time_col = _find_col(df, _PICKUP_TIME_VARIANTS, "pickup datetime")
-    if df[time_col].dt.tz is None:
-        df[time_col] = pd.to_datetime(df[time_col]).dt.tz_localize("America/New_York")
-    else:
-        df[time_col] = df[time_col].dt.tz_convert("America/New_York")
     if day is None:
         print("No date filter applied — using all rows.")
     else:
+        time_col = _find_col(df, _PICKUP_TIME_VARIANTS, "pickup datetime")
+        df[time_col] = pd.to_datetime(df[time_col], utc=True, errors='coerce')
+        if df[time_col].dt.tz is None:
+            df[time_col] = df[time_col].dt.tz_localize("America/New_York")
+        else:
+            df[time_col] = df[time_col].dt.tz_convert("America/New_York")
         mask_day = df[time_col].dt.date == pd.Timestamp(day).date()
         df = df[mask_day]
 
