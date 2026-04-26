@@ -65,8 +65,11 @@ def load_taxi_data(path, day):
         df[time_col] = pd.to_datetime(df[time_col]).dt.tz_localize("America/New_York")
     else:
         df[time_col] = df[time_col].dt.tz_convert("America/New_York")
-    mask_day = df[time_col].dt.date == pd.Timestamp(day).date()
-    df = df[mask_day]
+    if day is None:
+        print("No date filter applied — using all rows.")
+    else:
+        mask_day = df[time_col].dt.date == pd.Timestamp(day).date()
+        df = df[mask_day]
 
     plat_col = _find_col(df, _PICKUP_LAT_VARIANTS,  "pickup latitude")
     plon_col = _find_col(df, _PICKUP_LON_VARIANTS,  "pickup longitude")
@@ -330,7 +333,7 @@ def main():
         help="Path to yellow taxi parquet file",
     )
     parser.add_argument(
-        "--day", type=str, default=DEFAULT_DAY,
+        "--day", type=str, default=None,
         help="Date to filter (YYYY-MM-DD)",
     )
     args = parser.parse_args()
