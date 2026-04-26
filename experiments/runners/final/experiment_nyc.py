@@ -58,7 +58,12 @@ def _find_col(df, variants, label):
 
 def load_taxi_data(path, day):
     """Load and filter NYC yellow taxi parquet for a single day."""
-    df = pd.read_parquet(path)
+    if str(path).endswith(".csv"):
+        df = pd.read_csv(path)
+    elif str(path).endswith(".parquet"):
+        df = pd.read_parquet(path)
+    else:
+        raise ValueError(f"Unsupported file format: {path}")
 
     time_col = _find_col(df, _PICKUP_TIME_VARIANTS, "pickup datetime")
     if df[time_col].dt.tz is None:
