@@ -361,6 +361,8 @@ def main():
     rows = []
 
     for n in N_VALUES:
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         print(f"\nPreparing NYC N={n:,}", flush=True)
 
         A_raw, B_raw = make_point_sets(df, n, rng)
