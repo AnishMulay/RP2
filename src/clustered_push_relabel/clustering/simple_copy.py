@@ -100,7 +100,6 @@ class SimpleClustering:
         d_min_b, nearest_s = DB.min(dim=1)                     # (N,)  each
         del DB
         DR_int      = (DR      / eps).ceil_().to(torch.int32)  # (S, N)
-        del DR
         d_min_b_int = (d_min_b / eps).ceil_().to(torch.int32)  # (N,)
 
         # ── 3. Pre-computed norms and threshold ───────────────────────────────
@@ -139,7 +138,7 @@ class SimpleClustering:
 
         if M == 0:
             del float_buf, bool_buf
-            return _pack(sampled_idx, A_s, DR_int, d_min_b,
+            return _pack(sampled_idx, A_s, DR, DR_int, d_min_b,
                          d_min_b_int, nearest_s, adj_ptr, adj_col, adj_dist_int,
                          adj_dist_float)
 
@@ -174,7 +173,7 @@ class SimpleClustering:
             cursor.scatter_add_(0, b_idx, torch.ones_like(b_idx))
 
         del float_buf, bool_buf, cursor
-        return _pack(sampled_idx, A_s, DR_int, d_min_b, d_min_b_int,
+        return _pack(sampled_idx, A_s, DR, DR_int, d_min_b, d_min_b_int,
                      nearest_s, adj_ptr, adj_col, adj_dist_int, adj_dist_float)
 
     def get_adj(self, b: int, result: Dict) -> torch.Tensor:
@@ -273,11 +272,12 @@ def _group_offsets(b_idx: torch.Tensor) -> torch.Tensor:
     return cumsum - baseline
 
 
-def _pack(sampled_idx, A_s, DR_int, d_min_b, d_min_b_int, nearest_s,
+def _pack(sampled_idx, A_s, DR, DR_int, d_min_b, d_min_b_int, nearest_s,
           adj_ptr, adj_col, adj_dist_int, adj_dist_float) -> Dict[str, torch.Tensor]:
     return {
         "sampled_idx" : sampled_idx,
         "A_sampled"   : A_s,
+        "DR"          : DR,
         "DR_int"      : DR_int,
         "d_min_b"     : d_min_b,
         "d_min_b_int" : d_min_b_int,
