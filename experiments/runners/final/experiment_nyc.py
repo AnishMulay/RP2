@@ -12,6 +12,14 @@ import pandas as pd
 import torch
 
 
+def gpu_mem(device, label):
+    if device.type == "cuda":
+        alloc = torch.cuda.memory_allocated(device) / 1024**3
+        res   = torch.cuda.memory_reserved(device)  / 1024**3
+        print(f"  [MEM] {label}: alloc={alloc:.2f}GB res={res:.2f}GB",
+              flush=True)
+
+
 BASE_DIR = pathlib.Path(__file__).resolve().parent.parent.parent.parent  # → RP2/
 SRC_DIR = BASE_DIR / "src"
 if str(SRC_DIR) not in sys.path:
@@ -202,6 +210,7 @@ def benchmark_simple(P_red, P_blue, device, diameter):
     """
     for _ in range(WARMUP_RUNS):
         empty_cache_if_cuda(device)
+        gpu_mem(device, "before init")
         solver = SimpleGPUSolver(
             P_red, P_blue,
             EPSILON,
@@ -209,8 +218,10 @@ def benchmark_simple(P_red, P_blue, device, diameter):
             verbose=False,
             diameter=1.0,
         )
+        gpu_mem(device, "after init / before solve")
         synchronize_if_cuda(device)
         solver.solve()
+        gpu_mem(device, "after solve")
         synchronize_if_cuda(device)
         del solver
 
@@ -219,6 +230,7 @@ def benchmark_simple(P_red, P_blue, device, diameter):
     iterations_list = []
     for _ in range(TIMED_RUNS):
         empty_cache_if_cuda(device)
+        gpu_mem(device, "before init")
         solver = SimpleGPUSolver(
             P_red, P_blue,
             EPSILON,
@@ -226,9 +238,11 @@ def benchmark_simple(P_red, P_blue, device, diameter):
             verbose=False,
             diameter=1.0,
         )
+        gpu_mem(device, "after init / before solve")
         synchronize_if_cuda(device)
         t0 = time.perf_counter()
         solver.solve()
+        gpu_mem(device, "after solve")
         synchronize_if_cuda(device)
         t1 = time.perf_counter()
         cost_norm = average_l2_matching_cost(P_red, P_blue, solver.match_B)

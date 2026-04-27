@@ -4,6 +4,14 @@ from typing import Dict
 import torch
 
 
+def _gpu_mem(label):
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / 1024**3
+        res   = torch.cuda.memory_reserved()  / 1024**3
+        print(f"  [MEM-cluster] {label}: alloc={alloc:.2f}GB res={res:.2f}GB",
+              flush=True)
+
+
 class SimpleClustering:
     """
     Memory-efficient clustering representation for the push-relabel solver.
@@ -93,14 +101,17 @@ class SimpleClustering:
         A_s         = A[sampled_idx]                            # (S, d)
 
         # ── 2. DR and DB  (real L2, kept for slack computations) ──────────────
+        _gpu_mem("before DR cdist")
         DR = torch.cdist(A_s, A,
                          compute_mode="use_mm_for_euclid_dist_if_necessary")  # (S, N)
         DB = torch.cdist(B,  A_s,
                          compute_mode="use_mm_for_euclid_dist_if_necessary")  # (N, S)
         d_min_b, nearest_s = DB.min(dim=1)                     # (N,)  each
         del DB
+        _gpu_mem("after DB deleted")
         DR_int      = (DR      / eps).ceil_().to(torch.int32)  # (S, N)
         del DR
+        _gpu_mem("after DR deleted")
         d_min_b_int = (d_min_b / eps).ceil_().to(torch.int32)  # (N,)
 
         # ── 3. Pre-computed norms and threshold ───────────────────────────────
@@ -113,8 +124,10 @@ class SimpleClustering:
         #  bool_buf  : admissibility mask for one tile
         # Keeping these alive outside the loop means zero GPU allocations in
         # the hot path.
+        _gpu_mem("before tile buffers")
         float_buf = torch.empty(N, T, dtype=A.dtype,    device=device)
         bool_buf  = torch.empty(N, T, dtype=torch.bool, device=device)
+        _gpu_mem("after tile buffers")
 
         # ── 5. Pass 1: count admissible pairs per blue ────────────────────────
         counts = torch.zeros(N, dtype=torch.long, device=device)
@@ -127,6 +140,7 @@ class SimpleClustering:
             torch.lt(float_buf[:, :t], d_min_b_sq.unsqueeze(1),
                      out=bool_buf[:, :t])
             counts.add_(bool_buf[:, :t].sum(dim=1))
+        _gpu_mem("after pass 1")
 
         # ── 6. Build CSR pointers; allocate column buffer ─────────────────────
         adj_ptr     = torch.zeros(N + 1, dtype=torch.long, device=device)
@@ -134,10 +148,12 @@ class SimpleClustering:
         M           = int(adj_ptr[-1].item())
         adj_col     = torch.empty(M, dtype=torch.long, device=device)
         adj_dist_int = torch.empty(M, dtype=torch.int32, device=device)
+        _gpu_mem("after adj arrays allocated")
         del counts
 
         if M == 0:
             del float_buf, bool_buf
+            _gpu_mem("before return")
             return _pack(sampled_idx, A_s, DR_int, d_min_b,
                          d_min_b_int, nearest_s, adj_ptr, adj_col, adj_dist_int)
 
@@ -169,8 +185,10 @@ class SimpleClustering:
 
             # Advance cursor for every blue point that received pairs this tile
             cursor.scatter_add_(0, b_idx, torch.ones_like(b_idx))
+        _gpu_mem("after pass 2")
 
         del float_buf, bool_buf, cursor
+        _gpu_mem("before return")
         return _pack(sampled_idx, A_s, DR_int, d_min_b, d_min_b_int,
                      nearest_s, adj_ptr, adj_col, adj_dist_int)
 
