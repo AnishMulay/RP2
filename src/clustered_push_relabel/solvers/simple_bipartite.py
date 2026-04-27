@@ -536,7 +536,13 @@ class SimpleGPUSolver:
             set1_eligible = self._set1_eligible_mask(B_free)
             if set1_eligible.any().item():
                 pair_s = unique_pairs[:, 0].to(torch.long)
-                v_pair_row_max = self.V[pair_s].max(dim=1).values.to(torch.long)
+                num_pairs = pair_s.numel()
+                v_pair_row_max = torch.empty(num_pairs, device=self.device, dtype=torch.long)
+                for start in range(0, num_pairs, self.set1_pair_batch):
+                    end = min(start + self.set1_pair_batch, num_pairs)
+                    v_pair_row_max[start:end] = (
+                        self.V[pair_s[start:end]].max(dim=1).values.to(torch.long)
+                    )
                 min_slack1_per_blue[set1_eligible] = (
                     target1[set1_eligible]
                     - v_pair_row_max[pair_inverse[set1_eligible]]
