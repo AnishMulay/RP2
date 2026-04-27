@@ -31,13 +31,13 @@ DATA_DIR = BASE_DIR / "data" / "cifar_sift"
 TRAIN_DESC_PATH = DATA_DIR / "cifar10_sift_train.pkl.gz"
 TEST_DESC_PATH = DATA_DIR / "cifar10_sift_test.pkl.gz"
 
-N_VALUES = [500, 1_000, 2_000, 5_000]
+N_VALUES = [1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000, 9_000, 10_000]
 EPSILON = 0.01
 BATCH_SIZE = 512
 SEED = 42
 WARMUP_RUNS = 0
 TIMED_RUNS = 1
-EXACT_N_LIMIT = 2_000
+EXACT_N_LIMIT = 10_000
 
 
 def synchronize_if_cuda(device):
@@ -323,38 +323,46 @@ def benchmark_exact(D_blue_to_red_norm, device):
     """
     Run ot.emd with the true normalized Chamfer distance matrix.
     """
-    n = D_blue_to_red_norm.shape[0]
-    if n > EXACT_N_LIMIT:
-        raise RuntimeError(f"Exact OT skipped for N > {EXACT_N_LIMIT:,}")
-    if ot is None:
-        raise RuntimeError("POT is not installed; exact solver unavailable.")
+    N = D_blue_to_red_norm.shape[0]
+    try:
+        if N > EXACT_N_LIMIT:
+            raise RuntimeError(f"Exact OT skipped for N > {EXACT_N_LIMIT:,}")
+        if ot is None:
+            raise RuntimeError("POT is not installed; exact solver unavailable.")
 
-    D_cpu = D_blue_to_red_norm.detach().cpu()
-    a = np.full(n, 1.0 / n, dtype=np.float64)
-    b = np.full(n, 1.0 / n, dtype=np.float64)
+        D_cpu = D_blue_to_red_norm.detach().cpu()
+        a = np.full(N, 1.0 / N, dtype=np.float64)
+        b = np.full(N, 1.0 / N, dtype=np.float64)
 
-    # POT expects rows for the first marginal. We transpose so plan.argmax(axis=0)
-    # yields the matched red index for each blue image.
-    C = D_cpu.to(torch.float64).numpy().T
+        # POT expects rows for the first marginal. We transpose so plan.argmax(axis=0)
+        # yields the matched red index for each blue image.
+        C = D_cpu.to(torch.float64).numpy().T
 
-    for _ in range(WARMUP_RUNS):
-        plan = ot.emd(a, b, C, numItermax=10**6)
-        del plan
+        for _ in range(WARMUP_RUNS):
+            plan = ot.emd(a, b, C, numItermax=10**6)
+            del plan
 
-    times_ms = []
-    costs = []
-    blue_indices = torch.arange(n, dtype=torch.long)
-    for _ in range(TIMED_RUNS):
-        t0 = time.perf_counter()
-        plan = ot.emd(a, b, C, numItermax=10**6)
-        t1 = time.perf_counter()
-        matching = torch.from_numpy(plan.argmax(axis=0).astype(np.int64, copy=False))
-        cost = D_cpu[blue_indices, matching].mean().item()
-        times_ms.append((t1 - t0) * 1000.0)
-        costs.append(cost)
-        del plan, matching
+        times_ms = []
+        costs = []
+        blue_indices = torch.arange(N, dtype=torch.long)
+        for _ in range(TIMED_RUNS):
+            t0 = time.perf_counter()
+            plan = ot.emd(a, b, C, numItermax=10**6)
+            t1 = time.perf_counter()
+            matching = torch.from_numpy(plan.argmax(axis=0).astype(np.int64, copy=False))
+            cost = D_cpu[blue_indices, matching].mean().item()
+            times_ms.append((t1 - t0) * 1000.0)
+            costs.append(cost)
+            del plan, matching
 
-    return statistics.median(times_ms), statistics.median(costs)
+        return statistics.median(times_ms), statistics.median(costs)
+    except MemoryError:
+        message = (
+            f"Warning: Exact skipped at N={N}: CPU memory insufficient for "
+            f"{N}x{N} matrix"
+        )
+        print(message, flush=True)
+        raise RuntimeError(message)
 
 
 def benchmark_proxy_exact(D_blue_to_red_norm, D_red_to_red_norm, device):
