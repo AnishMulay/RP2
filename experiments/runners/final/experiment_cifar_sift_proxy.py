@@ -118,59 +118,167 @@ def _chamfer_distance(P, Q):
     return fwd + bwd
 
 
-def compute_chamfer_matrix(descs_A, descs_B, device, tile_size=50):
+def _pad_descriptors(descs_list, device):
     """
-    Compute the full Chamfer distance matrix between two sets of images.
-
-    Returns D [N, N] float32 tensor on `device` where D[b, a] = chamfer(B[b], A[a]).
+    Pad all descriptor sets to the same size and stack into one tensor.
     """
-    n = len(descs_A)
-    if len(descs_B) != n:
-        raise ValueError("descs_A and descs_B must have the same length")
+    n = len(descs_list)
+    max_K = max(desc.shape[0] for desc in descs_list)
+    dim = descs_list[0].shape[1]
 
-    descs_A_dev = _move_descriptor_list_to_device(descs_A, device)
-    descs_B_dev = _move_descriptor_list_to_device(descs_B, device)
-    D = torch.empty((n, n), dtype=torch.float32, device=device)
+    padded = torch.zeros((n, max_K, dim), dtype=torch.float32, device=device)
+    lengths = torch.empty(n, dtype=torch.int64, device=device)
 
-    for start in range(0, n, tile_size):
-        print(
-            f"    Computing Chamfer [blue->red]: {start}/{n} rows done...",
-            flush=True,
+    for i, desc in enumerate(descs_list):
+        K_i = desc.shape[0]
+        padded[i, :K_i, :] = torch.as_tensor(
+            desc, dtype=torch.float32, device=device
         )
-        end = min(start + tile_size, n)
-        for b in range(start, end):
-            P = descs_B_dev[b]
-            for a in range(n):
-                D[b, a] = _chamfer_distance(P, descs_A_dev[a])
+        lengths[i] = K_i
+
+    return padded, lengths
+
+
+def compute_chamfer_matrix(descs_B, descs_A, device, tile_b=50, tile_a=200):
+    """
+    Compute D[b, a] = chamfer(descs_B[b], descs_A[a]) for all b, a.
+    Returns (N, N) float32 tensor on device.
+
+    Reduce `tile_a` if this runs out of GPU memory.
+    """
+    n = len(descs_B)
+    if len(descs_A) != n:
+        raise ValueError("descs_B and descs_A must have the same length")
+
+    padded_B, lengths_B = _pad_descriptors(descs_B, device)
+    padded_A, lengths_A = _pad_descriptors(descs_A, device)
+    max_KB = padded_B.shape[1]
+    max_KA = padded_A.shape[1]
+
+    valid_B_all = torch.arange(max_KB, device=device).unsqueeze(0) < lengths_B.unsqueeze(1)
+    valid_A_all = torch.arange(max_KA, device=device).unsqueeze(0) < lengths_A.unsqueeze(1)
+    D = torch.zeros((n, n), dtype=torch.float32, device=device)
+
+    for b_start in range(0, n, tile_b):
+        b_end = min(b_start + tile_b, n)
+        tb = b_end - b_start
+
+        B_tile = padded_B[b_start:b_end]
+        lens_B = lengths_B[b_start:b_end]
+        valid_B = valid_B_all[b_start:b_end]
+        B_flat = B_tile.reshape(tb * max_KB, B_tile.shape[2])
+
+        for a_start in range(0, n, tile_a):
+            a_end = min(a_start + tile_a, n)
+            ta = a_end - a_start
+
+            A_tile = padded_A[a_start:a_end]
+            lens_A = lengths_A[a_start:a_end]
+            valid_A = valid_A_all[a_start:a_end]
+            A_flat = A_tile.reshape(ta * max_KA, A_tile.shape[2])
+
+            dists = torch.cdist(
+                B_flat,
+                A_flat,
+                p=2,
+                compute_mode="use_mm_for_euclid_dist_if_necessary",
+            )
+            dists = dists.reshape(tb, max_KB, ta, max_KA)
+
+            dists.masked_fill_(~valid_A.view(1, 1, ta, max_KA), float("inf"))
+            fwd_min = dists.min(dim=3).values
+            fwd_min = fwd_min.masked_fill(~valid_B.unsqueeze(2), 0.0)
+            fwd = fwd_min.sum(dim=1) / lens_B.to(torch.float32).unsqueeze(1).clamp(min=1.0)
+
+            dists.masked_fill_(~valid_B.view(tb, max_KB, 1, 1), float("inf"))
+            bwd_min = dists.min(dim=1).values
+            bwd_min = bwd_min.masked_fill(~valid_A.unsqueeze(0), 0.0)
+            bwd = bwd_min.sum(dim=2) / lens_A.to(torch.float32).unsqueeze(0).clamp(min=1.0)
+
+            D[b_start:b_end, a_start:a_end] = fwd + bwd
+
+        if b_start % (tile_b * 4) == 0 or b_end == n:
+            print(
+                f"    Computing Chamfer [blue->red]: "
+                f"{b_end}/{n} rows done...",
+                flush=True,
+            )
 
     synchronize_if_cuda(device)
     print("    Computing Chamfer [blue->red]: complete.", flush=True)
+    del padded_B, padded_A
     return D
 
 
-def compute_chamfer_matrix_symmetric(descs, device, tile_size=50):
+def compute_chamfer_matrix_symmetric(descs, device, tile=50):
     """
-    Compute the symmetric N x N Chamfer matrix for a single set of images.
+    Compute symmetric N x N Chamfer matrix for a single set of images.
+    D[i,j] = D[j,i], D[i,i] = 0.
+
+    Reduce `tile` if this runs out of GPU memory.
     """
     n = len(descs)
-    descs_dev = _move_descriptor_list_to_device(descs, device)
+    padded, lengths = _pad_descriptors(descs, device)
+    max_K = padded.shape[1]
+    valid_all = torch.arange(max_K, device=device).unsqueeze(0) < lengths.unsqueeze(1)
     D = torch.zeros((n, n), dtype=torch.float32, device=device)
 
-    for start in range(0, n, tile_size):
-        print(
-            f"    Computing Chamfer [red->red]: {start}/{n} rows done...",
-            flush=True,
-        )
-        end = min(start + tile_size, n)
-        for i in range(start, end):
-            P = descs_dev[i]
-            for j in range(i + 1, n):
-                value = _chamfer_distance(P, descs_dev[j])
-                D[i, j] = value
-                D[j, i] = value
+    for i_start in range(0, n, tile):
+        i_end = min(i_start + tile, n)
+        ti = i_end - i_start
+
+        I_tile = padded[i_start:i_end]
+        lens_I = lengths[i_start:i_end]
+        valid_I = valid_all[i_start:i_end]
+        I_flat = I_tile.reshape(ti * max_K, I_tile.shape[2])
+
+        for j_start in range(i_start, n, tile):
+            j_end = min(j_start + tile, n)
+            tj = j_end - j_start
+
+            J_tile = padded[j_start:j_end]
+            lens_J = lengths[j_start:j_end]
+            valid_J = valid_all[j_start:j_end]
+            J_flat = J_tile.reshape(tj * max_K, J_tile.shape[2])
+
+            dists = torch.cdist(
+                I_flat,
+                J_flat,
+                p=2,
+                compute_mode="use_mm_for_euclid_dist_if_necessary",
+            )
+            dists = dists.reshape(ti, max_K, tj, max_K)
+
+            dists.masked_fill_(~valid_J.view(1, 1, tj, max_K), float("inf"))
+            fwd_min = dists.min(dim=3).values
+            fwd_min = fwd_min.masked_fill(~valid_I.unsqueeze(2), 0.0)
+            fwd = fwd_min.sum(dim=1) / lens_I.to(torch.float32).unsqueeze(1).clamp(min=1.0)
+
+            dists.masked_fill_(~valid_I.view(ti, max_K, 1, 1), float("inf"))
+            bwd_min = dists.min(dim=1).values
+            bwd_min = bwd_min.masked_fill(~valid_J.unsqueeze(0), 0.0)
+            bwd = bwd_min.sum(dim=2) / lens_J.to(torch.float32).unsqueeze(0).clamp(min=1.0)
+
+            block = fwd + bwd
+            if i_start == j_start:
+                block = block.clone()
+                diag_idx = torch.arange(ti, device=device)
+                block[diag_idx, diag_idx] = 0.0
+                D[i_start:i_end, j_start:j_end] = block
+            else:
+                D[i_start:i_end, j_start:j_end] = block
+                D[j_start:j_end, i_start:i_end] = block.transpose(0, 1)
+
+        if i_start % (tile * 4) == 0 or i_end == n:
+            print(
+                f"    Computing Chamfer [red->red]: "
+                f"{i_end}/{n} rows done...",
+                flush=True,
+            )
 
     synchronize_if_cuda(device)
     print("    Computing Chamfer [red->red]: complete.", flush=True)
+    del padded
     return D
 
 
