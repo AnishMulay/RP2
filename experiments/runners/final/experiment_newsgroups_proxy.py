@@ -34,6 +34,11 @@ LABELS_PATH = DATA_DIR / "newsgroups_labels.npy"
 N_VALUES = [1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000, 9_000, 10_000]
 EPSILON = 0.01
 BATCH_SIZE = 512
+MAX_WORDS_PER_DOC = 300
+# Documents with more unique words are truncated to this limit.
+# Average words/doc in 20 Newsgroups is ~65; max is 2509 (outlier).
+# Capping at 300 covers >99% of documents without truncation and
+# is standard preprocessing in the WMD literature.
 SEED = 42
 WARMUP_RUNS = 0
 TIMED_RUNS = 1
@@ -109,6 +114,11 @@ def _pad_embeddings(descs_list, device):
     """
     Pad all document embedding sets to max_K and stack.
     """
+    # Truncate to MAX_WORDS_PER_DOC: bounds tile memory to
+    # tile_b * MAX_WORDS_PER_DOC * tile_a * MAX_WORDS_PER_DOC * 4 bytes
+    # = 50 * 300 * 100 * 300 * 4 = ~1.8 GB per tile (manageable)
+    descs_list = [d[:MAX_WORDS_PER_DOC] if len(d) > MAX_WORDS_PER_DOC else d for d in descs_list]
+
     n = len(descs_list)
     max_K = max(desc.shape[0] for desc in descs_list)
     dim = descs_list[0].shape[1]
@@ -128,7 +138,9 @@ def _pad_embeddings(descs_list, device):
     return padded, lengths
 
 
-def compute_chamfer_matrix(descs_B, descs_A, device, tile_b=50, tile_a=100):
+# tile_a=50: with MAX_WORDS_PER_DOC=300, each tile uses
+# 50*300 * 50*300 * 4 = ~900MB. Reduce further if OOM persists.
+def compute_chamfer_matrix(descs_B, descs_A, device, tile_b=50, tile_a=50):
     """
     Compute D[b, a] = chamfer(descs_B[b], descs_A[a]) for all b, a.
     Returns (N, N) float32 tensor on device.
