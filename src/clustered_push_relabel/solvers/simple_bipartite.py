@@ -43,63 +43,113 @@ class SimpleGPUSolver:
         diameter: float = 1.0,
         sample_factor: float = 1.0,
         clustering_class=None,
+        precomputed_clustering=None,
     ):
         if clustering_class is None:
             from ..clustering.simple import SimpleClustering as clustering_class
         self._clustering_class = clustering_class
 
-        if A.device != B.device:
-            raise ValueError("A and B must be on the same device")
-        if A.device.type != "cuda":
-            raise ValueError("SimpleGPUSolver requires CUDA tensors")
-        if A.ndim != 2 or B.ndim != 2:
-            raise ValueError("A and B must be rank-2 tensors")
-        if A.shape != B.shape:
-            raise ValueError("A and B must have the same shape (N, d)")
-        if not A.is_floating_point() or not B.is_floating_point():
-            raise TypeError("A and B must be floating-point tensors")
-        if A.shape[0] == 0:
-            raise ValueError("A and B must be non-empty")
         if epsilon <= 0:
             raise ValueError("epsilon must be positive")
 
-        self.device = A.device
-        self.N = A.shape[0]
-        self.epsilon = float(epsilon)
-        self.epsilon_int = int(round(self.epsilon * self.N))
-        self.diameter = float(diameter)
-        self.sample_factor = float(sample_factor)
-        self.verbose = verbose
-        self.max_iters = int(max_iters)
-        self.set1_pair_batch = int(set1_pair_batch)
-        if self.set1_pair_batch <= 0:
-            raise ValueError("set1_pair_batch must be positive")
+        if precomputed_clustering is not None:
+            self.N = int(precomputed_clustering["adj_ptr"].shape[0]) - 1
+            self.device = precomputed_clustering["adj_ptr"].device
+            self.epsilon = float(epsilon)
+            self.epsilon_int = int(round(self.epsilon * self.N))
+            self.diameter = float(diameter)
+            self.sample_factor = float(sample_factor)
+            self.verbose = verbose
+            self.max_iters = int(max_iters)
+            self.set1_pair_batch = int(set1_pair_batch)
+            if self.set1_pair_batch <= 0:
+                raise ValueError("set1_pair_batch must be positive")
 
-        if tile_size is None:
-            tile_size = 2048 if batch_size is None else batch_size
-        self.batch_size = int(tile_size)
+            if tile_size is None:
+                tile_size = 2048 if batch_size is None else batch_size
+            self.batch_size = int(tile_size)
 
-        self.P_red = A
-        self.P_blue = B
+            if self.verbose:
+                print(
+                    "=" * 60
+                    + f"\n[Init Simple] N={self.N}, epsilon={self.epsilon}, "
+                    + f"tile={self.batch_size}, device={self.device}"
+                )
 
-        if self.verbose:
-            print(
-                "=" * 60
-                + f"\n[Init Simple] N={self.N}, epsilon={self.epsilon}, "
-                + f"tile={self.batch_size}, device={self.device}"
+            if (
+                A is not None
+                and B is not None
+                and A.device == self.device
+                and B.device == self.device
+                and A.ndim == 2
+                and B.ndim == 2
+                and A.shape == B.shape
+                and A.shape[0] == self.N
+                and A.is_floating_point()
+                and B.is_floating_point()
+            ):
+                self.P_red = A
+                self.P_blue = B
+            elif self.verbose:
+                self.P_red = torch.zeros(
+                    self.N, 1, device=self.device, dtype=torch.float32
+                )
+                self.P_blue = torch.zeros(
+                    self.N, 1, device=self.device, dtype=torch.float32
+                )
+
+            clustering = precomputed_clustering
+        else:
+            if A.device != B.device:
+                raise ValueError("A and B must be on the same device")
+            if A.device.type != "cuda":
+                raise ValueError("SimpleGPUSolver requires CUDA tensors")
+            if A.ndim != 2 or B.ndim != 2:
+                raise ValueError("A and B must be rank-2 tensors")
+            if A.shape != B.shape:
+                raise ValueError("A and B must have the same shape (N, d)")
+            if not A.is_floating_point() or not B.is_floating_point():
+                raise TypeError("A and B must be floating-point tensors")
+            if A.shape[0] == 0:
+                raise ValueError("A and B must be non-empty")
+
+            self.device = A.device
+            self.N = A.shape[0]
+            self.epsilon = float(epsilon)
+            self.epsilon_int = int(round(self.epsilon * self.N))
+            self.diameter = float(diameter)
+            self.sample_factor = float(sample_factor)
+            self.verbose = verbose
+            self.max_iters = int(max_iters)
+            self.set1_pair_batch = int(set1_pair_batch)
+            if self.set1_pair_batch <= 0:
+                raise ValueError("set1_pair_batch must be positive")
+
+            if tile_size is None:
+                tile_size = 2048 if batch_size is None else batch_size
+            self.batch_size = int(tile_size)
+
+            self.P_red = A
+            self.P_blue = B
+
+            if self.verbose:
+                print(
+                    "=" * 60
+                    + f"\n[Init Simple] N={self.N}, epsilon={self.epsilon}, "
+                    + f"tile={self.batch_size}, device={self.device}"
+                )
+
+            t0 = time.time()
+            cluster_engine = self._clustering_class(
+                epsilon=self.epsilon,
+                tile_size=self.batch_size,
+                sample_factor=sample_factor,
             )
-
-        t0 = time.time()
-        cluster_engine = self._clustering_class(
-            epsilon=self.epsilon,
-            tile_size=self.batch_size,
-            sample_factor=sample_factor,
-        )
-        clustering = cluster_engine.run(A, B)
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
-        if self.verbose:
-            print(f"[Init Simple] clustering done in {time.time() - t0:.2f}s")
+            clustering = cluster_engine.run(A, B)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            if self.verbose:
+                print(f"[Init Simple] clustering done in {time.time() - t0:.2f}s")
 
         self.d_min_b_int = clustering["d_min_b_int"]
         self.nearest_s = clustering["nearest_s"]
@@ -110,7 +160,9 @@ class SimpleGPUSolver:
         self.V = clustering["DR_int"].clone()
         self.V.neg_()
 
-        del clustering, cluster_engine
+        del clustering
+        if precomputed_clustering is None:
+            del cluster_engine
         gc.collect()
 
         self.y_A = torch.zeros(self.N, device=self.device, dtype=torch.int32)

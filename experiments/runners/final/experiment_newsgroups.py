@@ -18,11 +18,13 @@ except ImportError:
 
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent.parent.parent.parent
-SRC_DIR  = BASE_DIR / "src"
+SRC_DIR = BASE_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from clustered_push_relabel.clustering.simple import SimpleClustering
+from clustered_push_relabel.clustering.simple_precomputed import (
+    SimplePrecomputedClustering,
+)
 from clustered_push_relabel.solvers.simple_bipartite import SimpleGPUSolver
 
 
@@ -51,106 +53,36 @@ def empty_cache_if_cuda(device):
         torch.cuda.empty_cache()
 
 
-def is_available(value):
-    return value == value
-
-
-def fmt_time(value):
-    if not is_available(value):
-        return "N/A"
-    return f"{value:.1f} ms"
-
-
-def fmt_cost(value):
-    if not is_available(value):
-        return "N/A"
-    return f"{value:.4f}"
-
-
-def fmt_iter(value):
-    if not is_available(value):
-        return "N/A"
-    return f"{int(value):,}"
-
-
-def normalize_points(A, B, n_subsample=1000):
-    """
-    Normalize two [N, d] tensors so all pairwise L2 distances are <= 1.0.
-
-    Diameter is computed as the max pairwise L2 distance over a random
-    subsample of both sets combined. This matches the approach in
-    experiment_sift.py and ensures the push-relabel solver's iteration
-    bound (1/epsilon^2) holds.
-
-    Steps:
-    1. Subsample min(n_subsample, N) points from each of A and B
-    2. Stack them: sub = torch.cat([A_sub, B_sub], dim=0)
-    3. diameter = float(torch.cdist(sub, sub, p=2).max().item())
-    4. diameter = max(diameter, 1e-6)
-    5. Return A / diameter, B / diameter, diameter
-
-    After this normalization, all pairwise L2 distances between any two
-    points in A or B are <= 1.0, so passing diameter=1.0 to SimpleGPUSolver
-    is correct.
-    """
-    N = A.shape[0]
-    sub_size = min(n_subsample, N)
-    idx = torch.randperm(N)[:sub_size]
-    sub = torch.cat([A[idx], B[idx]], dim=0)
-    diameter = float(torch.cdist(sub, sub, p=2).max().item())
-    diameter = max(diameter, 1e-6)
-    return A / diameter, B / diameter, diameter
-
-
 def load_embeddings(path):
-    """Load pkl.gz -> list of numpy arrays. Same as in newsgroups_proxy."""
+    """
+    Load gzip-pickled document embedding list.
+    Returns a Python list of numpy arrays, one per doc, each (K_i, 300).
+    """
     with gzip.open(path, "rb") as f:
-        embs = pickle.load(f)
+        embeddings = pickle.load(f)
     print(
-        f"  Loaded {len(embs):,} document embedding sets from {path.name}",
+        f"  Loaded {len(embeddings):,} document embedding sets from {path.name}",
         flush=True,
     )
-    return embs
+    return embeddings
 
 
-def compute_mean_embeddings(descs_list):
+def sample_pair(all_embeddings, n_samples, seed):
     """
-    Compute mean word embedding per document.
-    For each document i: mean_emb[i] = descs_list[i][:MAX_WORDS_PER_DOC].mean(axis=0)
-    Documents with 0 valid words (shape (1, 300) zero fallback) return zero vector.
-    Returns numpy array of shape (N, 300) float32.
+    Sample two non-overlapping sets of n_samples documents.
     """
-    means = np.zeros((len(descs_list), 300), dtype=np.float32)
-    for i, desc in enumerate(descs_list):
-        arr = np.asarray(desc, dtype=np.float32)
-        if arr.ndim != 2 or arr.shape[1] != 300:
-            raise ValueError(
-                f"Embedding set {i} has shape {arr.shape}; expected (K, 300)."
-            )
-        arr = arr[:MAX_WORDS_PER_DOC]
-        if arr.shape[0] == 0:
-            continue
-        means[i] = arr.mean(axis=0).astype(np.float32, copy=False)
-    return means
-
-
-def sample_pair(all_descs, n_samples, seed):
-    """
-    Sample two non-overlapping sets of n_samples.
-    rng = np.random.RandomState(seed)
-    perm = rng.permutation(len(all_descs))
-    red_descs  = [all_descs[i] for i in perm[:n_samples]]
-    blue_descs = [all_descs[i] for i in perm[n_samples:2*n_samples]]
-    Returns red_descs, blue_descs (lists of numpy arrays)
-    """
-    if 2 * n_samples > len(all_descs):
+    if len(all_embeddings) < 2 * n_samples:
         raise ValueError(
-            f"Need at least {2 * n_samples:,} documents, got {len(all_descs):,}."
+            f"Need at least {2 * n_samples:,} documents, got "
+            f"{len(all_embeddings):,}."
         )
+
     rng = np.random.RandomState(seed)
-    perm = rng.permutation(len(all_descs))
-    red_descs = [all_descs[i] for i in perm[:n_samples]]
-    blue_descs = [all_descs[i] for i in perm[n_samples : 2 * n_samples]]
+    perm = rng.permutation(len(all_embeddings))
+    red_idx = perm[:n_samples]
+    blue_idx = perm[n_samples : 2 * n_samples]
+    red_descs = [all_embeddings[i] for i in red_idx]
+    blue_descs = [all_embeddings[i] for i in blue_idx]
     return red_descs, blue_descs
 
 
@@ -158,23 +90,20 @@ def _pad_embeddings(descs_list, device):
     """
     Pad all document embedding sets to max_K and stack.
     """
-    descs_list = [
-        d[:MAX_WORDS_PER_DOC] if len(d) > MAX_WORDS_PER_DOC else d
-        for d in descs_list
-    ]
+    # Truncate to MAX_WORDS_PER_DOC: bounds tile memory to
+    # tile_b * MAX_WORDS_PER_DOC * tile_a * MAX_WORDS_PER_DOC * 4 bytes
+    # = 50 * 300 * 100 * 300 * 4 = ~1.8 GB per tile (manageable)
+    descs_list = [d[:MAX_WORDS_PER_DOC] if len(d) > MAX_WORDS_PER_DOC else d for d in descs_list]
 
     n = len(descs_list)
+    max_K = max(desc.shape[0] for desc in descs_list)
     dim = descs_list[0].shape[1]
-    max_K = max(max(desc.shape[0], 1) for desc in descs_list)
 
     padded = torch.zeros((n, max_K, dim), dtype=torch.float32, device=device)
     lengths = torch.empty(n, dtype=torch.int64, device=device)
 
     for i, desc in enumerate(descs_list):
         K_i = desc.shape[0]
-        if K_i == 0:
-            lengths[i] = 1
-            continue
         padded[i, :K_i, :] = torch.as_tensor(
             desc,
             dtype=torch.float32,
@@ -185,6 +114,8 @@ def _pad_embeddings(descs_list, device):
     return padded, lengths
 
 
+# tile_a=50: with MAX_WORDS_PER_DOC=300, each tile uses
+# 50*300 * 50*300 * 4 = ~900MB. Reduce further if OOM persists.
 def compute_chamfer_matrix(descs_B, descs_A, device, tile_b=50, tile_a=50):
     """
     Compute D[b, a] = chamfer(descs_B[b], descs_A[a]) for all b, a.
@@ -197,6 +128,8 @@ def compute_chamfer_matrix(descs_B, descs_A, device, tile_b=50, tile_a=50):
     if len(descs_A) != N:
         raise ValueError("descs_B and descs_A must have the same length")
 
+    # Sort by word count: tiles of short docs use local max_K~50 instead
+    # of global max_K=300, reducing cdist size by up to 36x for short tiles.
     order_B = sorted(range(len(descs_B)), key=lambda i: len(descs_B[i]))
     order_A = sorted(range(len(descs_A)), key=lambda i: len(descs_A[i]))
     descs_B_sorted = [descs_B[i] for i in order_B]
@@ -284,6 +217,8 @@ def compute_chamfer_matrix_symmetric(descs, device, tile=50):
     """
     N = len(descs)
 
+    # Sort by word count: tiles of short docs use local max_K~50 instead
+    # of global max_K=300, reducing cdist size by up to 36x for short tiles.
     order = sorted(range(len(descs)), key=lambda i: len(descs[i]))
     descs_sorted = [descs[i] for i in order]
 
@@ -368,235 +303,242 @@ def compute_chamfer_matrix_symmetric(descs, device, tile=50):
     return D
 
 
-def benchmark_exact_chamfer(red_descs, blue_descs, device):
+def is_available(value):
+    return value == value
+
+
+def fmt_time(value):
+    if not is_available(value):
+        return "N/A"
+    return f"{value:.1f} ms"
+
+
+def fmt_cost(value):
+    if not is_available(value):
+        return "N/A"
+    return f"{value:.4f}"
+
+
+def normalize_chamfer_matrices(D_blue_to_red, D_red_to_red):
     """
-    Compute true Chamfer distance matrix, run ot.emd.
-    Guard: raise RuntimeError if N > EXACT_N_LIMIT or ot is None.
+    Normalize both matrices by their joint maximum (the diameter).
+    This guarantees all distances are in [0, 1], which is required
+    for the push-relabel iteration bound (1/epsilon^2) to hold.
     """
-    n = len(red_descs)
+    diameter = max(D_blue_to_red.max().item(), D_red_to_red.max().item())
+    diameter = max(diameter, 1e-6)
+    return D_blue_to_red / diameter, D_red_to_red / diameter, diameter
+
+
+def build_proxy_cost_matrix(clustering, N, device):
+    """
+    Build the full N x N float proxy cost matrix from
+    SimplePrecomputedClustering output.
+
+    For each pair (b, a):
+      If a in adj(b): adj_dist_float[entry]
+      Otherwise:      d_min_b[b] + DR[nearest_s[b], a]
+    """
+    DR = clustering["DR"]
+    d_min_b = clustering["d_min_b"]
+    nearest_s = clustering["nearest_s"]
+    adj_ptr = clustering["adj_ptr"]
+    adj_col = clustering["adj_col"]
+    adj_dist_float = clustering["adj_dist_float"]
+
+    C = d_min_b.unsqueeze(1) + DR[nearest_s, :]
+    if adj_col.numel() > 0:
+        b_indices = torch.repeat_interleave(
+            torch.arange(N, device=device, dtype=torch.long),
+            adj_ptr[1:] - adj_ptr[:-1],
+        )
+        C[b_indices, adj_col] = adj_dist_float
+    return C.cpu().to(torch.float64).numpy()
+
+
+def benchmark_exact(D_br_norm, device):
+    """
+    Run ot.emd with the true normalized Chamfer distance matrix.
+    """
+    del device
+
+    n = D_br_norm.shape[0]
     if n > EXACT_N_LIMIT:
         raise RuntimeError(f"Exact OT skipped for N > {EXACT_N_LIMIT:,}")
     if ot is None:
         raise RuntimeError("POT is not installed; exact solver unavailable.")
 
+    a = np.full(n, 1.0 / n, np.float64)
+    b = np.full(n, 1.0 / n, np.float64)
+    D_cpu = D_br_norm.detach().cpu()
     try:
-        synchronize_if_cuda(device)
-        t0 = time.perf_counter()
-        D = compute_chamfer_matrix(
-            blue_descs,
-            red_descs,
-            device,
-            tile_b=50,
-            tile_a=50,
-        )
-        synchronize_if_cuda(device)
-        t1 = time.perf_counter()
-        print(
-            f"    Chamfer matrix computed in {(t1 - t0) * 1000.0:.1f} ms",
-            flush=True,
-        )
-    except Exception as exc:
-        print(f"Warning: Chamfer matrix computation failed: {exc}", flush=True)
-        empty_cache_if_cuda(device)
-        raise RuntimeError(f"Chamfer matrix computation failed: {exc}") from exc
-
-    try:
-        D_cpu = D.detach().cpu()
         C = D_cpu.to(torch.float64).numpy()
-        a = np.full(n, 1.0 / n, dtype=np.float64)
-        b = np.full(n, 1.0 / n, dtype=np.float64)
-        red_indices = torch.arange(n, dtype=torch.long)
-
-        for _ in range(WARMUP_RUNS):
-            plan = ot.emd(a, b, C, numItermax=10**6)
-            del plan
-
-        times_ms = []
-        costs = []
-        for _ in range(TIMED_RUNS):
-            t_emd0 = time.perf_counter()
-            plan = ot.emd(a, b, C, numItermax=10**6)
-            t_emd1 = time.perf_counter()
-            matching = torch.from_numpy(plan.argmax(axis=0).astype(np.int64, copy=False))
-            cost = D_cpu[matching, red_indices].mean().item()
-            times_ms.append((t_emd1 - t_emd0) * 1000.0)
-            costs.append(cost)
-            del plan, matching
     except MemoryError as exc:
-        print(f"Warning: Exact OT failed due to memory pressure: {exc}", flush=True)
-        empty_cache_if_cuda(device)
-        raise RuntimeError(f"Exact OT failed due to memory pressure: {exc}") from exc
-
-    return statistics.median(times_ms), statistics.median(costs), D
-
-
-def benchmark_simple(P_red_norm, P_blue_norm, device, diameter, D_chamfer=None):
-    """
-    Run SimpleGPUSolver on normalized mean embedding vectors.
-    Times the full wall time (clustering + solve).
-    """
-    if D_chamfer is not None:
-        print("    Cost type: true Chamfer", flush=True)
-    else:
-        print("    Cost type: L2 (Chamfer unavailable at this N)", flush=True)
+        raise RuntimeError(
+            f"Exact OT skipped at N={n:,}: CPU memory insufficient for "
+            f"{n}x{n} float64 matrix"
+        ) from exc
 
     for _ in range(WARMUP_RUNS):
-        empty_cache_if_cuda(device)
-        solver = SimpleGPUSolver(
-            P_red_norm,
-            P_blue_norm,
-            epsilon=EPSILON,
-            batch_size=BATCH_SIZE,
-            verbose=False,
-            diameter=1.0,
-            clustering_class=SimpleClustering,
-        )
-        solver.solve()
-        synchronize_if_cuda(device)
-        del solver
+        try:
+            plan = ot.emd(a, b, C, numItermax=10**6)
+        except MemoryError as exc:
+            raise RuntimeError(
+                f"Exact OT skipped at N={n:,}: CPU memory insufficient for "
+                f"{n}x{n} float64 matrix"
+            ) from exc
+        del plan
 
     times_ms = []
     costs = []
-    iterations_list = []
+    blue_idx = torch.arange(n, dtype=torch.long)
     for _ in range(TIMED_RUNS):
-        empty_cache_if_cuda(device)
-        synchronize_if_cuda(device)
-        t0 = time.perf_counter()
-        solver = SimpleGPUSolver(
-            P_red_norm,
-            P_blue_norm,
-            epsilon=EPSILON,
-            batch_size=BATCH_SIZE,
-            verbose=False,
-            diameter=1.0,
-            clustering_class=SimpleClustering,
-        )
-        solver.solve()
-        synchronize_if_cuda(device)
-        t1 = time.perf_counter()
+        try:
+            t0 = time.perf_counter()
+            plan = ot.emd(a, b, C, numItermax=10**6)
+            t1 = time.perf_counter()
+        except MemoryError as exc:
+            raise RuntimeError(
+                f"Exact OT skipped at N={n:,}: CPU memory insufficient for "
+                f"{n}x{n} float64 matrix"
+            ) from exc
 
-        if D_chamfer is not None:
-            matching = solver.match_B.detach().cpu()
-            blue_indices = torch.arange(matching.shape[0], dtype=torch.long)
-            cost = D_chamfer[blue_indices, matching].mean().item()
-            del matching
-        else:
-            cost = (
-                torch.norm(P_blue_norm - P_red_norm[solver.match_B], p=2, dim=1)
-                .mean()
-                .item()
-                * diameter
-            )
-
+        match_B = torch.from_numpy(plan.argmax(axis=1).astype(np.int64, copy=False))
+        cost = D_cpu[blue_idx, match_B].mean().item()
         times_ms.append((t1 - t0) * 1000.0)
         costs.append(cost)
-        iterations_list.append(solver.iterations)
-        del solver
+        del plan, match_B
 
-    return (
-        statistics.median(times_ms),
-        statistics.median(costs),
-        statistics.median(iterations_list),
+    return statistics.median(times_ms), statistics.median(costs)
+
+
+def benchmark_simple(D_br_norm, D_rr_norm, device, diameter):
+    """
+    Run SimplePrecomputedClustering on normalized Chamfer matrices,
+    then run SimpleGPUSolver with the precomputed clustering.
+    """
+    t0 = time.perf_counter()
+    cluster_engine = SimplePrecomputedClustering(
+        epsilon=EPSILON,
+        tile_size=BATCH_SIZE,
     )
+    clustering = cluster_engine.run(D_rr_norm, D_br_norm)
+    synchronize_if_cuda(device)
+    t1 = time.perf_counter()
+    print(f"    Clustering time (excl.): {(t1 - t0) * 1000.0:.1f} ms", flush=True)
+
+    synchronize_if_cuda(device)
+    t0 = time.perf_counter()
+    solver = SimpleGPUSolver(
+        None,
+        None,
+        epsilon=EPSILON,
+        batch_size=BATCH_SIZE,
+        verbose=False,
+        diameter=1.0,
+        precomputed_clustering=clustering,
+    )
+    solver.solve()
+    synchronize_if_cuda(device)
+    t1 = time.perf_counter()
+
+    match_B = solver.match_B.cpu()
+    n = D_br_norm.shape[0]
+    D_cpu = D_br_norm.detach().cpu()
+    cost_norm = D_cpu[torch.arange(n, dtype=torch.long), match_B].mean().item()
+    cost = cost_norm * diameter
+    return (t1 - t0) * 1000.0, cost, solver.iterations
 
 
-def run_exact(red_descs, blue_descs, device):
-    """
-    Wraps benchmark_exact_chamfer with try/except.
-    Returns {"time_ms", "cost", "D": D_chamfer_tensor_or_None, "status"}
-    D is returned for reuse in run_simple.
-    On any exception: print warning, return nan for time/cost, None for D.
-    """
+def run_exact(D_br_norm, device):
     try:
-        time_ms, cost, D = benchmark_exact_chamfer(red_descs, blue_descs, device)
-        return {"time_ms": time_ms, "cost": cost, "D": D, "status": "success"}
+        time_ms, cost = benchmark_exact(D_br_norm, device)
+        return {"time_ms": time_ms, "cost": cost, "status": "success"}
     except Exception as exc:
-        print(f"Warning: Exact failed: {exc}", flush=True)
-        empty_cache_if_cuda(device)
-        return {"time_ms": math.nan, "cost": math.nan, "D": None, "status": "fail"}
+        print(f"  Warning: Exact failed: {exc}", flush=True)
+        return {"time_ms": math.nan, "cost": math.nan, "status": "fail"}
 
 
-def run_simple(P_red_norm, P_blue_norm, device, diameter, D_chamfer=None):
-    """
-    Wraps benchmark_simple with try/except.
-    Returns {"time_ms", "cost", "iterations", "cost_type", "status"}
-    cost_type is "chamfer" if D_chamfer was provided, "l2" otherwise.
-    On any exception: print warning, empty_cache_if_cuda, return nans.
-    """
-    cost_type = "chamfer" if D_chamfer is not None else "l2"
+def run_simple(D_br_norm, D_rr_norm, device, diameter):
     try:
-        time_ms, cost, iterations = benchmark_simple(
-            P_red_norm,
-            P_blue_norm,
+        time_ms, cost, iters = benchmark_simple(
+            D_br_norm,
+            D_rr_norm,
             device,
             diameter,
-            D_chamfer=D_chamfer,
         )
         return {
             "time_ms": time_ms,
             "cost": cost,
-            "iterations": iterations,
-            "cost_type": cost_type,
+            "iterations": iters,
             "status": "success",
         }
     except Exception as exc:
-        print(f"Warning: Simple failed: {exc}", flush=True)
+        print(f"  Warning: Simple failed: {exc}", flush=True)
         empty_cache_if_cuda(device)
         return {
             "time_ms": math.nan,
             "cost": math.nan,
             "iterations": math.nan,
-            "cost_type": cost_type,
             "status": "fail",
         }
 
 
-def _fmt_cost_type(value):
-    if value == "chamfer":
-        return "Chamfer"
-    if value == "l2":
-        return "L2"
-    return "N/A"
+def fmt_ratio(value):
+    if not is_available(value):
+        return "N/A"
+    return f"{value:.4f}"
+
+
+def fmt_iters(value):
+    if not is_available(value):
+        return "N/A"
+    return f"{int(value):,}"
+
+
+def compute_ratio(exact_cost, simple_cost):
+    if math.isnan(exact_cost) or math.isnan(simple_cost) or exact_cost == 0.0:
+        return math.nan
+    return simple_cost / exact_cost
 
 
 def print_results_table(rows):
-    col_widths = {
+    widths = {
         "n": 7,
-        "exact_time": 14,
-        "simple_time": 14,
-        "exact_cost": 19,
-        "simple_cost": 16,
-        "cost_type": 10,
-        "simple_iters": 14,
+        "exact_time": 12,
+        "simple_time": 13,
+        "exact_cost": 18,
+        "simple_cost": 19,
+        "ratio": 7,
+        "simple_iters": 12,
     }
     headers = [
-        ("N", col_widths["n"], ">"),
-        ("Exact Time", col_widths["exact_time"], ">"),
-        ("Simple Time", col_widths["simple_time"], ">"),
-        ("Exact Chamfer Cost", col_widths["exact_cost"], ">"),
-        ("Simple Cost", col_widths["simple_cost"], ">"),
-        ("Cost Type", col_widths["cost_type"], ">"),
-        ("Simple Iters", col_widths["simple_iters"], ">"),
+        ("N", widths["n"]),
+        ("Exact Time", widths["exact_time"]),
+        ("Simple Time", widths["simple_time"]),
+        ("Exact Chamfer Cost", widths["exact_cost"]),
+        ("Simple Chamfer Cost", widths["simple_cost"]),
+        ("Ratio", widths["ratio"]),
+        ("Simple Iters", widths["simple_iters"]),
     ]
 
-    header_line = " | ".join(
-        f"{label:{align}{width}}" for label, width, align in headers
-    )
-    separator = "-+-".join("-" * width for _, width, _ in headers)
+    header_line = " | ".join(f"{label:>{width}}" for label, width in headers)
+    separator = "-+-".join("-" * width for _, width in headers)
 
     print(header_line, flush=True)
     print(separator, flush=True)
     for row in rows:
         exact = row["exact"]
         simple = row["simple"]
+        ratio = compute_ratio(exact["cost"], simple["cost"])
         cells = [
-            f"{row['n']:>{col_widths['n']},}",
-            f"{fmt_time(exact['time_ms']):>{col_widths['exact_time']}}",
-            f"{fmt_time(simple['time_ms']):>{col_widths['simple_time']}}",
-            f"{fmt_cost(exact['cost']):>{col_widths['exact_cost']}}",
-            f"{fmt_cost(simple['cost']):>{col_widths['simple_cost']}}",
-            f"{_fmt_cost_type(simple['cost_type']):>{col_widths['cost_type']}}",
-            f"{fmt_iter(simple['iterations']):>{col_widths['simple_iters']}}",
+            f"{row['n']:>{widths['n']},}",
+            f"{fmt_time(exact['time_ms']):>{widths['exact_time']}}",
+            f"{fmt_time(simple['time_ms']):>{widths['simple_time']}}",
+            f"{fmt_cost(exact['cost']):>{widths['exact_cost']}}",
+            f"{fmt_cost(simple['cost']):>{widths['simple_cost']}}",
+            f"{fmt_ratio(ratio):>{widths['ratio']}}",
+            f"{fmt_iters(simple.get('iterations', math.nan)):>{widths['simple_iters']}}",
         ]
         print(" | ".join(cells), flush=True)
 
@@ -608,164 +550,95 @@ def main():
     if device.type == "cuda":
         torch.cuda.manual_seed_all(SEED)
 
-    print("=" * 60, flush=True)
-    print("Experiment: 20 Newsgroups — Exact OT vs Push-Relabel", flush=True)
-    print("=" * 60, flush=True)
-    print(f"Device  : {device}", flush=True)
-    print(f"Epsilon : {EPSILON}  batch_size={BATCH_SIZE}", flush=True)
-    print(f"Exact OT (Chamfer): N ≤ {EXACT_N_LIMIT:,} only", flush=True)
-    print(
-        "Push-Relabel: all N values (uses mean word embedding, L2 clustering)",
-        flush=True,
-    )
-    print(
-        f"Cost reported: true Chamfer for N ≤ {EXACT_N_LIMIT:,}, "
-        f"L2 for larger N",
-        flush=True,
-    )
+    print("=" * 60)
+    print("Experiment: 20 Newsgroups — Exact OT vs Push-Relabel")
+    print("Both solvers use true Chamfer distances (GloVe 300d word sets)")
+    print("=" * 60)
+    print(f"Device  : {device}")
+    print(f"Epsilon : {EPSILON}  batch_size={BATCH_SIZE}")
+    print(f"Exact OT: N <= {EXACT_N_LIMIT:,} only")
+    print(f"Push-Relabel: all N (Chamfer clustering + integer discretization)")
+    print(f"All distances normalized to [0,1] before solver", flush=True)
 
     if not EMBEDDINGS_PATH.exists():
-        print(f"\nERROR: {EMBEDDINGS_PATH.name} not found.", flush=True)
-        print("Run download_newsgroups_glove.py first.", flush=True)
+        print(f"\nERROR: {EMBEDDINGS_PATH.name} not found.")
+        print("Run download_newsgroups_glove.py first.")
         return
 
     print("\n[Data] Loading document embeddings...", flush=True)
     try:
         all_descs = load_embeddings(EMBEDDINGS_PATH)
     except Exception as exc:
-        print(f"ERROR loading data: {exc}", flush=True)
+        print(f"ERROR: {exc}", flush=True)
         return
     print(f"[Data] Total documents: {len(all_descs):,}", flush=True)
 
     rows = []
     for n in N_VALUES:
-        P_red = None
-        P_blue = None
-        P_red_raw = None
-        P_blue_raw = None
-        P_red_norm_cpu = None
-        P_blue_norm_cpu = None
-        red_descs = None
-        blue_descs = None
-        red_means = None
-        blue_means = None
-        D_chamfer_cpu = None
+        print(f"\n{'=' * 40}")
+        print(f"N = {n:,}")
+        print(f"{'=' * 40}", flush=True)
+
+        if 2 * n > len(all_descs):
+            print(f"  Not enough documents (need {2 * n:,}). Skipping.")
+            continue
+
+        print(f"  [1/3] Sampling {n:,} red + {n:,} blue documents...", flush=True)
         try:
-            print(f"\n{'=' * 40}", flush=True)
-            print(f"N = {n:,}", flush=True)
-            print(f"{'=' * 40}", flush=True)
-
-            if 2 * n > len(all_descs):
-                print(
-                    f"  Not enough documents (need {2 * n:,}, have {len(all_descs):,}). "
-                    f"Skipping.",
-                    flush=True,
-                )
-                continue
-
-            print("  [1/3] Sampling document embeddings...", flush=True)
-            try:
-                red_descs, blue_descs = sample_pair(all_descs, n, SEED)
-            except Exception as exc:
-                print(f"  Sampling failed: {exc}", flush=True)
-                continue
-
-            print("  [2/3] Computing mean embeddings...", flush=True)
-            try:
-                red_means = compute_mean_embeddings(red_descs)
-                blue_means = compute_mean_embeddings(blue_descs)
-                P_red_raw = torch.from_numpy(red_means).float()
-                P_blue_raw = torch.from_numpy(blue_means).float()
-                P_red_norm_cpu, P_blue_norm_cpu, diameter = normalize_points(
-                    P_red_raw,
-                    P_blue_raw,
-                )
-                P_red = P_red_norm_cpu.to(device)
-                P_blue = P_blue_norm_cpu.to(device)
-                print(f"  L2 diameter (mean descriptors): {diameter:.4f}", flush=True)
-            except Exception as exc:
-                print(f"  Mean embedding computation failed: {exc}", flush=True)
-                continue
-
-            print("  [3/3] Running solvers...", flush=True)
-
-            D_chamfer_cpu = None
-            if n <= EXACT_N_LIMIT:
-                print("    Running Exact OT (true Chamfer)...", flush=True)
-                exact_result = run_exact(red_descs, blue_descs, device)
-                if exact_result["D"] is not None:
-                    D_chamfer_cpu = exact_result["D"].detach().cpu()
-                    exact_result["D"] = None
-                    empty_cache_if_cuda(device)
-            else:
-                print("    Exact OT skipped (N > EXACT_N_LIMIT)", flush=True)
-                exact_result = {
-                    "time_ms": math.nan,
-                    "cost": math.nan,
-                    "D": None,
-                    "status": "skipped",
-                }
-
-            print(
-                "    Running Push-Relabel (mean word embedding, L2 clustering)...",
-                flush=True,
-            )
-            simple_result = run_simple(
-                P_red,
-                P_blue,
-                device,
-                diameter,
-                D_chamfer=D_chamfer_cpu,
-            )
-
-            rows.append(
-                {
-                    "n": n,
-                    "exact": exact_result,
-                    "simple": simple_result,
-                }
-            )
-
-            print(f"\n--- Results so far (after N={n:,}) ---", flush=True)
-            print_results_table(rows)
-            print(f"--- End of intermediate results ---\n", flush=True)
+            red_descs, blue_descs = sample_pair(all_descs, n, SEED)
         except Exception as exc:
-            print(f"  Unexpected failure at N={n:,}: {exc}", flush=True)
+            print(f"  Sampling failed: {exc}", flush=True)
+            continue
+
+        print(f"  [2/3] Computing Chamfer matrices on {device}...", flush=True)
+        try:
+            t0 = time.perf_counter()
+            D_br = compute_chamfer_matrix(
+                blue_descs,
+                red_descs,
+                device,
+                tile_b=50,
+                tile_a=50,
+            )
+            D_rr = compute_chamfer_matrix_symmetric(red_descs, device)
+            chamfer_ms = (time.perf_counter() - t0) * 1000.0
+            print(f"  Chamfer matrices computed in {chamfer_ms:.1f} ms", flush=True)
+            D_br_norm, D_rr_norm, diameter = normalize_chamfer_matrices(D_br, D_rr)
+            print(f"  Diameter (max Chamfer): {diameter:.4f}", flush=True)
+            del D_br, D_rr
+        except Exception as exc:
+            print(f"  Chamfer computation failed: {exc}", flush=True)
             empty_cache_if_cuda(device)
             continue
-        finally:
-            if P_red is not None:
-                del P_red
-            if P_blue is not None:
-                del P_blue
-            if P_red_raw is not None:
-                del P_red_raw
-            if P_blue_raw is not None:
-                del P_blue_raw
-            if P_red_norm_cpu is not None:
-                del P_red_norm_cpu
-            if P_blue_norm_cpu is not None:
-                del P_blue_norm_cpu
-            if red_descs is not None:
-                del red_descs
-            if blue_descs is not None:
-                del blue_descs
-            if red_means is not None:
-                del red_means
-            if blue_means is not None:
-                del blue_means
-            if D_chamfer_cpu is not None:
-                del D_chamfer_cpu
-            empty_cache_if_cuda(device)
 
-    print(f"\n\n{'=' * 60}", flush=True)
-    print("RESULTS", flush=True)
-    print(f"{'=' * 60}", flush=True)
-    print(
-        f"Note: Simple Cost = true Chamfer for N ≤ {EXACT_N_LIMIT:,}; "
-        f"L2 for larger N",
-        flush=True,
-    )
+        print(f"  [3/3] Running solvers...", flush=True)
+
+        if n <= EXACT_N_LIMIT:
+            print("    Running Exact OT...", flush=True)
+            exact_result = run_exact(D_br_norm, device)
+            if exact_result["status"] == "success":
+                exact_result["cost"] *= diameter
+        else:
+            print("    Exact OT skipped (N > EXACT_N_LIMIT)", flush=True)
+            exact_result = {"time_ms": math.nan, "cost": math.nan, "status": "skipped"}
+
+        print("    Running Push-Relabel (Chamfer clustering)...", flush=True)
+        simple_result = run_simple(D_br_norm, D_rr_norm, device, diameter)
+
+        rows.append({"n": n, "exact": exact_result, "simple": simple_result})
+
+        print(f"\n--- Results so far (after N={n:,}) ---", flush=True)
+        print_results_table(rows)
+        print(f"--- End intermediate results ---\n", flush=True)
+
+        del D_br_norm, D_rr_norm, red_descs, blue_descs
+        empty_cache_if_cuda(device)
+
+    print(f"\n\n{'=' * 60}")
+    print("FINAL RESULTS")
+    print(f"{'=' * 60}")
+    print("Both costs are true Chamfer distances of each solver's matching.")
+    print("Ratio = Simple / Exact (measures push-relabel quality vs optimal)")
     print_results_table(rows)
 
 
