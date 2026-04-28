@@ -73,19 +73,31 @@ def fmt_iter(value):
     return f"{int(value):,}"
 
 
-def normalize_points(A, B):
+def normalize_points(A, B, n_subsample=1000):
     """
-    Normalize two [N, d] tensors by their joint bounding-box diameter.
-    all_pts = torch.cat([A, B], dim=0)
-    diameter = float((all_pts.max(dim=0).values -
-                      all_pts.min(dim=0).values).max().item())
-    diameter = max(diameter, 1e-6)
-    return A / diameter, B / diameter, diameter
+    Normalize two [N, d] tensors so all pairwise L2 distances are <= 1.0.
+
+    Diameter is computed as the max pairwise L2 distance over a random
+    subsample of both sets combined. This matches the approach in
+    experiment_sift.py and ensures the push-relabel solver's iteration
+    bound (1/epsilon^2) holds.
+
+    Steps:
+    1. Subsample min(n_subsample, N) points from each of A and B
+    2. Stack them: sub = torch.cat([A_sub, B_sub], dim=0)
+    3. diameter = float(torch.cdist(sub, sub, p=2).max().item())
+    4. diameter = max(diameter, 1e-6)
+    5. Return A / diameter, B / diameter, diameter
+
+    After this normalization, all pairwise L2 distances between any two
+    points in A or B are <= 1.0, so passing diameter=1.0 to SimpleGPUSolver
+    is correct.
     """
-    all_pts = torch.cat([A, B], dim=0)
-    diameter = float(
-        (all_pts.max(dim=0).values - all_pts.min(dim=0).values).max().item()
-    )
+    N = A.shape[0]
+    sub_size = min(n_subsample, N)
+    idx = torch.randperm(N)[:sub_size]
+    sub = torch.cat([A[idx], B[idx]], dim=0)
+    diameter = float(torch.cdist(sub, sub, p=2).max().item())
     diameter = max(diameter, 1e-6)
     return A / diameter, B / diameter, diameter
 
@@ -670,7 +682,7 @@ def main():
                 )
                 P_red = P_red_norm_cpu.to(device)
                 P_blue = P_blue_norm_cpu.to(device)
-                print(f"  Mean embedding diameter: {diameter:.4f}", flush=True)
+                print(f"  L2 diameter (mean descriptors): {diameter:.4f}", flush=True)
             except Exception as exc:
                 print(f"  Mean embedding computation failed: {exc}", flush=True)
                 continue
