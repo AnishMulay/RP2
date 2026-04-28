@@ -718,6 +718,10 @@ def main():
                     "simple": simple_result,
                 }
             )
+
+            print(f"\n--- Results so far (after N={n:,}) ---", flush=True)
+            print_results_table(rows)
+            print(f"--- End of intermediate results ---\n", flush=True)
         except Exception as exc:
             print(f"  Unexpected failure at N={n:,}: {exc}", flush=True)
             empty_cache_if_cuda(device)
