@@ -154,6 +154,14 @@ def compute_cost_matrix_l1(red, blue):
     return torch.cdist(X, Y, p=1).numpy()
 
 
+def clustering_gpu_bytes(clustering):
+    total = 0
+    for value in clustering.values():
+        if isinstance(value, torch.Tensor) and value.device.type == "cuda":
+            total += value.numel() * value.element_size()
+    return total
+
+
 def benchmark_exact(P_red, P_blue):
     if P_red.shape[0] > 10_000:
         raise RuntimeError("Exact OT skipped: N > 10,000")
@@ -191,6 +199,7 @@ def benchmark_proxy_exact(P_red, P_blue, device):
     clustering = cluster_engine.run(
         P_red.to(device), P_blue.to(device)
     )
+    struct_bytes = clustering_gpu_bytes(clustering)
 
     n = P_red.shape[0]
     a = np.full(n, 1.0 / n, dtype=np.float64)
@@ -204,7 +213,7 @@ def benchmark_proxy_exact(P_red, P_blue, device):
     matching = torch.from_numpy(plan.argmax(axis=1).astype(np.int64))
     matched = P_red[matching.to(device=P_red.device, dtype=torch.long)]
     cost = (P_blue - matched).abs().sum(dim=1).mean().item()
-    return elapsed_ms, cost
+    return elapsed_ms, cost, struct_bytes
 
 
 def run_exact(P_red, P_blue):
@@ -218,11 +227,11 @@ def run_exact(P_red, P_blue):
 
 def run_proxy_exact(P_red, P_blue, device):
     try:
-        time_ms, cost = benchmark_proxy_exact(P_red, P_blue, device)
-        return {"time_ms": time_ms, "cost": cost, "status": "ok"}
+        time_ms, cost, struct_bytes = benchmark_proxy_exact(P_red, P_blue, device)
+        return {"time_ms": time_ms, "cost": cost, "struct_bytes": struct_bytes, "status": "ok"}
     except Exception as exc:
         print(f"  [ProxyExact] failed: {exc}", flush=True)
-        return {"time_ms": math.nan, "cost": math.nan, "status": "fail"}
+        return {"time_ms": math.nan, "cost": math.nan, "struct_bytes": math.nan, "status": "fail"}
 
 
 def is_available(value):
@@ -241,16 +250,17 @@ def fmt_cost(value):
     return f"{value:.4f}"
 
 
-def fmt_ratio(value):
+def fmt_size_bytes(value):
     if not is_available(value):
         return "N/A"
-    return f"{value:.4f}"
-
-
-def compute_cost_ratio(exact_cost, proxy_cost):
-    if math.isnan(exact_cost) or math.isnan(proxy_cost):
-        return math.nan
-    return proxy_cost / exact_cost
+    value = float(value)
+    if value < 1024.0:
+        return f"{value:.0f} B"
+    if value < 1024.0 ** 2:
+        return f"{value / 1024.0:.1f} KiB"
+    if value < 1024.0 ** 3:
+        return f"{value / (1024.0 ** 2):.1f} MiB"
+    return f"{value / (1024.0 ** 3):.2f} GiB"
 
 
 def print_results_table(rows):
@@ -260,7 +270,7 @@ def print_results_table(rows):
         "proxy_time": 19,
         "exact_cost": 18,
         "proxy_cost": 23,
-        "cost_ratio": 10,
+        "struct_size": 16,
     }
     headers = [
         ("N", col_widths["n"], ">"),
@@ -268,7 +278,7 @@ def print_results_table(rows):
         ("ProxyExact Time", col_widths["proxy_time"], ">"),
         ("Exact Avg L1 Cost", col_widths["exact_cost"], ">"),
         ("ProxyExact Avg L1 Cost", col_widths["proxy_cost"], ">"),
-        ("Cost Ratio", col_widths["cost_ratio"], ">"),
+        ("GPU Struct Size", col_widths["struct_size"], ">"),
     ]
 
     header_line = " | ".join(
@@ -282,14 +292,13 @@ def print_results_table(rows):
     for row in rows:
         exact = row["exact"]
         proxy = row["proxy_exact"]
-        ratio = compute_cost_ratio(exact["cost"], proxy["cost"])
         cells = [
             f"{row['n']:>{col_widths['n']},}",
             f"{fmt_time(exact['time_ms']):>{col_widths['exact_time']}}",
             f"{fmt_time(proxy['time_ms']):>{col_widths['proxy_time']}}",
             f"{fmt_cost(exact['cost']):>{col_widths['exact_cost']}}",
             f"{fmt_cost(proxy['cost']):>{col_widths['proxy_cost']}}",
-            f"{fmt_ratio(ratio):>{col_widths['cost_ratio']}}",
+            f"{fmt_size_bytes(proxy['struct_bytes']):>{col_widths['struct_size']}}",
         ]
         print(" | ".join(cells))
 
