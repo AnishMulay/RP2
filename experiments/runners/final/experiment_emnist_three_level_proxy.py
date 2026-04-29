@@ -3,12 +3,8 @@
 Experiment: Exact OT vs Three-Level Proxy-Exact OT on EMNIST.
 
 Mirrors experiment_emnist_proxy.py exactly in structure and data loading.
-The two-level experiment uses L1 + SimpleL1Clustering.
-This experiment uses L2 + ThreeLevelClustering so the proxy cost approximates
-the same L2 distance that the exact solver is run on.
-
-To add an L1 three-level variant, follow simple_l1.py to build a
-ThreeLevelL1Clustering and swap compute_cost_matrix_l2 → l1 below.
+This experiment uses L1 + ThreeLevelL1Clustering so the proxy cost
+approximates the same L1 distance that the exact solver is run on.
 """
 
 import math
@@ -32,7 +28,7 @@ try:
 except ImportError:
     ot = None
 
-from clustered_push_relabel.clustering.simple_three_level import ThreeLevelClustering
+from clustered_push_relabel.clustering.simple_three_level_l1 import ThreeLevelL1Clustering
 
 
 N_VALUES    = [1_000, 5_000, 10_000]
@@ -119,11 +115,11 @@ def load_emnist_balanced(n_samples, seed, split):
 
 # ── Cost-matrix helpers ───────────────────────────────────────────────────────
 
-def compute_cost_matrix_l2(red: torch.Tensor, blue: torch.Tensor) -> np.ndarray:
-    """Full N×N pairwise L2 cost matrix as float64 numpy array."""
+def compute_cost_matrix_l1(red: torch.Tensor, blue: torch.Tensor) -> np.ndarray:
+    """Full N×N pairwise L1 cost matrix as float64 numpy array."""
     X = red.cpu().to(torch.float64).contiguous()
     Y = blue.cpu().to(torch.float64).contiguous()
-    return torch.cdist(X, Y, p=2).numpy()
+    return torch.cdist(X, Y, p=1).numpy()
 
 
 def build_proxy_cost_matrix_three_level(
@@ -132,7 +128,7 @@ def build_proxy_cost_matrix_three_level(
     device: torch.device,
 ) -> np.ndarray:
     """
-    Build the full N×N float proxy cost matrix from a ThreeLevelClustering result.
+    Build the full N×N float proxy cost matrix from a ThreeLevelL1Clustering result.
 
     Proxy priority (each level overwrites the previous):
         Level 2 (base)    C[b,a]  = d_min_b_A2[b]  + DR[nearest_s2[b], a]
@@ -219,7 +215,7 @@ def benchmark_exact(P_red: torch.Tensor, P_blue: torch.Tensor):
     n        = red_cpu.shape[0]
     a        = np.full(n, 1.0 / n, dtype=np.float64)
     b        = np.full(n, 1.0 / n, dtype=np.float64)
-    C        = compute_cost_matrix_l2(red_cpu, blue_cpu)
+    C        = compute_cost_matrix_l1(red_cpu, blue_cpu)
 
     t0         = time.perf_counter()
     plan       = ot.emd(a, b, C, numItermax=10 ** 6)
@@ -227,7 +223,7 @@ def benchmark_exact(P_red: torch.Tensor, P_blue: torch.Tensor):
 
     matching = torch.from_numpy(plan.argmax(axis=0).astype(np.int64))
     matched  = red_cpu[matching.to(dtype=torch.long)]
-    cost     = torch.norm(blue_cpu - matched, p=2, dim=1).mean().item()
+    cost     = (blue_cpu - matched).abs().sum(dim=1).mean().item()
     return elapsed_ms, cost
 
 
@@ -241,7 +237,7 @@ def benchmark_three_level_proxy_exact(
     if ot is None:
         raise RuntimeError("POT not installed")
 
-    cluster_engine = ThreeLevelClustering(
+    cluster_engine = ThreeLevelL1Clustering(
         epsilon=EPSILON,
         tile_size=BATCH_SIZE,
     )
@@ -256,10 +252,10 @@ def benchmark_three_level_proxy_exact(
     plan       = ot.emd(a, b, C, numItermax=10 ** 6)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-    # Evaluate the matching under the TRUE L2 cost (not the proxy)
+    # Evaluate the matching under the TRUE L1 cost (not the proxy)
     matching = torch.from_numpy(plan.argmax(axis=1).astype(np.int64))
     matched  = P_red[matching.to(device=P_red.device, dtype=torch.long)]
-    cost     = torch.norm(P_blue - matched, p=2, dim=1).mean().item()
+    cost     = (P_blue - matched).abs().sum(dim=1).mean().item()
     return elapsed_ms, cost
 
 
@@ -318,8 +314,8 @@ def print_results_table(rows):
         ("N",                     col_widths["n"],          ">"),
         ("Exact Time",            col_widths["exact_time"], ">"),
         ("3-Lvl Proxy Time",      col_widths["proxy_time"], ">"),
-        ("Exact Avg L2 Cost",     col_widths["exact_cost"], ">"),
-        ("3-Lvl Proxy Avg L2 Cost", col_widths["proxy_cost"], ">"),
+        ("Exact Avg L1 Cost",     col_widths["exact_cost"], ">"),
+        ("3-Lvl Proxy Avg L1 Cost", col_widths["proxy_cost"], ">"),
         ("Cost Ratio",            col_widths["cost_ratio"], ">"),
     ]
 
@@ -358,7 +354,7 @@ def main():
 
     print(f"Device: {device}  epsilon={EPSILON}  batch_size={BATCH_SIZE}")
     print(f"EMNIST split: {EMNIST_SPLIT}  data dir: {DATA_DIR}")
-    print("Distance metric: L2 (three-level clustering uses _sq_dist_inplace / L2 cdist)")
+    print("Distance metric: L1 (three-level clustering uses Manhattan distances)")
 
     rows = []
     for n in N_VALUES:
@@ -371,10 +367,10 @@ def main():
             print(f"  Data loading failed: {exc}", flush=True)
             continue
 
-        print("  Running Exact OT (L2)...", flush=True)
+        print("  Running Exact OT (L1)...", flush=True)
         exact_result = run_exact(P_red, P_blue)
 
-        print("  Running Three-Level Proxy-Exact OT (L2)...", flush=True)
+        print("  Running Three-Level Proxy-Exact OT (L1)...", flush=True)
         proxy_result = run_three_level_proxy_exact(P_red, P_blue, device)
 
         rows.append({
