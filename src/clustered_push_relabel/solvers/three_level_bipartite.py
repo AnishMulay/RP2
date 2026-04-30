@@ -10,6 +10,8 @@ from .simple_bipartite import (
     _ensure_long_arange,
 )
 
+_HIST_SIZE_LIMIT = 50_000_000
+
 
 class ThreeLevelGPUSolver(SimpleGPUSolver):
     """
@@ -153,6 +155,7 @@ class ThreeLevelGPUSolver(SimpleGPUSolver):
         self.adj_B_ptr = clustering["adj_B_ptr"]
         self.adj_B_col = clustering["adj_B_col"]
         self.adj_B_dist_int = clustering["adj_B_dist_int"]
+        self._precompute_A1_structure()
 
         # Set-1 logic is still the A2-matrix fallback; retain these aliases only
         # for inherited debugging helpers that are specific to the matrix set.
@@ -551,6 +554,123 @@ class ThreeLevelGPUSolver(SimpleGPUSolver):
         )
         return active_row_pos, active_edge_idx
 
+    def _precompute_A1_structure(self):
+        """
+        Precompute the owner A1 center of every flat Adj_A1 CSR entry.
+        """
+        S1 = int(self.adj_A1_ptr.shape[0]) - 1
+        lengths = self.adj_A1_ptr[1:] - self.adj_A1_ptr[:-1]
+        self.center_of_A1_entry = torch.repeat_interleave(
+            torch.arange(S1, device=self.device, dtype=torch.long),
+            lengths,
+        )
+
+    def _set2_build_histogram_sort_fallback(self, B_query, rhs, S1, MA1):
+        """
+        Sort-based fallback when the bounded-range histogram would be too large.
+        """
+        NQ = B_query.numel()
+
+        lhs_all = (
+            self.y_A[self.adj_A1_col].to(torch.long)
+            - self.adj_A1_dist_int.to(torch.long)
+        )
+        centers_all = self.center_of_A1_entry
+
+        global_min = int(min(lhs_all.min().item(), rhs.min().item()))
+        global_max = int(max(lhs_all.max().item(), rhs.max().item()))
+        V_stride = global_max - global_min + 1
+        key_entries_all = centers_all * V_stride + (lhs_all - global_min)
+        key_blues = self.nearest_s1[B_query] * V_stride + (rhs - global_min)
+
+        hist_size_full = S1 * V_stride
+        if hist_size_full > _HIST_SIZE_LIMIT:
+            sorted_entry_keys, sorted_order = torch.sort(key_entries_all)
+            left = torch.searchsorted(sorted_entry_keys, key_blues, right=False)
+            right = torch.searchsorted(sorted_entry_keys, key_blues, right=True)
+            counts_nq = (right - left).clamp_(min=0)
+            return {
+                "hist": None,
+                "filtered_idx": sorted_order,
+                "key_entries": sorted_entry_keys,
+                "query_key": key_blues,
+                "rhs_min": global_min,
+                "V_range": V_stride,
+                "_sort_fallback": True,
+                "_counts_nq": counts_nq,
+                "_sorted_red": self.adj_A1_col[sorted_order],
+                "_left": left,
+            }
+
+        hist = torch.zeros(hist_size_full, dtype=torch.long, device=self.device)
+        hist.scatter_add_(
+            0,
+            key_entries_all,
+            torch.ones(MA1, dtype=torch.long, device=self.device),
+        )
+        return {
+            "hist": hist,
+            "filtered_idx": torch.arange(MA1, device=self.device),
+            "key_entries": key_entries_all,
+            "query_key": key_blues,
+            "rhs_min": global_min,
+            "V_range": V_stride,
+        }
+
+    def _set2_build_histogram(self, B_query):
+        """
+        Build the (center, lhs-value) histogram restricted to B_query's rhs range.
+        """
+        MA1 = int(self.adj_A1_col.numel())
+        NQ = int(B_query.numel())
+        if NQ == 0 or MA1 == 0:
+            return None
+
+        rhs = (
+            self.d_min_b_A1_int[B_query].to(torch.long)
+            + 1
+            - self.y_B[B_query].to(torch.long)
+        )
+
+        rhs_min = int(rhs.min().item())
+        rhs_max = int(rhs.max().item())
+        V_range = rhs_max - rhs_min + 1
+        S1 = int(self.adj_A1_ptr.shape[0]) - 1
+
+        hist_size = S1 * V_range
+        if hist_size > _HIST_SIZE_LIMIT:
+            return self._set2_build_histogram_sort_fallback(B_query, rhs, S1, MA1)
+
+        lhs_all = (
+            self.y_A[self.adj_A1_col].to(torch.long)
+            - self.adj_A1_dist_int.to(torch.long)
+        )
+        in_range = (lhs_all >= rhs_min) & (lhs_all <= rhs_max)
+        filtered_idx = in_range.nonzero(as_tuple=True)[0]
+        if filtered_idx.numel() == 0:
+            return None
+
+        lhs_filtered = lhs_all[filtered_idx]
+        centers_filtered = self.center_of_A1_entry[filtered_idx]
+        key_entries = centers_filtered * V_range + (lhs_filtered - rhs_min)
+
+        hist = torch.zeros(hist_size, dtype=torch.long, device=self.device)
+        hist.scatter_add_(
+            0,
+            key_entries,
+            torch.ones(filtered_idx.numel(), dtype=torch.long, device=self.device),
+        )
+
+        query_key = self.nearest_s1[B_query] * V_range + (rhs - rhs_min)
+        return {
+            "hist": hist,
+            "filtered_idx": filtered_idx,
+            "key_entries": key_entries,
+            "query_key": query_key,
+            "rhs_min": rhs_min,
+            "V_range": V_range,
+        }
+
     def _expand_set2_A1_entries(self, blues, edge_attr_name, pos_attr_name):
         num_blues = blues.numel()
         empty = torch.empty(0, device=self.device, dtype=torch.long)
@@ -577,89 +697,74 @@ class ThreeLevelGPUSolver(SimpleGPUSolver):
 
     def _set2_counts(self, B_free):
         num_free = B_free.numel()
-        set2_count_per_blue = torch.zeros(
-            num_free, device=self.device, dtype=torch.long
-        )
+        zero = torch.zeros(num_free, dtype=torch.long, device=self.device)
+        if num_free == 0:
+            return zero
 
-        active_free_pos, active_b, active_edge_idx = self._expand_set2_A1_entries(
-            B_free,
-            "_set2_A1_edge_arange",
-            "_set2_A1_sorted_pos",
-        )
-        if active_edge_idx.numel() == 0:
-            return set2_count_per_blue
+        info = self._set2_build_histogram(B_free)
+        if info is None:
+            return zero
+        if info.get("_sort_fallback"):
+            return info["_counts_nq"]
+        return info["hist"][info["query_key"]]
 
-        active_a = self.adj_A1_col[active_edge_idx]
-        target_y_a = (
-            self.d_min_b_A1_int[active_b]
-            + self.adj_A1_dist_int[active_edge_idx]
-            + 1
-            - self.y_B[active_b]
-        )
-        is_candidate = self.y_A[active_a] == target_y_a
-        cand_free_pos = active_free_pos[is_candidate]
+    def _set2_sample_sort(self, selected_b, info):
+        empty = torch.empty(0, device=self.device, dtype=torch.long)
+        counts_nq = info["_counts_nq"]
+        sorted_red = info["_sorted_red"]
+        left = info["_left"]
 
-        if cand_free_pos.numel() != 0:
-            set2_count_per_blue.scatter_add_(
-                0, cand_free_pos, torch.ones_like(cand_free_pos)
-            )
-        return set2_count_per_blue
+        has_cand = counts_nq > 0
+        if not has_cand.any():
+            return empty, empty
+
+        sel_valid = selected_b[has_cand]
+        count_valid = counts_nq[has_cand]
+        left_valid = left[has_cand]
+
+        rand_rank = (
+            torch.rand(sel_valid.numel(), device=self.device) * count_valid.float()
+        ).long().clamp_(max=count_valid - 1)
+        sampled_a = sorted_red[left_valid + rand_rank]
+        return sel_valid, sampled_a
 
     def _set2_sample(self, B_free, choose_set2):
         selected_b = B_free[choose_set2]
-        num_selected = selected_b.numel()
-        if num_selected == 0:
+        empty = torch.empty(0, device=self.device, dtype=torch.long)
+        if selected_b.numel() == 0:
             empty = torch.empty(0, device=self.device, dtype=torch.long)
             return empty, empty
 
-        active_selected_pos, active_b, active_edge_idx = self._expand_set2_A1_entries(
-            selected_b,
-            "_set2_A1_sample_edge_arange",
-            "_set2_A1_sample_sorted_pos",
-        )
-        if active_edge_idx.numel() == 0:
-            empty = torch.empty(0, device=self.device, dtype=torch.long)
+        info = self._set2_build_histogram(selected_b)
+        if info is None:
+            return empty, empty
+        if info.get("_sort_fallback"):
+            return self._set2_sample_sort(selected_b, info)
+
+        hist = info["hist"]
+        filtered_idx = info["filtered_idx"]
+        key_entries = info["key_entries"]
+        query_key = info["query_key"]
+
+        count_per_blue = hist[query_key]
+        has_cand = count_per_blue > 0
+        if not has_cand.any():
             return empty, empty
 
-        active_a = self.adj_A1_col[active_edge_idx]
-        target_y_a = (
-            self.d_min_b_A1_int[active_b]
-            + self.adj_A1_dist_int[active_edge_idx]
-            + 1
-            - self.y_B[active_b]
-        )
-        is_candidate = self.y_A[active_a] == target_y_a
-        cand_selected_pos = active_selected_pos[is_candidate]
-        cand_a = active_a[is_candidate]
-        cand_count = cand_a.numel()
-        if cand_count == 0:
-            empty = torch.empty(0, device=self.device, dtype=torch.long)
-            return empty, empty
+        sel_valid = selected_b[has_cand]
+        qkey_valid = query_key[has_cand]
+        count_valid = count_per_blue[has_cand]
 
-        cand_idx = _ensure_long_arange(
-            self, "_set2_A1_sample_cand_arange", cand_count, self.device
-        )
+        sort_order = torch.argsort(key_entries, stable=True)
+        sorted_keys = key_entries[sort_order]
+        sorted_red = self.adj_A1_col[filtered_idx[sort_order]]
 
-        rand_prio = torch.rand(cand_count, device=self.device)
-        min_prio = torch.full((num_selected,), float("inf"), device=self.device)
-        min_prio.scatter_reduce_(
-            0, cand_selected_pos, rand_prio, reduce="amin", include_self=True
-        )
-
-        is_min = rand_prio == min_prio[cand_selected_pos]
-        winner_idx = torch.full(
-            (num_selected,), cand_count, device=self.device, dtype=torch.long
-        )
-        winner_idx.scatter_reduce_(
-            0,
-            cand_selected_pos[is_min],
-            cand_idx[is_min],
-            reduce="amin",
-            include_self=True,
-        )
-
-        valid = winner_idx < cand_count
-        return selected_b[valid], cand_a[winner_idx[valid]]
+        group_start = torch.searchsorted(sorted_keys, qkey_valid)
+        rand_rank = (
+            torch.rand(sel_valid.numel(), device=self.device) * count_valid.float()
+        ).long().clamp_(max=count_valid - 1)
+        sampled_a = sorted_red[group_start + rand_rank]
+        return sel_valid, sampled_a
 
     def _set3_counts(self, B_free):
         num_free = B_free.numel()
@@ -747,11 +852,12 @@ class ThreeLevelGPUSolver(SimpleGPUSolver):
             return 0
 
         sentinel = torch.iinfo(torch.int64).max // 4
+        device = self.device
         target2 = (
             self.d_min_b_A2_int[B_free] + 1 - self.y_B[B_free]
         ).to(torch.long)
         min_slack1_per_blue = torch.full(
-            (num_free,), sentinel, device=self.device, dtype=torch.long
+            (num_free,), sentinel, device=device, dtype=torch.long
         )
         if unique_pairs.numel() != 0:
             set1_eligible = self._set1_eligible_mask(B_free)
@@ -759,7 +865,7 @@ class ThreeLevelGPUSolver(SimpleGPUSolver):
                 pair_s = unique_pairs[:, 0].to(torch.long)
                 num_pairs = pair_s.numel()
                 v_pair_row_max = torch.empty(
-                    num_pairs, device=self.device, dtype=torch.long
+                    num_pairs, device=device, dtype=torch.long
                 )
                 for start in range(0, num_pairs, self.set1_pair_batch):
                     end = min(start + self.set1_pair_batch, num_pairs)
@@ -771,73 +877,80 @@ class ThreeLevelGPUSolver(SimpleGPUSolver):
                     - v_pair_row_max[pair_inverse[set1_eligible]]
                 )
 
-        min_adj_A1_term = torch.full(
-            (num_free,), sentinel, device=self.device, dtype=torch.long
+        min_slack2_per_blue = torch.full(
+            (num_free,), sentinel, device=device, dtype=torch.long
         )
-        active_free_pos, active_b, active_edge_idx = self._expand_set2_A1_entries(
-            B_free,
-            "_delta_set2_A1_edge_arange",
-            "_delta_set2_A1_sorted_pos",
-        )
-        if active_edge_idx.numel() != 0:
-            active_a = self.adj_A1_col[active_edge_idx]
-            adj_A1_term = (
-                self.d_min_b_A1_int[active_b].to(torch.long)
-                + self.adj_A1_dist_int[active_edge_idx].to(torch.long)
-                - self.y_A[active_a].to(torch.long)
+        MA1 = int(self.adj_A1_col.numel())
+        if MA1 > 0:
+            S1 = int(self.adj_A1_ptr.shape[0]) - 1
+            entry_term = (
+                self.adj_A1_dist_int.to(torch.long)
+                - self.y_A[self.adj_A1_col].to(torch.long)
             )
-            min_adj_A1_term.scatter_reduce_(
+            min_entry_term = torch.full(
+                (S1,), sentinel, device=device, dtype=torch.long
+            )
+            min_entry_term.scatter_reduce_(
                 0,
-                active_free_pos,
-                adj_A1_term,
+                self.center_of_A1_entry,
+                entry_term,
                 reduce="amin",
                 include_self=True,
             )
 
-        min_slack2_per_blue = torch.full(
-            (num_free,), sentinel, device=self.device, dtype=torch.long
-        )
-        has_set2_edges = min_adj_A1_term != sentinel
-        if has_set2_edges.any().item():
-            min_slack2_per_blue[has_set2_edges] = (
-                1
-                - self.y_B[B_free[has_set2_edges]].to(torch.long)
-                + min_adj_A1_term[has_set2_edges]
-            )
+            rhs_b = (
+                self.d_min_b_A1_int[B_free] + 1 - self.y_B[B_free]
+            ).to(torch.long)
+            nearest_min = min_entry_term[self.nearest_s1[B_free]]
+            has_edges = nearest_min != sentinel
+            if has_edges.any():
+                min_slack2_per_blue[has_edges] = (
+                    rhs_b[has_edges] + nearest_min[has_edges]
+                )
 
-        min_adj_B_term = torch.full(
-            (num_free,), sentinel, device=self.device, dtype=torch.long
+        min_slack3_per_blue = torch.full(
+            (num_free,), sentinel, device=device, dtype=torch.long
         )
-        active_free_pos, active_edge_idx = self._expand_csr_rows(
-            B_free,
-            self.adj_B_ptr,
-            "_delta_set3_B_edge_arange",
-            "_delta_set3_B_free_pos",
-        )
-        if active_edge_idx.numel() != 0:
+        starts = self.adj_B_ptr[B_free]
+        ends = self.adj_B_ptr[B_free + 1]
+        lengths = ends - starts
+        total_B = int(lengths.sum().item())
+        if total_B > 0:
+            edge_range = _ensure_long_arange(
+                self, "_delta_B_edge_arange", total_B, device
+            )
+            free_pos = _ensure_long_arange(
+                self, "_delta_B_free_pos", num_free, device
+            )
+            cum_len = torch.cumsum(lengths, dim=0)
+            packed_starts = cum_len - lengths
+
+            active_free_pos = torch.repeat_interleave(free_pos[:num_free], lengths)
+            active_edge_idx = (
+                torch.repeat_interleave(starts, lengths)
+                + edge_range[:total_B]
+                - torch.repeat_interleave(packed_starts, lengths)
+            )
             active_a = self.adj_B_col[active_edge_idx]
             adj_B_term = (
                 self.adj_B_dist_int[active_edge_idx].to(torch.long)
                 - self.y_A[active_a].to(torch.long)
             )
-            min_adj_B_term.scatter_reduce_(
+            min_adj_B = torch.full(
+                (num_free,), sentinel, device=device, dtype=torch.long
+            )
+            min_adj_B.scatter_reduce_(
                 0,
                 active_free_pos,
                 adj_B_term,
                 reduce="amin",
                 include_self=True,
             )
-
-        min_slack3_per_blue = torch.full(
-            (num_free,), sentinel, device=self.device, dtype=torch.long
-        )
-        has_set3_edges = min_adj_B_term != sentinel
-        if has_set3_edges.any().item():
-            min_slack3_per_blue[has_set3_edges] = (
-                1
-                - self.y_B[B_free[has_set3_edges]].to(torch.long)
-                + min_adj_B_term[has_set3_edges]
-            )
+            has_B = min_adj_B != sentinel
+            if has_B.any():
+                min_slack3_per_blue[has_B] = (
+                    1 - self.y_B[B_free[has_B]].to(torch.long) + min_adj_B[has_B]
+                )
 
         min_slack_per_blue = torch.minimum(
             min_slack1_per_blue,
