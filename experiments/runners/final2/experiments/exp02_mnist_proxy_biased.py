@@ -99,18 +99,16 @@ def load_mnist_biased(n_samples, seed):
 
     rng_r = np.random.RandomState(seed)
     rng_b = np.random.RandomState(seed + 1)
-    red_arr  = _sample_from_digits(images, labels, RED_DIGITS,  n_samples, rng_r)
-    blue_arr = _sample_from_digits(images, labels, BLUE_DIGITS, n_samples, rng_b)
+    red_arr  = _sample_from_digits(images, labels, RED_DIGITS,  n_samples, rng_r).astype(np.float32) / 255.0
+    blue_arr = _sample_from_digits(images, labels, BLUE_DIGITS, n_samples, rng_b).astype(np.float32) / 255.0
 
     for arr in (red_arr, blue_arr):
-        arr[:] = arr.astype(np.float32) / 255.0
         s = arr.sum(axis=1, keepdims=True)
         np.maximum(s, 1e-8, out=s)
         arr /= s
         arr /= 2.0
 
-    return torch.from_numpy(red_arr.astype(np.float32)), \
-           torch.from_numpy(blue_arr.astype(np.float32))
+    return torch.from_numpy(red_arr), torch.from_numpy(blue_arr)
 
 
 def compute_l1_matrix(red, blue):
