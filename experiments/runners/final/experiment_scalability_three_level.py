@@ -27,6 +27,7 @@ BATCH_SIZE = 2048
 SEED = 42
 MAX_ITERS = 100_000
 TILE_SIZE = 2048
+CLUSTERING_TILE_SIZE = 512
 
 
 def gpu_mem_mb() -> tuple[float, float]:
@@ -169,6 +170,7 @@ def run_trial(n: int, device: torch.device) -> tuple[dict[str, object], bool]:
             epsilon=EPSILON,
             batch_size=BATCH_SIZE,
             tile_size=TILE_SIZE,
+            clustering_tile_size=CLUSTERING_TILE_SIZE,
             verbose=False,
             max_iters=MAX_ITERS,
             clustering_class=ThreeLevelClustering,
@@ -319,7 +321,11 @@ def main() -> None:
         return
 
     device = torch.device("cuda:0")
-    print(f"Device: {device}  epsilon={EPSILON}  tile={TILE_SIZE}", flush=True)
+    print(
+        f"Device: {device}  epsilon={EPSILON}  "
+        f"solver_tile={TILE_SIZE}  cluster_tile={CLUSTERING_TILE_SIZE}",
+        flush=True,
+    )
 
     rows: list[dict[str, object]] = []
     for n in range(N_START, N_MAX + 1, N_STEP):

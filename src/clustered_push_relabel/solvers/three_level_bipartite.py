@@ -28,6 +28,7 @@ class ThreeLevelGPUSolver(SimpleGPUSolver):
         epsilon,
         batch_size=None,
         tile_size=None,
+        clustering_tile_size=None,
         verbose=False,
         max_iters=50000,
         set1_pair_batch=64,
@@ -59,12 +60,17 @@ class ThreeLevelGPUSolver(SimpleGPUSolver):
             if tile_size is None:
                 tile_size = 2048 if batch_size is None else batch_size
             self.batch_size = int(tile_size)
+            if clustering_tile_size is None:
+                clustering_tile_size = min(self.batch_size, 512)
+            self.clustering_tile_size = int(clustering_tile_size)
 
             if self.verbose:
                 print(
                     "=" * 60
                     + f"\n[Init ThreeLevel] N={self.N}, epsilon={self.epsilon}, "
-                    + f"tile={self.batch_size}, device={self.device}"
+                    + f"tile={self.batch_size}, "
+                    + f"cluster_tile={self.clustering_tile_size}, "
+                    + f"device={self.device}"
                 )
 
             if (
@@ -119,6 +125,9 @@ class ThreeLevelGPUSolver(SimpleGPUSolver):
             if tile_size is None:
                 tile_size = 2048 if batch_size is None else batch_size
             self.batch_size = int(tile_size)
+            if clustering_tile_size is None:
+                clustering_tile_size = min(self.batch_size, 512)
+            self.clustering_tile_size = int(clustering_tile_size)
 
             self.P_red = A
             self.P_blue = B
@@ -127,13 +136,15 @@ class ThreeLevelGPUSolver(SimpleGPUSolver):
                 print(
                     "=" * 60
                     + f"\n[Init ThreeLevel] N={self.N}, epsilon={self.epsilon}, "
-                    + f"tile={self.batch_size}, device={self.device}"
+                    + f"tile={self.batch_size}, "
+                    + f"cluster_tile={self.clustering_tile_size}, "
+                    + f"device={self.device}"
                 )
 
             t0 = time.time()
             cluster_engine = self._clustering_class(
                 epsilon=self.epsilon,
-                tile_size=self.batch_size,
+                tile_size=self.clustering_tile_size,
                 sample_factor=sample_factor,
             )
             clustering = cluster_engine.run(A, B)
