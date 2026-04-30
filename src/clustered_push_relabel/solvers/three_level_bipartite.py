@@ -150,6 +150,8 @@ class ThreeLevelGPUSolver(SimpleGPUSolver):
         self.nearest_s1 = clustering["nearest_s1"]
         self.d_min_b_A1_int = clustering["d_min_b_A1_int"]
         self.adj_A1_ptr = clustering["adj_A1_ptr"]
+        self.S1 = int(clustering["sampled_idx_A1"].shape[0])
+        self.S2 = int(clustering["sampled_idx_A2"].shape[0])
         self.adj_A1_col = clustering["adj_A1_col"]
         self.adj_A1_dist_int = clustering["adj_A1_dist_int"]
         self.adj_B_ptr = clustering["adj_B_ptr"]
