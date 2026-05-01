@@ -2,7 +2,7 @@
 """
 Experiment control file — Final2
 =================================
-Presents an interactive checklist of all 9 experiments, runs selected ones
+Presents an interactive checklist of all 10 experiments, runs selected ones
 with live terminal progress, prints a final summary table, and writes every
 result set to a timestamped Markdown file under results/.
 
@@ -39,9 +39,10 @@ from experiments import (
     exp07_cifar_sift_scalability as exp07,
     exp08_newsgroups_proxy    as exp08,
     exp09_newsgroups_scalability as exp09,
+    exp10_mnist_proxy_dissimilar as exp10,
 )
 
-ALL_MODULES = [exp01, exp02, exp03, exp04, exp05, exp06, exp07, exp08, exp09]
+ALL_MODULES = [exp01, exp02, exp03, exp04, exp05, exp06, exp07, exp08, exp09, exp10]
 
 RESULTS_DIR = FINAL2_DIR / "results"
 
@@ -92,15 +93,15 @@ def ask_selection(completed):
     while True:
         raw = input("  Enter experiment numbers to run  (e.g. 1,2,3  or  all): ").strip()
         if raw.lower() == "all":
-            return list(range(1, 10))
+            return list(range(1, 11))
         try:
             ids = [int(x.strip()) for x in raw.split(",") if x.strip()]
-            valid = [i for i in ids if 1 <= i <= 9]
+            valid = [i for i in ids if 1 <= i <= 10]
             if not valid:
                 raise ValueError
             return valid
         except ValueError:
-            print("  Invalid input. Please enter comma-separated numbers 1–9 or 'all'.")
+            print("  Invalid input. Please enter comma-separated numbers 1–10 or 'all'.")
 
 
 # ── Table printer for final summary ──────────────────────────────────────────
@@ -167,7 +168,7 @@ def main():
     # ── Select experiments ────────────────────────────────────────────────────
     if args.run is not None:
         if args.run.lower() == "all":
-            selected_ids = list(range(1, 10))
+            selected_ids = list(range(1, 11))
         else:
             selected_ids = [int(x.strip()) for x in args.run.split(",") if x.strip()]
     else:
