@@ -42,11 +42,11 @@ DATASET = "EMNIST"
 DATA_DIR = BASE_DIR / "data"
 EMNIST_SPLIT = "byclass"
 
-N_VALUES = [1_000, 5_000, 10_000]
+N_VALUES = [5_000, 10_000, 15_000, 20_000, 25_000]
 EPSILON = 0.01
 BATCH_SIZE = 512
 SEED = 42
-EXACT_N_LIMIT = 10_000
+EXACT_N_LIMIT = 25_000
 
 # EMNIST byclass has 62 classes (0-9 digits, then A-Z, a-z)
 BLUE_CLASS_END = 31   # classes 0-30 (inclusive) → blue set

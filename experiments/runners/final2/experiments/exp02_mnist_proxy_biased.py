@@ -41,11 +41,11 @@ EXP_NAME = "MNIST — Exact vs 2L-Proxy vs 3L-Proxy (Biased: B=0–4, A=5–9)"
 DATASET = "MNIST"
 DATA_DIR = FINAL2_DIR / "data"
 
-N_VALUES = [500, 1_000, 2_000, 3_000, 5_000]
+N_VALUES = [5_000, 10_000, 15_000, 20_000, 25_000]
 EPSILON = 0.01
 BATCH_SIZE = 512
 SEED = 42
-EXACT_N_LIMIT = 10_000
+EXACT_N_LIMIT = 25_000
 
 BLUE_DIGITS = list(range(5))   # digits 0-4 → blue set
 RED_DIGITS  = list(range(5, 10))  # digits 5-9 → red set
