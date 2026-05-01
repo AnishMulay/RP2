@@ -969,9 +969,10 @@ class ThreeLevelGPUSolver(SimpleGPUSolver):
             min_slack1_per_blue,
             torch.minimum(min_slack2_per_blue, min_slack3_per_blue),
         )
-        valid_mask = (min_slack_per_blue != sentinel) & (min_slack_per_blue > 0)
+        valid_mask = min_slack_per_blue != sentinel
         if valid_mask.any().item():
-            return int(min_slack_per_blue[valid_mask].min().item())
+            delta = int(min_slack_per_blue[valid_mask].min().item())
+            return max(delta, 0)
         return 0
 
     def _update_matching(self, B_free, r_new, b_new):
