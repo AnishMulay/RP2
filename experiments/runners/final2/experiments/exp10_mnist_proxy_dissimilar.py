@@ -283,7 +283,7 @@ def run(device, **kwargs):
     return rows
 
 
-def _fmt_row_terminal(row):
+def _fmt_main_row_terminal(row):
     e, p2, p3 = row["exact"], row["prx2"], row["prx3"]
     r2 = compute_ratio(e["cost"], p2["cost"])
     r3 = compute_ratio(e["cost"], p3["cost"])
@@ -297,6 +297,13 @@ def _fmt_row_terminal(row):
         f"{fmt_cost(p3['cost']):>12}",
         f"{fmt_ratio(r2):>9}",
         f"{fmt_ratio(r3):>9}",
+    ]
+
+
+def _fmt_diag_row_terminal(row):
+    e, p2, p3 = row["exact"], row["prx2"], row["prx3"]
+    return [
+        f"{row['n']:>7,}",
         f"{fmt_ratio(e['frac_gt_1']):>10}",
         f"{_fmt_triplet(e):>20}",
         f"{fmt_ratio(p2['frac_gt_1']):>10}",
@@ -307,17 +314,23 @@ def _fmt_row_terminal(row):
 
 
 def print_table(rows):
-    headers = ["       N", "    Exact Time", "  2L-Prx Time",
-               "  3L-Prx Time", "  Exact Cost", " 2L-Prx Cost",
-               " 3L-Prx Cost", " 2L Ratio", " 3L Ratio",
-               "  Exact >1", "   Exact Min/Med/Max",
-               "     2L >1", "      2L Min/Med/Max",
-               "     3L >1", "      3L Min/Med/Max"]
-    sep = "-+-".join("-" * len(h) for h in headers)
-    print("\n" + " | ".join(headers))
-    print(sep)
+    main_headers = ["       N", "    Exact Time", "  2L-Prx Time",
+                    "  3L-Prx Time", "  Exact Cost", " 2L-Prx Cost",
+                    " 3L-Prx Cost", " 2L Ratio", " 3L Ratio"]
+    main_sep = "-+-".join("-" * len(h) for h in main_headers)
+    print("\n" + " | ".join(main_headers))
+    print(main_sep)
     for row in rows:
-        print(" | ".join(_fmt_row_terminal(row)))
+        print(" | ".join(_fmt_main_row_terminal(row)))
+
+    diag_headers = ["       N", "  Exact >1", "   Exact Min/Med/Max",
+                    "     2L >1", "      2L Min/Med/Max",
+                    "     3L >1", "      3L Min/Med/Max"]
+    diag_sep = "-+-".join("-" * len(h) for h in diag_headers)
+    print("\n" + " | ".join(diag_headers))
+    print(diag_sep)
+    for row in rows:
+        print(" | ".join(_fmt_diag_row_terminal(row)))
 
 
 if __name__ == "__main__":
