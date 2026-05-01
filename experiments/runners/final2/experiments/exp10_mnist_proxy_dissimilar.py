@@ -61,6 +61,10 @@ COL_SPECS = [
     ("3L-Prx Cost",   12),
     ("2L Ratio",       9),
     ("3L Ratio",       9),
+]
+
+DIAG_COL_SPECS = [
+    ("N",              7),
     ("Exact >1",      10),
     ("Exact Min/Med/Max", 20),
     ("2L >1",         10),
@@ -88,6 +92,10 @@ FMT_FNS = {
     "3L-Prx Cost":      lambda r: fmt_cost(r["prx3"]["cost"]),
     "2L Ratio":         lambda r: fmt_ratio(compute_ratio(r["exact"]["cost"], r["prx2"]["cost"])),
     "3L Ratio":         lambda r: fmt_ratio(compute_ratio(r["exact"]["cost"], r["prx3"]["cost"])),
+}
+
+DIAG_FMT_FNS = {
+    "N":                lambda r: f"{r['n']:,}",
     "Exact >1":         lambda r: fmt_ratio(r["exact"]["frac_gt_1"]),
     "Exact Min/Med/Max": lambda r: _fmt_triplet(r["exact"]),
     "2L >1":            lambda r: fmt_ratio(r["prx2"]["frac_gt_1"]),

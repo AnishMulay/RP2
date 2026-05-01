@@ -110,13 +110,10 @@ def _fmt_row(mod, row):
     return [fn(row) for fn in mod.FMT_FNS.values()]
 
 
-def print_results_table(mod, rows):
-    if not rows:
-        print("  (no results)")
-        return
-    headers = [h for h, _ in mod.COL_SPECS]
-    widths  = [max(len(h), w) for h, w in mod.COL_SPECS]
-    fmt_fns = list(mod.FMT_FNS.values())
+def _print_table(col_specs, fmt_fns_by_header, rows):
+    headers = [h for h, _ in col_specs]
+    widths  = [max(len(h), w) for h, w in col_specs]
+    fmt_fns = [fmt_fns_by_header[h] for h in headers]
 
     top = "┌" + "┬".join("─" * (w + 2) for w in widths) + "┐"
     hdr = "│" + "│".join(f" {h:^{w}} " for h, w in zip(headers, widths)) + "│"
@@ -133,16 +130,35 @@ def print_results_table(mod, rows):
     print(bot)
 
 
+def print_results_table(mod, rows):
+    if not rows:
+        print("  (no results)")
+        return
+    _print_table(mod.COL_SPECS, mod.FMT_FNS, rows)
+    if hasattr(mod, "DIAG_COL_SPECS") and hasattr(mod, "DIAG_FMT_FNS"):
+        print()
+        _print_table(mod.DIAG_COL_SPECS, mod.DIAG_FMT_FNS, rows)
+
+
 # ── Markdown section builder ──────────────────────────────────────────────────
 
-def _md_section(mod, rows):
-    return {
+def _md_sections(mod, rows):
+    sections = [{
         "title":     f"Experiment {mod.EXP_ID}: {mod.EXP_NAME}",
         "subtitle":  f"Dataset: {mod.DATASET}",
         "col_specs": mod.COL_SPECS,
         "rows":      rows,
         "fmt_fns":   mod.FMT_FNS,
-    }
+    }]
+    if hasattr(mod, "DIAG_COL_SPECS") and hasattr(mod, "DIAG_FMT_FNS"):
+        sections.append({
+            "title":     f"Experiment {mod.EXP_ID}: {mod.EXP_NAME} Diagnostics",
+            "subtitle":  f"Dataset: {mod.DATASET}",
+            "col_specs": mod.DIAG_COL_SPECS,
+            "rows":      rows,
+            "fmt_fns":   mod.DIAG_FMT_FNS,
+        })
+    return sections
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -206,7 +222,7 @@ def main():
 
         completed[mod.EXP_ID] = True
         all_results[mod.EXP_ID] = rows
-        md_sections.append(_md_section(mod, rows))
+        md_sections.extend(_md_sections(mod, rows))
 
         print(f"\n  ── Results: Exp {mod.EXP_ID} ({elapsed_s:.1f}s total) ──", flush=True)
         print_results_table(mod, rows)
