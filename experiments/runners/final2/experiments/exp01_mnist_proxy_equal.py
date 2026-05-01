@@ -2,7 +2,8 @@
 """
 Experiment 1 — MNIST: Exact OT vs 2-Level Proxy vs 3-Level Proxy
 Sampling: Equal from all 10 digits for both B (blue) and A (red).
-Distance: L1 (Manhattan) on normalised 784-dim pixel vectors.
+Distance: L1 (Manhattan) on probability-normalized 784-dim pixel histograms.
+          Each image sums to 1, so pairwise L1 costs lie in [0, 2].
 """
 
 import math
@@ -102,8 +103,10 @@ def load_mnist_equal(n_samples, seed):
     for arr in (red, blue):
         s = arr.sum(axis=1, keepdims=True)
         np.maximum(s, 1e-8, out=s)
+        # Treat each MNIST image as a probability measure over the pixel grid.
+        # This is the standard OT image-histogram scaling; do not divide by 2,
+        # because these proxy experiments report costs in natural [0, 2] L1 units.
         arr /= s
-        arr /= 2.0
     return torch.from_numpy(red), torch.from_numpy(blue)
 
 
@@ -193,7 +196,7 @@ def run(device, **kwargs):
 
     print(f"\n{'─'*60}", flush=True)
     print(f"  Exp {EXP_ID}: {EXP_NAME}", flush=True)
-    print(f"  Device: {device}  ε={EPSILON}  batch={BATCH_SIZE}", flush=True)
+    print(f"  Device: {device}  ε={EPSILON}  batch={BATCH_SIZE}  L1 range=[0,2]", flush=True)
     print(f"{'─'*60}", flush=True)
 
     rows = []
