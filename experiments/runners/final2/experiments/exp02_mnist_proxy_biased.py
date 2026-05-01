@@ -38,7 +38,7 @@ from shared import (
 EXP_ID = 2
 EXP_NAME = "MNIST — Exact vs 2L-Proxy vs 3L-Proxy (Biased: B=0–4, A=5–9)"
 DATASET = "MNIST"
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = FINAL2_DIR / "data"
 
 N_VALUES = [500, 1_000, 2_000, 3_000, 5_000]
 EPSILON = 0.01
