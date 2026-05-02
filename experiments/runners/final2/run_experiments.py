@@ -174,6 +174,8 @@ def main():
                         help="Path to NYC taxi parquet file (for Exp 5).")
     parser.add_argument("--nyc-day",  default=None,
                         help="Date filter for NYC taxi data (YYYY-MM-DD).")
+    parser.add_argument("--results-dir", default=None,
+                        help="Absolute path to the timestamped run directory for this batch.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -223,6 +225,28 @@ def main():
 
         completed[mod.EXP_ID] = True
         all_results[mod.EXP_ID] = rows
+        if args.results_dir:
+            _json_path = Path(args.results_dir) / f"exp{mod.EXP_ID:02d}.json"
+            try:
+                import json as _json
+                def _nan_safe(obj):
+                    import math as _math
+                    if isinstance(obj, float):
+                        return None if (_math.isnan(obj) or _math.isinf(obj)) else obj
+                    if isinstance(obj, dict):
+                        return {k: _nan_safe(v) for k, v in obj.items()}
+                    if isinstance(obj, list):
+                        return [_nan_safe(v) for v in obj]
+                    return obj
+                _json_path.write_text(
+                    _json.dumps({"exp_id": mod.EXP_ID, "exp_name": mod.EXP_NAME,
+                                 "dataset": mod.DATASET, "rows": _nan_safe(rows)},
+                                indent=2),
+                    encoding="utf-8"
+                )
+                print(f"  Results saved: {_json_path}", flush=True)
+            except Exception as _exc:
+                print(f"  Warning: could not save JSON: {_exc}", flush=True)
         md_sections.extend(_md_sections(mod, rows))
 
         print(f"\n  ── Results: Exp {mod.EXP_ID} ({elapsed_s:.1f}s total) ──", flush=True)
@@ -245,7 +269,10 @@ def main():
 
     # ── Write Markdown ────────────────────────────────────────────────────────
     if md_sections:
-        md_path = get_results_path(RESULTS_DIR)
+        if args.results_dir:
+            md_path = Path(args.results_dir) / f"exp{selected_mods[0].EXP_ID:02d}_results.md"
+        else:
+            md_path = get_results_path(RESULTS_DIR)
         write_markdown(md_path, md_sections)
     else:
         print("\n  No results to write.", flush=True)
