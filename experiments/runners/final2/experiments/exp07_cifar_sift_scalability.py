@@ -32,7 +32,7 @@ from clustered_push_relabel.clustering.simple_precomputed import SimplePrecomput
 from clustered_push_relabel.solvers.simple_bipartite import SimpleGPUSolver
 from clustered_push_relabel.solvers.three_level_bipartite import ThreeLevelGPUSolver
 from shared import (
-    compute_ratio, fmt_time, fmt_cost, fmt_ratio, fmt_iters,
+    compute_ratio, fmt_time, fmt_cost, fmt_ratio, fmt_iters, fmt_bytes,
     run_three_level_precomputed,
 )
 
@@ -60,6 +60,8 @@ COL_SPECS = [
     ("3L Ratio",    9),
     ("2L Iters",   10),
     ("3L Iters",   10),
+    ("2L Peak Mem", 12),
+    ("3L Peak Mem", 12),
 ]
 
 FMT_FNS = {
@@ -74,6 +76,8 @@ FMT_FNS = {
     "3L Ratio":   lambda r: fmt_ratio(compute_ratio(r["exact"]["cost"], r["sol3"]["cost"])),
     "2L Iters":   lambda r: fmt_iters(r["sol2"].get("iters", math.nan)),
     "3L Iters":   lambda r: fmt_iters(r["sol3"].get("iters", math.nan)),
+    "2L Peak Mem": lambda r: fmt_bytes(r["sol2"]["peak_mem_bytes"]),
+    "3L Peak Mem": lambda r: fmt_bytes(r["sol3"]["peak_mem_bytes"]),
 }
 
 
@@ -210,34 +214,40 @@ def _run_solver2(D_br_norm, D_rr_norm, device, diameter):
     c = SimplePrecomputedClustering(epsilon=EPSILON, tile_size=BATCH_SIZE).run(D_rr_norm, D_br_norm)
     _sync(device)
     t0 = time.perf_counter()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     solver = SimpleGPUSolver(None, None, epsilon=EPSILON, batch_size=BATCH_SIZE,
                              verbose=False, diameter=1.0, precomputed_clustering=c)
     solver.solve()
     _sync(device)
+    peak_mem = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else math.nan
     elapsed = (time.perf_counter() - t0) * 1000.0
     n = D_br_norm.shape[0]
     D_cpu = D_br_norm.detach().cpu()
     cost = D_cpu[torch.arange(n), solver.match_B.cpu()].mean().item() * diameter
     iters = solver.iterations
     del solver, c
-    return elapsed, cost, iters
+    return elapsed, cost, iters, peak_mem
 
 
 def _run_solver3(D_br_norm, D_rr_norm, device, diameter):
     c = run_three_level_precomputed(D_rr_norm, D_br_norm, EPSILON, BATCH_SIZE)
     _sync(device)
     t0 = time.perf_counter()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     solver = ThreeLevelGPUSolver(None, None, epsilon=EPSILON, batch_size=BATCH_SIZE,
                                  verbose=False, diameter=1.0, precomputed_clustering=c)
     solver.solve()
     _sync(device)
+    peak_mem = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else math.nan
     elapsed = (time.perf_counter() - t0) * 1000.0
     n = D_br_norm.shape[0]
     D_cpu = D_br_norm.detach().cpu()
     cost = D_cpu[torch.arange(n), solver.match_B.cpu()].mean().item() * diameter
     iters = solver.iterations
     del solver, c
-    return elapsed, cost, iters
+    return elapsed, cost, iters, peak_mem
 
 
 def _safe_exact(fn, label):
@@ -251,12 +261,12 @@ def _safe_exact(fn, label):
 
 def _safe_solver(fn, label, device):
     try:
-        t, c, it = fn()
-        return {"time_ms": t, "cost": c, "iters": it, "status": "ok"}
+        t, c, it, peak_mem = fn()
+        return {"time_ms": t, "cost": c, "iters": it, "peak_mem_bytes": peak_mem, "status": "ok"}
     except Exception as exc:
         print(f"    [{label}] failed: {exc}", flush=True)
         _clear(device)
-        return {"time_ms": math.nan, "cost": math.nan, "iters": math.nan, "status": "fail"}
+        return {"time_ms": math.nan, "cost": math.nan, "iters": math.nan, "peak_mem_bytes": math.nan, "status": "fail"}
 
 
 def run(device, **kwargs):

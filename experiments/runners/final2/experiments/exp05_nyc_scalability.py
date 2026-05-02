@@ -35,7 +35,7 @@ except ImportError:
 
 from clustered_push_relabel.solvers.simple_bipartite import SimpleGPUSolver
 from clustered_push_relabel.solvers.three_level_bipartite import ThreeLevelGPUSolver
-from shared import compute_ratio, fmt_time, fmt_cost, fmt_ratio, fmt_iters
+from shared import compute_ratio, fmt_time, fmt_cost, fmt_ratio, fmt_iters, fmt_bytes
 
 EXP_ID = 5
 EXP_NAME = "NYC Taxi — Exact vs 2L-Solver vs 3L-Solver (Scalability)"
@@ -71,6 +71,8 @@ COL_SPECS = [
     ("3L Ratio",    9),
     ("2L Iters",   10),
     ("3L Iters",   10),
+    ("2L Peak Mem", 12),
+    ("3L Peak Mem", 12),
 ]
 
 FMT_FNS = {
@@ -85,6 +87,8 @@ FMT_FNS = {
     "3L Ratio":   lambda r: fmt_ratio(compute_ratio(r["exact"]["cost"], r["sol3"]["cost"])),
     "2L Iters":   lambda r: fmt_iters(r["sol2"].get("iters", math.nan)),
     "3L Iters":   lambda r: fmt_iters(r["sol3"].get("iters", math.nan)),
+    "2L Peak Mem": lambda r: fmt_bytes(r["sol2"]["peak_mem_bytes"]),
+    "3L Peak Mem": lambda r: fmt_bytes(r["sol3"]["peak_mem_bytes"]),
 }
 
 
@@ -184,30 +188,36 @@ def _run_exact(red_cpu, blue_cpu, diameter):
 
 def _run_solver2(red, blue, device, diameter):
     _clear(device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     solver = SimpleGPUSolver(red, blue, EPSILON, batch_size=BATCH_SIZE, verbose=False, diameter=1.0)
     _sync(device)
     t0 = time.perf_counter()
     solver.solve()
     _sync(device)
+    peak_mem = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else math.nan
     elapsed = (time.perf_counter() - t0) * 1000.0
     cost = _avg_l2(red, blue, solver.match_B) * diameter
     iters = solver.iterations
     del solver
-    return elapsed, cost, iters
+    return elapsed, cost, iters, peak_mem
 
 
 def _run_solver3(red, blue, device, diameter):
     _clear(device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     solver = ThreeLevelGPUSolver(red, blue, EPSILON, batch_size=BATCH_SIZE, verbose=False, diameter=1.0)
     _sync(device)
     t0 = time.perf_counter()
     solver.solve()
     _sync(device)
+    peak_mem = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else math.nan
     elapsed = (time.perf_counter() - t0) * 1000.0
     cost = _avg_l2(red, blue, solver.match_B) * diameter
     iters = solver.iterations
     del solver
-    return elapsed, cost, iters
+    return elapsed, cost, iters, peak_mem
 
 
 def _safe_exact(fn, label):
@@ -221,11 +231,11 @@ def _safe_exact(fn, label):
 
 def _safe_solver(fn, label):
     try:
-        t, c, it = fn()
-        return {"time_ms": t, "cost": c, "iters": it, "status": "ok"}
+        t, c, it, peak_mem = fn()
+        return {"time_ms": t, "cost": c, "iters": it, "peak_mem_bytes": peak_mem, "status": "ok"}
     except Exception as exc:
         print(f"    [{label}] failed: {exc}", flush=True)
-        return {"time_ms": math.nan, "cost": math.nan, "iters": math.nan, "status": "fail"}
+        return {"time_ms": math.nan, "cost": math.nan, "iters": math.nan, "peak_mem_bytes": math.nan, "status": "fail"}
 
 
 def run(device, nyc_data_path=None, nyc_day=None, **kwargs):

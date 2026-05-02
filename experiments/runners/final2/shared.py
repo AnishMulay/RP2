@@ -62,6 +62,52 @@ def compute_ratio(exact, approx):
     return float(approx) / float(exact)
 
 
+def agg_mean(values):
+    vals = [float(v) for v in values if not math.isnan(float(v))]
+    return math.nan if not vals else float(sum(vals) / len(vals))
+
+
+def agg_median(values):
+    vals = [float(v) for v in values if not math.isnan(float(v))]
+    return math.nan if not vals else float(np.median(vals))
+
+
+def agg_std(values):
+    vals = [float(v) for v in values if not math.isnan(float(v))]
+    return math.nan if len(vals) < 2 else float(np.std(vals))
+
+
+def agg_p90(values):
+    vals = [float(v) for v in values if not math.isnan(float(v))]
+    return math.nan if not vals else float(np.percentile(vals, 90))
+
+
+def agg_max(values):
+    vals = [float(v) for v in values if not math.isnan(float(v))]
+    return math.nan if not vals else float(max(vals))
+
+
+def fmt_stat(v):
+    return "N/A" if is_nan(v) else f"{float(v):.4f}"
+
+
+def compute_gamma(match, red, blue, adj_ptr, adj_col):
+    if adj_col.numel() == 0:
+        return math.nan
+
+    pair_costs = (red[match] - blue).abs().sum(dim=1)
+    is_local = torch.zeros(match.shape[0], dtype=torch.bool)
+    for b in range(match.shape[0]):
+        start = adj_ptr[b].item()
+        end = adj_ptr[b + 1].item()
+        is_local[b] = (adj_col[start:end] == match[b]).any()
+
+    total = pair_costs.sum().item()
+    if total <= 0.0:
+        return 0.0
+    return pair_costs[~is_local].sum().item() / total
+
+
 # ── Three-level precomputed clustering ───────────────────────────────────────
 # Builds a dict compatible with ThreeLevelGPUSolver(precomputed_clustering=...)
 # from precomputed (N x N) distance matrices D_rr and D_br.
