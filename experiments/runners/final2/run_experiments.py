@@ -41,9 +41,10 @@ from experiments import (
     exp09_newsgroups_scalability as exp09,
     exp10_mnist_proxy_dissimilar as exp10,
     exp11_landmark_density as exp11,
+    exp12_gamma_validation as exp12,
 )
 
-ALL_MODULES = [exp01, exp02, exp03, exp04, exp05, exp06, exp07, exp08, exp09, exp10, exp11]
+ALL_MODULES = [exp01, exp02, exp03, exp04, exp05, exp06, exp07, exp08, exp09, exp10, exp11, exp12]
 
 RESULTS_DIR = FINAL2_DIR / "results"
 
@@ -92,17 +93,17 @@ def print_menu(completed):
 
 def ask_selection(completed):
     while True:
-        raw = input("  Enter experiment numbers to run  (e.g. 1,2,3  or  all): ").strip()
+        raw = input("  Enter experiment numbers to run  (1–12; e.g. 1,2,3  or  all): ").strip()
         if raw.lower() == "all":
-            return list(range(1, 12))
+            return list(range(1, 13))
         try:
             ids = [int(x.strip()) for x in raw.split(",") if x.strip()]
-            valid = [i for i in ids if 1 <= i <= 11]
+            valid = [i for i in ids if 1 <= i <= 12]
             if not valid:
                 raise ValueError
             return valid
         except ValueError:
-            print("  Invalid input. Please enter comma-separated numbers 1–11 or 'all'.")
+            print("  Invalid input. Please enter comma-separated numbers 1–12 or 'all'.")
 
 
 # ── Table printer for final summary ──────────────────────────────────────────
@@ -191,7 +192,7 @@ def main():
         selected_mods = ALL_MODULES
     elif args.run is not None:
         if args.run.lower() == "all":
-            selected_ids = list(range(1, 12))
+            selected_ids = list(range(1, 13))
         else:
             selected_ids = [int(x.strip()) for x in args.run.split(",") if x.strip()]
         selected_mods = [m for m in ALL_MODULES if m.EXP_ID in selected_ids]
