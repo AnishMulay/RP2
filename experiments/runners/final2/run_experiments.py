@@ -43,9 +43,10 @@ from experiments import (
     exp11_landmark_density as exp11,
     exp12_gamma_validation as exp12,
     exp13_scalability_limits as exp13,
+    exp14_pushrelabel_scalability as exp14,
 )
 
-ALL_MODULES = [exp01, exp02, exp03, exp04, exp05, exp06, exp07, exp08, exp09, exp10, exp11, exp12, exp13]
+ALL_MODULES = [exp01, exp02, exp03, exp04, exp05, exp06, exp07, exp08, exp09, exp10, exp11, exp12, exp13, exp14]
 
 RESULTS_DIR = FINAL2_DIR / "results"
 
@@ -94,17 +95,17 @@ def print_menu(completed):
 
 def ask_selection(completed):
     while True:
-        raw = input("  Enter experiment numbers to run  (1–13; e.g. 1,2,3  or  all): ").strip()
+        raw = input("  Enter experiment numbers to run  (1–14; e.g. 1,2,3  or  all): ").strip()
         if raw.lower() == "all":
-            return list(range(1, 14))
+            return list(range(1, 15))
         try:
             ids = [int(x.strip()) for x in raw.split(",") if x.strip()]
-            valid = [i for i in ids if 1 <= i <= 13]
+            valid = [i for i in ids if 1 <= i <= 14]
             if not valid:
                 raise ValueError
             return valid
         except ValueError:
-            print("  Invalid input. Please enter comma-separated numbers 1–13 or 'all'.")
+            print("  Invalid input. Please enter comma-separated numbers 1–14 or 'all'.")
 
 
 # ── Table printer for final summary ──────────────────────────────────────────
@@ -193,7 +194,7 @@ def main():
         selected_mods = ALL_MODULES
     elif args.run is not None:
         if args.run.lower() == "all":
-            selected_ids = list(range(1, 14))
+            selected_ids = list(range(1, 15))
         else:
             selected_ids = [int(x.strip()) for x in args.run.split(",") if x.strip()]
         selected_mods = [m for m in ALL_MODULES if m.EXP_ID in selected_ids]
@@ -216,7 +217,7 @@ def main():
         ), flush=True)
 
         kwargs = {}
-        if mod.EXP_ID == 5:
+        if mod.EXP_ID in (5, 14):
             if args.nyc_data:
                 kwargs["nyc_data_path"] = args.nyc_data
             if args.nyc_day:
