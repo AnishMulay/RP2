@@ -1039,11 +1039,12 @@ class ThreeLevelGPUSolver(SimpleGPUSolver):
             + y_A_long.unsqueeze(0)
             - V_rows
         )
-        proxy = torch.where(
-            in_adj_B_mask,
-            direct_B_costs,
-            torch.where(in_adj_A1_mask, mid_A1_costs, fallback_A2_proxy),
-        )
+        large = fallback_A2_proxy.new_full(fallback_A2_proxy.shape,
+                                           torch.iinfo(torch.long).max // 4)
+        proxy_3 = torch.where(in_adj_B_mask, direct_B_costs.long(), large)
+        proxy_2 = torch.where(in_adj_A1_mask, mid_A1_costs.long(), large)
+        proxy = torch.minimum(fallback_A2_proxy,
+                              torch.minimum(proxy_2, proxy_3))
         return (
             in_adj_B_mask,
             direct_B_costs,
