@@ -7,6 +7,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH -t 24:00:00
 #SBATCH -p rtx2060super
+#SBATCH --exclude=c34
 
 export PYTHONUNBUFFERED=1
 
