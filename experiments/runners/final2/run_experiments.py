@@ -170,6 +170,8 @@ def main():
     )
     parser.add_argument("--run",      default=None,
                         help="Comma-separated experiment IDs or 'all'.")
+    parser.add_argument("--all", action="store_true",
+                        help="Run all experiments without interactive prompt.")
     parser.add_argument("--nyc-data", default=None,
                         help="Path to NYC taxi parquet file (for Exp 5).")
     parser.add_argument("--nyc-day",  default=None,
@@ -185,16 +187,19 @@ def main():
     completed = {}
 
     # ── Select experiments ────────────────────────────────────────────────────
-    if args.run is not None:
+    if args.all:
+        selected_mods = ALL_MODULES
+    elif args.run is not None:
         if args.run.lower() == "all":
             selected_ids = list(range(1, 12))
         else:
             selected_ids = [int(x.strip()) for x in args.run.split(",") if x.strip()]
+        selected_mods = [m for m in ALL_MODULES if m.EXP_ID in selected_ids]
     else:
         print_menu(completed)
         selected_ids = ask_selection(completed)
+        selected_mods = [m for m in ALL_MODULES if m.EXP_ID in selected_ids]
 
-    selected_mods = [m for m in ALL_MODULES if m.EXP_ID in selected_ids]
     print(f"\n  Will run {len(selected_mods)} experiment(s): "
           f"{', '.join(str(m.EXP_ID) for m in selected_mods)}\n")
 
