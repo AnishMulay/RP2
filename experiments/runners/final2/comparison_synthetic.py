@@ -9,7 +9,6 @@ clouds. Table 2 compares scalable methods on larger point clouds.
 import csv
 import gc
 import math
-import statistics as _statistics
 import sys
 import time
 from datetime import datetime
@@ -37,10 +36,9 @@ MAX_ITERS = 999_999_999
 
 DIAMETER_TILE = 1024
 ACCURACY_SIZES = [1_000, 5_000, 10_000, 15_000]
-ACCURACY_SEEDS = [42, 123, 777, 999, 1337]
-SCALABILITY_SEEDS = [42, 123, 777]
+SEED = 42
 SINKHORN_REGS = [0.1, 0.01, 0.001]
-MAX_SINKHORN_N = 10_000  # N x N float32 matrix = 400 MB at N=10K; skip above this
+MAX_SINKHORN_N = 15_000
 MAX_EXACT_EMD_N = 2_000  # exact EMD is O(N^3); impractical above this
 
 
@@ -122,7 +120,7 @@ def run_exact_emd(A_cuda, B_cuda, diameter):
             f"O(N^3) solver impractical at this size)",
             flush=True,
         )
-        return {"status": "skip", "cost": math.nan, "time": math.nan}
+        return {"status": "skip", "cost": math.nan, "time": math.nan, "peak_gb": 0.0}
 
     try:
         import ot as pot
@@ -145,14 +143,14 @@ def run_exact_emd(A_cuda, B_cuda, diameter):
         cost = float(cost_normalized) * diameter
 
         print(f"  [Exact EMD] Time: {elapsed:.2f}s | Avg Cost: {cost:.5f}", flush=True)
-        return {"status": "ok", "cost": cost, "time": elapsed}
+        return {"status": "ok", "cost": cost, "time": elapsed, "peak_gb": 0.0}
 
     except MemoryError:
         print("  [Exact EMD] OOM", flush=True)
-        return {"status": "oom", "cost": math.nan, "time": math.nan}
+        return {"status": "oom", "cost": math.nan, "time": math.nan, "peak_gb": 0.0}
     except Exception as exc:
         print(f"  [Exact EMD] ERROR: {exc}", flush=True)
-        return {"status": "error", "cost": math.nan, "time": math.nan}
+        return {"status": "error", "cost": math.nan, "time": math.nan, "peak_gb": 0.0}
 
 
 def sinkhorn_has_memory(n):
@@ -173,7 +171,7 @@ def run_sinkhorn_pot(A_cuda, B_cuda, diameter, reg):
     N = A_cuda.shape[0]
 
     if N > MAX_SINKHORN_N:
-        return {"status": "skip", "cost": math.nan, "time": math.nan}
+        return {"status": "skip", "cost": math.nan, "time": math.nan, "peak_gb": math.nan}
 
     has_mem, available, required = sinkhorn_has_memory(N)
     if not has_mem:
@@ -182,12 +180,16 @@ def run_sinkhorn_pot(A_cuda, B_cuda, diameter, reg):
             f"(need {required/1024**3:.2f} GB, have {available/1024**3:.2f} GB)",
             flush=True,
         )
-        return {"status": "oom", "cost": math.nan, "time": math.nan}
+        return {"status": "oom", "cost": math.nan, "time": math.nan, "peak_gb": math.nan}
 
     try:
         import ot as pot
         a = torch.ones(N, device=A_cuda.device, dtype=torch.float32) / N
         b = torch.ones(N, device=A_cuda.device, dtype=torch.float32) / N
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
 
         sync()
         t0 = time.time()
@@ -211,6 +213,7 @@ def run_sinkhorn_pot(A_cuda, B_cuda, diameter, reg):
 
         sync()
         elapsed = time.time() - t0
+        peak_gb = torch.cuda.max_memory_allocated() / 1024**3
 
         # Convergence check: verify marginal constraints directly on T.
         # T must satisfy T.sum(dim=1) == a and T.sum(dim=0) == b.
@@ -227,7 +230,7 @@ def run_sinkhorn_pot(A_cuda, B_cuda, diameter, reg):
                 f"(row_err={row_err:.2e}, col_err={col_err:.2e})",
                 flush=True,
             )
-            return {"status": "dnc", "cost": math.nan, "time": elapsed}
+            return {"status": "dnc", "cost": math.nan, "time": elapsed, "peak_gb": math.nan}
 
         # Soft plan cost: sum_ij T_ij * C_ij = average transport cost under T.
         # Biased upward vs true OT cost by O(reg * entropy(T)).
@@ -243,16 +246,16 @@ def run_sinkhorn_pot(A_cuda, B_cuda, diameter, reg):
             f"(row_err={row_err:.2e}, col_err={col_err:.2e})",
             flush=True,
         )
-        return {"status": "ok", "cost": soft_cost, "time": elapsed}
+        return {"status": "ok", "cost": soft_cost, "time": elapsed, "peak_gb": peak_gb}
 
     except torch.cuda.OutOfMemoryError:
         cleanup()
         print(f"  [Sinkhorn eps_reg={reg}] OOM", flush=True)
-        return {"status": "oom", "cost": math.nan, "time": math.nan}
+        return {"status": "oom", "cost": math.nan, "time": math.nan, "peak_gb": math.nan}
     except Exception as exc:
         cleanup()
         print(f"  [Sinkhorn eps_reg={reg}] ERROR: {exc}", flush=True)
-        return {"status": "error", "cost": math.nan, "time": math.nan}
+        return {"status": "error", "cost": math.nan, "time": math.nan, "peak_gb": math.nan}
 
 
 def run_solver(label, solver_cls, A, B, diameter):
@@ -264,11 +267,13 @@ def run_solver(label, solver_cls, A, B, diameter):
     t_solve_end = None
 
     try:
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
         sync()
         t_cluster_start = time.time()
         solver = solver_cls(
-            A,
-            B,
+            A, B,
             epsilon=EPSILON,
             batch_size=BATCH_SIZE,
             verbose=False,
@@ -282,13 +287,32 @@ def run_solver(label, solver_cls, A, B, diameter):
             flush=True,
         )
     except torch.cuda.OutOfMemoryError:
-        cleanup()
-        print(f"  [{label}] OOM during CLUSTERING -- see last [MEM] line above", flush=True)
-        return {"status": "oom", "phase": "clustering", "time": math.nan, "cost": math.nan}
+        peak_oom = torch.cuda.max_memory_allocated() / 1024**3
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(
+            f"  [{label}] OOM during CLUSTERING "
+            f"(peak before OOM: {peak_oom:.3f} GB) -- see last [MEM] line above",
+            flush=True,
+        )
+        return {
+            "status": "oom",
+            "phase": "clustering",
+            "time": math.nan,
+            "cost": math.nan,
+            "peak_gb": peak_oom,
+        }
     except Exception as exc:
-        cleanup()
+        gc.collect()
+        torch.cuda.empty_cache()
         print(f"  [{label}] ERROR during CLUSTERING: {exc}", flush=True)
-        return {"status": "error", "phase": "clustering", "time": math.nan, "cost": math.nan}
+        return {
+            "status": "error",
+            "phase": "clustering",
+            "time": math.nan,
+            "cost": math.nan,
+            "peak_gb": math.nan,
+        }
 
     match_B = None
     try:
@@ -297,14 +321,22 @@ def run_solver(label, solver_cls, A, B, diameter):
         match_B = solver.solve()
         sync()
         t_solve_end = time.time()
+        peak_gb = torch.cuda.max_memory_allocated() / 1024**3
     except torch.cuda.OutOfMemoryError:
+        peak_oom = torch.cuda.max_memory_allocated() / 1024**3
         cleanup()
         phase = getattr(solver, "_oom_phase", "unknown")
         print(f"  [{label}] OOM during SOLVE at sub-step: {phase}", flush=True)
         del solver
         solver = None
         cleanup()
-        return {"status": "oom", "phase": f"solve:{phase}", "time": math.nan, "cost": math.nan}
+        return {
+            "status": "oom",
+            "phase": f"solve:{phase}",
+            "time": math.nan,
+            "cost": math.nan,
+            "peak_gb": peak_oom,
+        }
     except Exception as exc:
         cleanup()
         phase = getattr(solver, "_oom_phase", "unknown")
@@ -312,7 +344,13 @@ def run_solver(label, solver_cls, A, B, diameter):
         del solver
         solver = None
         cleanup()
-        return {"status": "error", "phase": f"solve:{phase}", "time": math.nan, "cost": math.nan}
+        return {
+            "status": "error",
+            "phase": f"solve:{phase}",
+            "time": math.nan,
+            "cost": math.nan,
+            "peak_gb": math.nan,
+        }
 
     try:
         if match_B is None:
@@ -332,11 +370,18 @@ def run_solver(label, solver_cls, A, B, diameter):
             "time_cluster": t_cluster_end - t_cluster_start,
             "time_solve": t_solve_end - t_solve_start,
             "cost": cost,
+            "peak_gb": peak_gb,
         }
     except Exception as exc:
         cleanup()
         print(f"  [{label}] ERROR during cost computation: {exc}", flush=True)
-        return {"status": "error", "phase": "cost", "time": math.nan, "cost": math.nan}
+        return {
+            "status": "error",
+            "phase": "cost",
+            "time": math.nan,
+            "cost": math.nan,
+            "peak_gb": math.nan,
+        }
     finally:
         del solver
         cleanup()
@@ -392,28 +437,13 @@ def progress_pair(result):
     return f"{result['status'].upper()} / {result['status'].upper()}"
 
 
-def _aggregate(rows, n, method, eps_or_blur, key):
-    vals = [
-        r["result"].get(key, math.nan)
-        for r in rows
-        if r["n"] == n
-        and r["method"] == method
-        and str(r["epsilon_or_blur"]) == str(eps_or_blur)
-        and r["result"]["status"] == "ok"
-        and math.isfinite(r["result"].get(key, math.nan))
-    ]
-    if not vals:
-        return math.nan, math.nan
-    mean = sum(vals) / len(vals)
-    std = _statistics.stdev(vals) if len(vals) > 1 else 0.0
-    return mean, std
-
-
-def _fmt_mean_std(mean, std, decimals):
-    if not math.isfinite(mean):
-        return "N/A"
-    fmt = f".{decimals}f"
-    return f"{mean:{fmt}}±{std:{fmt}}"
+def peak_value(result, is_cpu=False):
+    if is_cpu:
+        return "CPU"
+    peak_gb = result.get("peak_gb", math.nan)
+    if math.isfinite(peak_gb):
+        return f"{peak_gb:.3f}"
+    return result_value(result, "time")
 
 
 def print_table(title, headers, table):
@@ -432,33 +462,24 @@ def print_accuracy_table(rows):
         "N",
         "Method",
         "eps/blur",
-        "Time (s) mean±std",
-        "Cost mean±std",
-        "Δ mean (%)",
+        "Time (s)",
+        "Avg Cost or Divergence",
+        "Delta from Exact (%)",
+        "Peak GPU (GB)",
     ]
     table = []
-    seen = set()
-    groups = []
     for row in rows:
-        key = (row["n"], row["method"], row["epsilon_or_blur"])
-        if key not in seen:
-            seen.add(key)
-            groups.append(key)
-    for n, method, epsilon_or_blur in groups:
-        time_mean, time_std = _aggregate(rows, n, method, epsilon_or_blur, "time")
-        cost_mean, cost_std = _aggregate(rows, n, method, epsilon_or_blur, "cost")
-        exact_mean, _ = _aggregate(rows, n, "Exact EMD", "", "cost")
-        delta = math.nan
-        if math.isfinite(cost_mean) and math.isfinite(exact_mean):
-            delta = (cost_mean - exact_mean) / exact_mean * 100.0
+        exact_cost = row["exact_cost"]
+        is_cpu = row["method"] == "Exact EMD"
         table.append(
             [
-                f"{n:,}",
-                method,
-                epsilon_or_blur,
-                _fmt_mean_std(time_mean, time_std, 2),
-                _fmt_mean_std(cost_mean, cost_std, 5),
-                f"{delta:.2f}" if math.isfinite(delta) else "N/A",
+                f"{row['n']:,}",
+                row["method"],
+                row["epsilon_or_blur"],
+                result_value(row["result"], "time"),
+                result_value(row["result"], "cost"),
+                delta_value(row["result"], exact_cost),
+                peak_value(row["result"], is_cpu=is_cpu),
             ]
         )
     print_table("Table 1 - Accuracy", headers, table)
@@ -474,28 +495,22 @@ def print_scalability_table(rows):
         "N",
         "2-Level Time (s)",
         "2-Level Cost",
+        "2-Level Peak (GB)",
         "3-Level Time (s)",
         "3-Level Cost",
+        "3-Level Peak (GB)",
     ]
     table = []
     for row in rows:
-        n = row["n"]
-        flat_rows = []
-        for result in row["sol2"]:
-            flat_rows.append({"n": n, "method": "sol2", "epsilon_or_blur": "", "result": result})
-        for result in row["sol3"]:
-            flat_rows.append({"n": n, "method": "sol3", "epsilon_or_blur": "", "result": result})
-        sol2_time_mean, sol2_time_std = _aggregate(flat_rows, n, "sol2", "", "time")
-        sol2_cost_mean, sol2_cost_std = _aggregate(flat_rows, n, "sol2", "", "cost")
-        sol3_time_mean, sol3_time_std = _aggregate(flat_rows, n, "sol3", "", "time")
-        sol3_cost_mean, sol3_cost_std = _aggregate(flat_rows, n, "sol3", "", "cost")
         table.append(
             [
-                f"{n:,}",
-                _fmt_mean_std(sol2_time_mean, sol2_time_std, 2),
-                _fmt_mean_std(sol2_cost_mean, sol2_cost_std, 5),
-                _fmt_mean_std(sol3_time_mean, sol3_time_std, 2),
-                _fmt_mean_std(sol3_cost_mean, sol3_cost_std, 5),
+                f"{row['n']:,}",
+                result_value(row["sol2"], "time"),
+                result_value(row["sol2"], "cost"),
+                peak_value(row["sol2"]),
+                result_value(row["sol3"], "time"),
+                result_value(row["sol3"], "cost"),
+                peak_value(row["sol3"]),
             ]
         )
     print_table("Table 2 - Scalability", headers, table)
@@ -509,12 +524,12 @@ def save_accuracy_csv(rows, stamp):
         writer.writerow(
             [
                 "N",
-                "seed",
                 "Method",
                 "epsilon_or_blur",
                 "time_s",
                 "cost",
                 "delta_from_exact_pct",
+                "peak_gpu_gb",
                 "cost_type",
                 "hardware",
             ]
@@ -525,12 +540,12 @@ def save_accuracy_csv(rows, stamp):
             writer.writerow(
                 [
                     row["n"],
-                    row["seed"],
                     row["method"],
                     row["epsilon_or_blur"],
                     csv_result_value(result, "time"),
                     csv_result_value(result, "cost"),
                     csv_float(delta),
+                    csv_float(result.get("peak_gb", math.nan)),
                     row["cost_type"],
                     row["hardware"],
                 ]
@@ -548,33 +563,27 @@ def save_scalability_csv(rows, stamp):
                 "N",
                 "two_level_time_s",
                 "two_level_cost",
+                "two_level_peak_gb",
                 "two_level_status",
                 "three_level_time_s",
                 "three_level_cost",
+                "three_level_peak_gb",
                 "three_level_status",
                 "sinkhorn_pot",
             ]
         )
         for row in rows:
-            n = row["n"]
-            flat_rows = []
-            for result in row["sol2"]:
-                flat_rows.append({"n": n, "method": "sol2", "epsilon_or_blur": "", "result": result})
-            for result in row["sol3"]:
-                flat_rows.append({"n": n, "method": "sol3", "epsilon_or_blur": "", "result": result})
-            sol2_time_mean, sol2_time_std = _aggregate(flat_rows, n, "sol2", "", "time")
-            sol2_cost_mean, sol2_cost_std = _aggregate(flat_rows, n, "sol2", "", "cost")
-            sol3_time_mean, sol3_time_std = _aggregate(flat_rows, n, "sol3", "", "time")
-            sol3_cost_mean, sol3_cost_std = _aggregate(flat_rows, n, "sol3", "", "cost")
             writer.writerow(
                 [
-                    n,
-                    _fmt_mean_std(sol2_time_mean, sol2_time_std, 2),
-                    _fmt_mean_std(sol2_cost_mean, sol2_cost_std, 5),
-                    "ok" if math.isfinite(sol2_time_mean) else "N/A",
-                    _fmt_mean_std(sol3_time_mean, sol3_time_std, 2),
-                    _fmt_mean_std(sol3_cost_mean, sol3_cost_std, 5),
-                    "ok" if math.isfinite(sol3_time_mean) else "N/A",
+                    row["n"],
+                    csv_result_value(row["sol2"], "time"),
+                    csv_result_value(row["sol2"], "cost"),
+                    csv_float(row["sol2"].get("peak_gb", math.nan)),
+                    row["sol2"]["status"],
+                    csv_result_value(row["sol3"], "time"),
+                    csv_result_value(row["sol3"], "cost"),
+                    csv_float(row["sol3"].get("peak_gb", math.nan)),
+                    row["sol3"]["status"],
                     "N/A (N x N matrix)",
                 ]
             )
@@ -585,7 +594,6 @@ def save_scalability_csv(rows, stamp):
 def append_accuracy_row(
     rows,
     n,
-    seed,
     method,
     epsilon_or_blur,
     result,
@@ -596,7 +604,6 @@ def append_accuracy_row(
     rows.append(
         {
             "n": n,
-            "seed": seed,
             "method": method,
             "epsilon_or_blur": epsilon_or_blur,
             "result": result,
@@ -608,106 +615,99 @@ def append_accuracy_row(
 
 
 def run_accuracy_phase():
-    print("\n=== Table 1: Accuracy ===", flush=True)
     print(
-        "\nNote: Sinkhorn eps_reg in {0.1, 0.01, 0.001} spans high/medium/low "
-        "regularization. Our solver eps=0.01 is an additive per-pair error bound "
-        "(different quantity). Sinkhorn soft-plan costs are biased upward by "
-        "entropic smoothing; Delta from Exact includes this bias.",
-        flush=True,
-    )
-    print(
-        f"Exact EMD runs only for N <= {MAX_EXACT_EMD_N} (O(N^3) CPU solver).\n"
-        f"Sinkhorn runs only for N <= {MAX_SINKHORN_N} (N x N GPU memory limit).\n",
+        "\n=== Table 1: Accuracy ===\n"
+        f"Sizes: {ACCURACY_SIZES}\n"
+        f"Exact EMD: N <= {MAX_EXACT_EMD_N} only (O(N^3) CPU solver).\n"
+        f"Sinkhorn:  N <= {MAX_SINKHORN_N} only (N x N GPU matrix).\n"
+        "Peak GPU memory measured per solver via torch.cuda.reset_peak_memory_stats()\n"
+        "+ torch.cuda.max_memory_allocated(). GPU cleared between every solver call.\n"
+        "Sinkhorn soft-plan costs are biased upward by entropic smoothing.\n"
+        "Delta from Exact includes this bias. Our solver eps=0.01 is an additive\n"
+        "per-pair error bound -- a different quantity from Sinkhorn eps_reg.\n",
         flush=True,
     )
     rows = []
 
     for n in ACCURACY_SIZES:
         print(f"\n=== Accuracy N = {n:,} ===", flush=True)
-        for seed in ACCURACY_SEEDS:
-            torch.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
+        torch.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
 
-            try:
-                A, B, diameter = make_data(n)
-            except torch.cuda.OutOfMemoryError:
-                cleanup()
-                print(f"  DATA OOM at N={n}, seed={seed}; skipping.", flush=True)
-                continue
-            except Exception as exc:
-                cleanup()
-                print(f"  DATA ERROR at N={n}, seed={seed}: {exc}; skipping.", flush=True)
-                continue
-
-            print(f"--- Accuracy N = {n:,}, seed = {seed} ---", flush=True)
-            alloc, reserved = gpu_mem_gb()
-            print(
-                f"GPU Memory: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved",
-                flush=True,
-            )
-
+        try:
+            A, B, diameter = make_data(n)
+        except torch.cuda.OutOfMemoryError:
             cleanup()
-            exact = run_exact_emd(A, B, diameter)
-            exact_cost = exact["cost"] if exact["status"] == "ok" else math.nan
+            print(f"  DATA OOM at N={n}; skipping.", flush=True)
+            continue
+        except Exception as exc:
             cleanup()
+            print(f"  DATA ERROR at N={n}: {exc}; skipping.", flush=True)
+            continue
+
+        alloc, reserved = gpu_mem_gb()
+        print(
+            f"GPU Memory: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved",
+            flush=True,
+        )
+
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+        exact = run_exact_emd(A, B, diameter)
+        exact_cost = exact["cost"] if exact["status"] == "ok" else math.nan
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+        append_accuracy_row(
+            rows,
+            n,
+            "Exact EMD",
+            "",
+            exact,
+            exact_cost,
+            "hard_matching_cost",
+            "CPU (single-thread C++)",
+        )
+
+        for reg in SINKHORN_REGS:
+            sinkhorn = run_sinkhorn_pot(A, B, diameter, reg)
+            gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
             append_accuracy_row(
                 rows,
                 n,
-                seed,
-                "Exact EMD",
-                "",
-                exact,
+                "Sinkhorn (POT)",
+                reg,
+                sinkhorn,
                 exact_cost,
-                "hard_matching_cost",
-                "CPU (single-thread C++)",
-            )
-
-            for reg in SINKHORN_REGS:
-                cleanup()
-                sinkhorn = run_sinkhorn_pot(A, B, diameter, reg)
-                append_accuracy_row(
-                    rows,
-                    n,
-                    seed,
-                    "Sinkhorn (POT)",
-                    reg,
-                    sinkhorn,
-                    exact_cost,
-                    "soft_plan_cost",
-                    "GPU (RTX 2060 Super, 8GB VRAM)",
-                )
-
-            cleanup()
-            sol2 = run_solver("2-Level", SimpleGPUSolver, A, B, diameter)
-            append_accuracy_row(
-                rows,
-                n,
-                seed,
-                "2-Level Push-Relabel",
-                EPSILON,
-                sol2,
-                exact_cost,
-                "hard_matching_cost",
+                "soft_plan_cost",
                 "GPU (RTX 2060 Super, 8GB VRAM)",
             )
 
-            cleanup()
-            sol3 = run_solver("3-Level", ThreeLevelGPUSolver, A, B, diameter)
-            append_accuracy_row(
-                rows,
-                n,
-                seed,
-                "3-Level Push-Relabel",
-                EPSILON,
-                sol3,
-                exact_cost,
-                "hard_matching_cost",
-                "GPU (RTX 2060 Super, 8GB VRAM)",
-            )
+        sol2 = run_solver("2-Level", SimpleGPUSolver, A, B, diameter)
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+        append_accuracy_row(
+            rows,
+            n,
+            "2-Level Push-Relabel",
+            EPSILON,
+            sol2,
+            exact_cost,
+            "hard_matching_cost",
+            "GPU (RTX 2060 Super, 8GB VRAM)",
+        )
 
-            del A, B
-            cleanup()
+        sol3 = run_solver("3-Level", ThreeLevelGPUSolver, A, B, diameter)
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+        append_accuracy_row(
+            rows,
+            n,
+            "3-Level Push-Relabel",
+            EPSILON,
+            sol3,
+            exact_cost,
+            "hard_matching_cost",
+            "GPU (RTX 2060 Super, 8GB VRAM)",
+        )
+
+        del A, B
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
 
     print_accuracy_table(rows)
     return rows
@@ -719,6 +719,8 @@ def run_scalability_phase():
     rows = []
     sol2_active = True
     sol3_active = True
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
 
     for n in scalability_n_values():
         print(f"\n=== Scalability N = {n:,} ===", flush=True)
@@ -728,62 +730,52 @@ def run_scalability_phase():
             flush=True,
         )
 
-        sol2_results = []
-        sol3_results = []
-        sol2_ever_ok = False
-        sol3_ever_ok = False
-
-        for seed in SCALABILITY_SEEDS:
-            torch.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-
-            try:
-                A, B, diameter = make_data(n)
-            except torch.cuda.OutOfMemoryError:
-                cleanup()
-                print(f"  DATA OOM at N={n}, seed={seed}; skipping seed.", flush=True)
-                sol2_results.append({"status": "oom", "time": math.nan, "cost": math.nan})
-                sol3_results.append({"status": "oom", "time": math.nan, "cost": math.nan})
-                continue
-            except Exception as exc:
-                cleanup()
-                print(f"  DATA ERROR at N={n}, seed={seed}: {exc}; skipping seed.", flush=True)
-                sol2_results.append({"status": "error", "time": math.nan, "cost": math.nan})
-                sol3_results.append({"status": "error", "time": math.nan, "cost": math.nan})
-                continue
-
-            if sol2_active:
-                cleanup()
-                sol2 = run_solver("2-Level", SimpleGPUSolver, A, B, diameter)
-            else:
-                sol2 = {"status": "oom", "time": math.nan, "cost": math.nan}
-                print("  [2-Level] OOM (skipped)", flush=True)
-            sol2_results.append(sol2)
-            if sol2["status"] == "ok":
-                sol2_ever_ok = True
-
-            if sol3_active:
-                cleanup()
-                sol3 = run_solver("3-Level", ThreeLevelGPUSolver, A, B, diameter)
-            else:
-                sol3 = {"status": "oom", "time": math.nan, "cost": math.nan}
-                print("  [3-Level] OOM (skipped)", flush=True)
-            sol3_results.append(sol3)
-            if sol3["status"] == "ok":
-                sol3_ever_ok = True
-
-            del A, B
+        try:
+            A, B, diameter = make_data(n)
+        except torch.cuda.OutOfMemoryError:
             cleanup()
+            print(f"DATA OOM while generating or normalizing N={n:,}; stopping.", flush=True)
+            break
+        except Exception as exc:
+            cleanup()
+            print(f"DATA ERROR at N={n:,}: {exc}; stopping.", flush=True)
+            break
 
-        if all(r["status"] == "oom" for r in sol2_results):
-            sol2_active = False
-        if all(r["status"] == "oom" for r in sol3_results):
-            sol3_active = False
+        if sol2_active:
+            gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+            sol2 = run_solver("2-Level", SimpleGPUSolver, A, B, diameter)
+            if sol2["status"] == "oom":
+                sol2_active = False
+        else:
+            sol2 = {"status": "oom", "time": math.nan, "cost": math.nan, "peak_gb": math.nan}
+            print("  [2-Level] OOM", flush=True)
 
-        rows.append({"n": n, "sol2": sol2_results, "sol3": sol3_results})
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
 
+        if sol3_active:
+            sol3 = run_solver("3-Level", ThreeLevelGPUSolver, A, B, diameter)
+            if sol3["status"] == "oom":
+                sol3_active = False
+        else:
+            sol3 = {"status": "oom", "time": math.nan, "cost": math.nan, "peak_gb": math.nan}
+            print("  [3-Level] OOM", flush=True)
+
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+
+        rows.append({"n": n, "sol2": sol2, "sol3": sol3})
+        print(
+            f"Row: {n:,} | 2-Level {progress_pair(sol2)} | 3-Level {progress_pair(sol3)}",
+            flush=True,
+        )
+
+        stop_for_error = sol2["status"] == "error" or sol3["status"] == "error"
+        del A, B
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+        if stop_for_error:
+            print("Unrecoverable solver error recorded; stopping.", flush=True)
+            break
         if not sol2_active and not sol3_active:
-            print("Both solvers OOMed on all seeds; stopping.", flush=True)
+            print("Both push-relabel solvers have OOMed; stopping.", flush=True)
             break
 
     print_scalability_table(rows)
