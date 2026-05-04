@@ -2,9 +2,9 @@
 """
 Experiment control file — Final2
 =================================
-Presents an interactive checklist of all 10 experiments, runs selected ones
-with live terminal progress, prints a final summary table, and writes every
-result set to a timestamped Markdown file under results/.
+Presents an interactive checklist of all final2 experiments, runs selected
+ones with live terminal progress, prints a final summary table, and writes
+every result set to a timestamped Markdown file under results/.
 
 Usage:
   python run_experiments.py                     # interactive menu
@@ -44,9 +44,10 @@ from experiments import (
     exp12_gamma_validation as exp12,
     exp13_scalability_limits as exp13,
     exp14_pushrelabel_scalability as exp14,
+    exp15_old_vs_new_proxy as exp15,
 )
 
-ALL_MODULES = [exp01, exp02, exp03, exp04, exp05, exp06, exp07, exp08, exp09, exp10, exp11, exp12, exp13, exp14]
+ALL_MODULES = [exp01, exp02, exp03, exp04, exp05, exp06, exp07, exp08, exp09, exp10, exp11, exp12, exp13, exp14, exp15]
 
 RESULTS_DIR = FINAL2_DIR / "results"
 
@@ -95,17 +96,17 @@ def print_menu(completed):
 
 def ask_selection(completed):
     while True:
-        raw = input("  Enter experiment numbers to run  (1–14; e.g. 1,2,3  or  all): ").strip()
+        raw = input("  Enter experiment numbers to run  (1–15; e.g. 1,2,3  or  all): ").strip()
         if raw.lower() == "all":
-            return list(range(1, 15))
+            return list(range(1, 16))
         try:
             ids = [int(x.strip()) for x in raw.split(",") if x.strip()]
-            valid = [i for i in ids if 1 <= i <= 14]
+            valid = [i for i in ids if 1 <= i <= 15]
             if not valid:
                 raise ValueError
             return valid
         except ValueError:
-            print("  Invalid input. Please enter comma-separated numbers 1–14 or 'all'.")
+            print("  Invalid input. Please enter comma-separated numbers 1–15 or 'all'.")
 
 
 # ── Table printer for final summary ──────────────────────────────────────────
@@ -194,7 +195,7 @@ def main():
         selected_mods = ALL_MODULES
     elif args.run is not None:
         if args.run.lower() == "all":
-            selected_ids = list(range(1, 15))
+            selected_ids = list(range(1, 16))
         else:
             selected_ids = [int(x.strip()) for x in args.run.split(",") if x.strip()]
         selected_mods = [m for m in ALL_MODULES if m.EXP_ID in selected_ids]
