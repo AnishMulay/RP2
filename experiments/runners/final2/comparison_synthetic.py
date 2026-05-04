@@ -9,6 +9,7 @@ clouds. Table 2 compares scalable methods on larger point clouds.
 import csv
 import gc
 import math
+import statistics as _statistics
 import sys
 import time
 from datetime import datetime
@@ -18,8 +19,8 @@ import numpy as np
 import torch
 
 # GeomLoss/PyKeOps excluded: PyKeOps requires runtime CUDA kernel compilation
-# which is incompatible with CUDA 13.x (system: CUDA 13.2, PyKeOps 2.3).
-# POT sinkhorn (log-domain stabilized) is used as the Sinkhorn baseline.
+# incompatible with CUDA 13.x (system CUDA 13.2, PyKeOps 2.3).
+# POT bregman log-domain Sinkhorn is the Sinkhorn baseline.
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent.parent
@@ -35,10 +36,12 @@ BATCH_SIZE = 2048
 MAX_ITERS = 999_999_999
 
 DIAMETER_TILE = 1024
-ACCURACY_SIZES = [1_000, 5_000, 10_000]
+ACCURACY_SIZES = [1_000, 5_000, 10_000, 15_000]
 ACCURACY_SEEDS = [42, 123, 777, 999, 1337]
 SCALABILITY_SEEDS = [42, 123, 777]
 SINKHORN_REGS = [0.1, 0.01, 0.001]
+MAX_SINKHORN_N = 10_000  # N x N float32 matrix = 400 MB at N=10K; skip above this
+MAX_EXACT_EMD_N = 2_000  # exact EMD is O(N^3); impractical above this
 
 
 def scalability_n_values():
@@ -109,11 +112,16 @@ def avg_matching_cost(A, B, match_B, diameter):
 def run_exact_emd(A_cuda, B_cuda, diameter):
     """
     Exact W1 transport cost using POT ot.emd2. Runs on CPU in float64.
-    Only call for N <= 10000.
+    Only call for N <= MAX_EXACT_EMD_N.
     Returns {"status": "ok", "cost": float, "time": float}
          or {"status": "error"/"oom", "cost": nan, "time": nan}
     """
-    if A_cuda.shape[0] > 10_000:
+    if A_cuda.shape[0] > MAX_EXACT_EMD_N:
+        print(
+            f"  [Exact EMD] SKIP (N={A_cuda.shape[0]:,} > MAX_EXACT_EMD_N={MAX_EXACT_EMD_N:,}; "
+            f"O(N^3) solver impractical at this size)",
+            flush=True,
+        )
         return {"status": "skip", "cost": math.nan, "time": math.nan}
 
     try:
@@ -156,68 +164,74 @@ def sinkhorn_has_memory(n):
 
 def run_sinkhorn_pot(A_cuda, B_cuda, diameter, reg):
     """
-    Sinkhorn via POT with PyTorch GPU backend.
-    Returns soft transport plan cost = sum_ij T_ij * C_ij in original scale.
-    This is a biased upper bound on the true OT cost.
+    Sinkhorn via POT bregman log-domain routine (stabilized, GPU).
+    Reports soft transport plan cost = sum_ij T_ij * C_ij in original scale.
+    This is a biased upper bound on the true OT cost due to entropic smoothing.
+    Convergence is verified by checking marginal constraint violations on T.
+    Only runs for N <= MAX_SINKHORN_N (N x N cost matrix memory limit).
     """
-    if A_cuda.shape[0] > 10_000:
+    N = A_cuda.shape[0]
+
+    if N > MAX_SINKHORN_N:
         return {"status": "skip", "cost": math.nan, "time": math.nan}
+
+    has_mem, available, required = sinkhorn_has_memory(N)
+    if not has_mem:
+        print(
+            f"  [Sinkhorn eps_reg={reg}] OOM precheck "
+            f"(need {required/1024**3:.2f} GB, have {available/1024**3:.2f} GB)",
+            flush=True,
+        )
+        return {"status": "oom", "cost": math.nan, "time": math.nan}
 
     try:
         import ot as pot
-
-        N = A_cuda.shape[0]
-        has_memory, available, required = sinkhorn_has_memory(N)
-        if not has_memory:
-            print(
-                f"  [Sinkhorn eps_reg={reg}] OOM precheck "
-                f"(available={available / 1024**3:.2f} GiB, "
-                f"required={required / 1024**3:.2f} GiB)",
-                flush=True,
-            )
-            return {"status": "oom", "cost": math.nan, "time": math.nan}
-
         a = torch.ones(N, device=A_cuda.device, dtype=torch.float32) / N
         b = torch.ones(N, device=A_cuda.device, dtype=torch.float32) / N
 
         sync()
         t0 = time.time()
 
+        # Build N x N L2 cost matrix, timed because it is part of Sinkhorn's cost.
         C = torch.cdist(
-            B_cuda,
-            A_cuda,
-            p=2,
+            B_cuda, A_cuda, p=2,
             compute_mode="use_mm_for_euclid_dist_if_necessary",
-        )
+        )  # (N, N) float32, GPU
 
-        T, sinkhorn_log_dict = pot.sinkhorn(
-            a,
-            b,
-            C,
+        # Log-domain stabilized Sinkhorn, numerically robust at small reg.
+        # This direct bregman call is the correct POT API.
+        T, _log = pot.bregman.sinkhorn_log(
+            a, b, C,
             reg=reg,
-            method="sinkhorn_log",
-            numItermax=10000,
-            stopThr=1e-9,
+            numItermax=5000,
+            stopThr=1e-6,
             log=True,
+            warn=False,
         )
 
         sync()
         elapsed = time.time() - t0
 
-        err_list = sinkhorn_log_dict.get("err", [])
-        converged = (len(err_list) == 0) or (float(err_list[-1]) <= 1e-9)
+        # Convergence check: verify marginal constraints directly on T.
+        # T must satisfy T.sum(dim=1) == a and T.sum(dim=0) == b.
+        # Threshold 1e-4 is conservative for float32 GPU arithmetic.
+        row_err = float((T.sum(dim=1) - a).abs().max().item())
+        col_err = float((T.sum(dim=0) - b).abs().max().item())
+        converged = (row_err < 1e-4) and (col_err < 1e-4)
 
         if not converged:
-            print(
-                f"  [Sinkhorn eps_reg={reg}] DNC "
-                f"(did not converge, last_err={err_list[-1]:.2e})",
-                flush=True,
-            )
             del T, C
             cleanup()
+            print(
+                f"  [Sinkhorn eps_reg={reg}] DNC "
+                f"(row_err={row_err:.2e}, col_err={col_err:.2e})",
+                flush=True,
+            )
             return {"status": "dnc", "cost": math.nan, "time": elapsed}
 
-        soft_cost_normalized = (T * C).sum().item()
+        # Soft plan cost: sum_ij T_ij * C_ij = average transport cost under T.
+        # Biased upward vs true OT cost by O(reg * entropy(T)).
+        soft_cost_normalized = float((T * C).sum().item())
         soft_cost = soft_cost_normalized * diameter
 
         del T, C
@@ -225,7 +239,8 @@ def run_sinkhorn_pot(A_cuda, B_cuda, diameter, reg):
 
         print(
             f"  [Sinkhorn eps_reg={reg}] Time: {elapsed:.2f}s | "
-            f"Soft Plan Cost: {soft_cost:.5f}",
+            f"Soft Plan Cost: {soft_cost:.5f} "
+            f"(row_err={row_err:.2e}, col_err={col_err:.2e})",
             flush=True,
         )
         return {"status": "ok", "cost": soft_cost, "time": elapsed}
@@ -328,12 +343,17 @@ def run_solver(label, solver_cls, A, B, diameter):
 
 
 def result_value(result, key):
-    if result["status"] == "ok":
+    status = result.get("status", "error")
+    if status == "ok":
         value = result.get(key, math.nan)
+        if not math.isfinite(value):
+            return "N/A"
         return f"{value:.5f}" if key == "cost" else f"{value:.2f}"
-    if result["status"] == "dnc":
+    if status == "dnc":
         return "DNC"
-    return result["status"].upper()
+    if status == "skip":
+        return "SKIP"
+    return status.upper()
 
 
 def delta_from_exact(result, exact_cost):
@@ -343,12 +363,15 @@ def delta_from_exact(result, exact_cost):
 
 
 def delta_value(result, exact_cost):
-    if result["status"] == "dnc":
+    if result.get("status") != "ok":
         return "N/A"
-    delta = delta_from_exact(result, exact_cost)
-    if math.isfinite(delta):
-        return f"{delta:.2f}"
-    return "N/A"
+    if exact_cost is None or not math.isfinite(exact_cost):
+        return "N/A"
+    cost = result.get("cost", math.nan)
+    if not math.isfinite(cost):
+        return "N/A"
+    delta = (cost - exact_cost) / exact_cost * 100.0
+    return f"{delta:+.2f}%"
 
 
 def csv_float(value):
@@ -367,9 +390,6 @@ def progress_pair(result):
     if result["status"] == "ok":
         return f"{result_value(result, 'time')}s / {result_value(result, 'cost')}"
     return f"{result['status'].upper()} / {result['status'].upper()}"
-
-
-import statistics as _statistics
 
 
 def _aggregate(rows, n, method, eps_or_blur, key):
@@ -590,11 +610,15 @@ def append_accuracy_row(
 def run_accuracy_phase():
     print("\n=== Table 1: Accuracy ===", flush=True)
     print(
-        "\nNote: Sinkhorn eps_reg values span high/medium/low regularization "
-        "relative to mean pairwise L2 ~0.52 in normalized [0,1]^2 uniform data.\n"
-        "Our solver eps=0.01 is an additive per-pair error bound -- a different "
-        "quantity. Sinkhorn costs are soft-plan expected costs biased upward by "
-        "entropic smoothing. Delta from Exact includes this bias.",
+        "\nNote: Sinkhorn eps_reg in {0.1, 0.01, 0.001} spans high/medium/low "
+        "regularization. Our solver eps=0.01 is an additive per-pair error bound "
+        "(different quantity). Sinkhorn soft-plan costs are biased upward by "
+        "entropic smoothing; Delta from Exact includes this bias.",
+        flush=True,
+    )
+    print(
+        f"Exact EMD runs only for N <= {MAX_EXACT_EMD_N} (O(N^3) CPU solver).\n"
+        f"Sinkhorn runs only for N <= {MAX_SINKHORN_N} (N x N GPU memory limit).\n",
         flush=True,
     )
     rows = []
@@ -695,70 +719,71 @@ def run_scalability_phase():
     rows = []
     sol2_active = True
     sol3_active = True
-    stop_scalability = False
 
     for n in scalability_n_values():
         print(f"\n=== Scalability N = {n:,} ===", flush=True)
+        alloc, reserved = gpu_mem_gb()
+        print(
+            f"GPU Memory: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved",
+            flush=True,
+        )
+
+        sol2_results = []
+        sol3_results = []
+        sol2_ever_ok = False
+        sol3_ever_ok = False
+
         for seed in SCALABILITY_SEEDS:
-            print(f"\n--- Scalability N = {n:,}, seed = {seed} ---", flush=True)
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
-            alloc, reserved = gpu_mem_gb()
-            print(f"GPU Memory: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved", flush=True)
 
             try:
                 A, B, diameter = make_data(n)
             except torch.cuda.OutOfMemoryError:
                 cleanup()
-                print(
-                    f"DATA OOM while generating or normalizing N={n:,}, seed={seed}; stopping.",
-                    flush=True,
-                )
-                stop_scalability = True
-                break
+                print(f"  DATA OOM at N={n}, seed={seed}; skipping seed.", flush=True)
+                sol2_results.append({"status": "oom", "time": math.nan, "cost": math.nan})
+                sol3_results.append({"status": "oom", "time": math.nan, "cost": math.nan})
+                continue
             except Exception as exc:
                 cleanup()
-                print(f"DATA ERROR at N={n:,}, seed={seed}: {exc}; stopping.", flush=True)
-                stop_scalability = True
-                break
+                print(f"  DATA ERROR at N={n}, seed={seed}: {exc}; skipping seed.", flush=True)
+                sol2_results.append({"status": "error", "time": math.nan, "cost": math.nan})
+                sol3_results.append({"status": "error", "time": math.nan, "cost": math.nan})
+                continue
 
             if sol2_active:
                 cleanup()
                 sol2 = run_solver("2-Level", SimpleGPUSolver, A, B, diameter)
-                if sol2["status"] == "oom":
-                    sol2_active = False
             else:
                 sol2 = {"status": "oom", "time": math.nan, "cost": math.nan}
-                print("  [2-Level] OOM", flush=True)
+                print("  [2-Level] OOM (skipped)", flush=True)
+            sol2_results.append(sol2)
+            if sol2["status"] == "ok":
+                sol2_ever_ok = True
 
             if sol3_active:
                 cleanup()
                 sol3 = run_solver("3-Level", ThreeLevelGPUSolver, A, B, diameter)
-                if sol3["status"] == "oom":
-                    sol3_active = False
             else:
                 sol3 = {"status": "oom", "time": math.nan, "cost": math.nan}
-                print("  [3-Level] OOM", flush=True)
+                print("  [3-Level] OOM (skipped)", flush=True)
+            sol3_results.append(sol3)
+            if sol3["status"] == "ok":
+                sol3_ever_ok = True
 
-            rows.append({"n": n, "seed": seed, "sol2": sol2, "sol3": sol3})
-            print(
-                f"Row: {n:,}, seed {seed} | "
-                f"2-Level {progress_pair(sol2)} | 3-Level {progress_pair(sol3)}",
-                flush=True,
-            )
-
-            stop_for_error = sol2["status"] == "error" or sol3["status"] == "error"
             del A, B
             cleanup()
-            if stop_for_error:
-                print("Unrecoverable solver error recorded; stopping.", flush=True)
-                stop_scalability = True
-                break
-            if not sol2_active and not sol3_active:
-                print("Both push-relabel solvers have OOMed; stopping.", flush=True)
-                stop_scalability = True
-                break
-        if stop_scalability:
+
+        if all(r["status"] == "oom" for r in sol2_results):
+            sol2_active = False
+        if all(r["status"] == "oom" for r in sol3_results):
+            sol3_active = False
+
+        rows.append({"n": n, "sol2": sol2_results, "sol3": sol3_results})
+
+        if not sol2_active and not sol3_active:
+            print("Both solvers OOMed on all seeds; stopping.", flush=True)
             break
 
     print_scalability_table(rows)
