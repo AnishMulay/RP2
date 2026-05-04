@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""
+Head-to-head benchmark: RP2 2-level GPU push-relabel vs HiRef.
+
+Dataset:
+  HiRef synthetic 2D Half-Moon source and S-Curve target, generated with the
+  same code path and default JAX RNG seed used in HiRef's synthetic notebook.
+
+Output:
+  Long-format CSV in final2/results/ with one row per (N, method).
+"""
+
+import argparse
+import csv
+import gc
+import math
+import sys
+import time
+import traceback
+from datetime import datetime
+from pathlib import Path
+
+import torch
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent.parent.parent
+RP2_SRC_DIR = REPO_ROOT / "src"
+HIREF_SRC_DIR = SCRIPT_DIR / "hiref_src"
+RESULTS_DIR = SCRIPT_DIR / "results"
+
+for path in (RP2_SRC_DIR, HIREF_SRC_DIR, SCRIPT_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+from clustered_push_relabel.solvers.simple_bipartite import SimpleGPUSolver
+from hiref_synthetic import ret_halfmoon_scurve
+
+DATASET = "HiRef halfmoon_Scurve"
+HIREF_SYNTHETIC_SEED = 0
+DEFAULT_MIN_POWER = 5
+DEFAULT_MAX_POWER = 20
+DEFAULT_RP2_EPSILON = 0.01
+DEFAULT_BATCH_SIZE = 2048
+DEFAULT_MAX_ITERS = 999_999_999
+DEFAULT_HIREF_HIERARCHY_DEPTH = 6
+DEFAULT_HIREF_MAX_Q = 2**11
+DEFAULT_HIREF_MAX_RANK = 64
+CSV_FIELDS = [
+    "timestamp",
+    "dataset",
+    "seed",
+    "n",
+    "method",
+    "status",
+    "primal_ot_cost",
+    "wall_time_s",
+    "peak_gpu_gb",
+    "peak_gpu_extra_gb",
+    "input_gpu_baseline_gb",
+    "iterations",
+    "rank_schedule",
+    "epsilon",
+    "batch_size",
+    "cost_function",
+    "dtype",
+    "device",
+    "error",
+]
+
+
+def sync_if_cuda(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def cleanup(device):
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def current_gpu_gb(device):
+    if device.type != "cuda":
+        return 0.0
+    return torch.cuda.memory_allocated(device) / 1024**3
+
+
+def reset_peak(device):
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def peak_gpu_gb(device):
+    if device.type != "cuda":
+        return 0.0
+    return torch.cuda.max_memory_allocated(device) / 1024**3
+
+
+def sample_sizes(min_power, max_power):
+    return [2**p for p in range(min_power, max_power + 1)]
+
+
+def make_points(n, seed, device, dtype):
+    x_np, y_np = ret_halfmoon_scurve(n_points=n, seed=seed)
+    x = torch.from_numpy(x_np).to(device=device, dtype=dtype)
+    y = torch.from_numpy(y_np).to(device=device, dtype=dtype)
+    return x, y
+
+
+def set_torch_seed(seed):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def average_l2_matching_cost(source, target, match_target_to_source):
+    match = match_target_to_source.to(device=source.device, dtype=torch.long)
+    return float(torch.norm(target - source[match], p=2, dim=1).mean().item())
+
+
+def short_error(exc):
+    text = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+    return text.replace("\n", " ")
+
+
+def run_rp2_two_level(source, target, args, device):
+    solver = None
+    cleanup(device)
+    baseline = current_gpu_gb(device)
+    try:
+        set_torch_seed(args.seed)
+        reset_peak(device)
+        sync_if_cuda(device)
+        t0 = time.perf_counter()
+        solver = SimpleGPUSolver(
+            source,
+            target,
+            epsilon=args.rp2_epsilon,
+            batch_size=args.batch_size,
+            tile_size=args.batch_size,
+            verbose=args.verbose,
+            max_iters=args.max_iters,
+        )
+        match = solver.solve()
+        sync_if_cuda(device)
+        wall = time.perf_counter() - t0
+        peak = peak_gpu_gb(device)
+        cost = average_l2_matching_cost(source, target, match)
+        return {
+            "method": "RP2_2level_gpu_push_relabel",
+            "status": "ok",
+            "primal_ot_cost": cost,
+            "wall_time_s": wall,
+            "peak_gpu_gb": peak,
+            "peak_gpu_extra_gb": max(0.0, peak - baseline),
+            "input_gpu_baseline_gb": baseline,
+            "iterations": getattr(solver, "iterations", math.nan),
+            "rank_schedule": "",
+            "epsilon": args.rp2_epsilon,
+            "batch_size": args.batch_size,
+            "error": "",
+        }
+    except torch.cuda.OutOfMemoryError as exc:
+        peak = peak_gpu_gb(device)
+        return {
+            "method": "RP2_2level_gpu_push_relabel",
+            "status": "oom",
+            "primal_ot_cost": math.nan,
+            "wall_time_s": math.nan,
+            "peak_gpu_gb": peak,
+            "peak_gpu_extra_gb": max(0.0, peak - baseline),
+            "input_gpu_baseline_gb": baseline,
+            "iterations": getattr(solver, "iterations", math.nan) if solver else math.nan,
+            "rank_schedule": "",
+            "epsilon": args.rp2_epsilon,
+            "batch_size": args.batch_size,
+            "error": short_error(exc),
+        }
+    except Exception as exc:
+        return {
+            "method": "RP2_2level_gpu_push_relabel",
+            "status": "error",
+            "primal_ot_cost": math.nan,
+            "wall_time_s": math.nan,
+            "peak_gpu_gb": peak_gpu_gb(device),
+            "peak_gpu_extra_gb": math.nan,
+            "input_gpu_baseline_gb": baseline,
+            "iterations": getattr(solver, "iterations", math.nan) if solver else math.nan,
+            "rank_schedule": "",
+            "epsilon": args.rp2_epsilon,
+            "batch_size": args.batch_size,
+            "error": short_error(exc),
+        }
+    finally:
+        del solver
+        cleanup(device)
+
+
+def run_hiref(source, target, args, device):
+    import HR_OT
+    import rank_annealing
+
+    hrot = None
+    rank_schedule = []
+    cleanup(device)
+    baseline = current_gpu_gb(device)
+    try:
+        set_torch_seed(args.seed)
+        rank_schedule = rank_annealing.optimal_rank_schedule(
+            source.shape[0],
+            hierarchy_depth=args.hiref_hierarchy_depth,
+            max_Q=args.hiref_max_q,
+            max_rank=args.hiref_max_rank,
+        )
+        reset_peak(device)
+        sync_if_cuda(device)
+        t0 = time.perf_counter()
+        hrot = HR_OT.HierarchicalRefinementOT.init_from_point_clouds(
+            source,
+            target,
+            rank_schedule,
+            base_rank=1,
+            device=device,
+            sq_Euclidean=False,
+        )
+        hrot.run(return_as_coupling=False)
+        cost = float(hrot.compute_OT_cost().item())
+        sync_if_cuda(device)
+        wall = time.perf_counter() - t0
+        peak = peak_gpu_gb(device)
+        return {
+            "method": "HiRef_HROT_LR",
+            "status": "ok",
+            "primal_ot_cost": cost,
+            "wall_time_s": wall,
+            "peak_gpu_gb": peak,
+            "peak_gpu_extra_gb": max(0.0, peak - baseline),
+            "input_gpu_baseline_gb": baseline,
+            "iterations": math.nan,
+            "rank_schedule": " ".join(str(v) for v in rank_schedule),
+            "epsilon": "",
+            "batch_size": "",
+            "error": "",
+        }
+    except torch.cuda.OutOfMemoryError as exc:
+        peak = peak_gpu_gb(device)
+        return {
+            "method": "HiRef_HROT_LR",
+            "status": "oom",
+            "primal_ot_cost": math.nan,
+            "wall_time_s": math.nan,
+            "peak_gpu_gb": peak,
+            "peak_gpu_extra_gb": max(0.0, peak - baseline),
+            "input_gpu_baseline_gb": baseline,
+            "iterations": math.nan,
+            "rank_schedule": " ".join(str(v) for v in rank_schedule),
+            "epsilon": "",
+            "batch_size": "",
+            "error": short_error(exc),
+        }
+    except Exception as exc:
+        return {
+            "method": "HiRef_HROT_LR",
+            "status": "error",
+            "primal_ot_cost": math.nan,
+            "wall_time_s": math.nan,
+            "peak_gpu_gb": peak_gpu_gb(device),
+            "peak_gpu_extra_gb": math.nan,
+            "input_gpu_baseline_gb": baseline,
+            "iterations": math.nan,
+            "rank_schedule": " ".join(str(v) for v in rank_schedule),
+            "epsilon": "",
+            "batch_size": "",
+            "error": short_error(exc),
+        }
+    finally:
+        del hrot
+        cleanup(device)
+
+
+def csv_value(value):
+    if isinstance(value, float):
+        if math.isnan(value):
+            return ""
+        return f"{value:.10g}"
+    return value
+
+
+def append_rows(csv_path, rows):
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not csv_path.exists()
+    with csv_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        if write_header:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow({k: csv_value(row.get(k, "")) for k in CSV_FIELDS})
+
+
+def print_result(row):
+    cost = row["primal_ot_cost"]
+    cost_s = "N/A" if not math.isfinite(float(cost)) else f"{float(cost):.6f}"
+    wall = row["wall_time_s"]
+    wall_s = "N/A" if not math.isfinite(float(wall)) else f"{float(wall):.2f}s"
+    peak = row["peak_gpu_gb"]
+    peak_s = "N/A" if not math.isfinite(float(peak)) else f"{float(peak):.3f}GB"
+    print(
+        f"  {row['method']}: {row['status']} | cost={cost_s} | "
+        f"time={wall_s} | peak={peak_s}",
+        flush=True,
+    )
+
+
+def parse_methods(raw):
+    aliases = {
+        "rp2": "rp2",
+        "pushrelabel": "rp2",
+        "push-relabel": "rp2",
+        "hiref": "hiref",
+        "hrot": "hiref",
+    }
+    methods = []
+    for part in raw.split(","):
+        key = part.strip().lower()
+        if not key:
+            continue
+        if key not in aliases:
+            raise ValueError(f"unknown method {part!r}; use rp2,hiref")
+        value = aliases[key]
+        if value not in methods:
+            methods.append(value)
+    if not methods:
+        raise ValueError("at least one method is required")
+    return methods
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Benchmark RP2 2-level solver against HiRef on HiRef Half-Moon/S-Curve."
+    )
+    parser.add_argument("--min-power", type=int, default=DEFAULT_MIN_POWER)
+    parser.add_argument("--max-power", type=int, default=DEFAULT_MAX_POWER)
+    parser.add_argument("--seed", type=int, default=HIREF_SYNTHETIC_SEED)
+    parser.add_argument("--methods", default="rp2,hiref")
+    parser.add_argument("--rp2-epsilon", type=float, default=DEFAULT_RP2_EPSILON)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--max-iters", type=int, default=DEFAULT_MAX_ITERS)
+    parser.add_argument("--hiref-hierarchy-depth", type=int, default=DEFAULT_HIREF_HIERARCHY_DEPTH)
+    parser.add_argument("--hiref-max-q", type=int, default=DEFAULT_HIREF_MAX_Q)
+    parser.add_argument("--hiref-max-rank", type=int, default=DEFAULT_HIREF_MAX_RANK)
+    parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
+    parser.add_argument("--output", default=None)
+    parser.add_argument("--keep-going", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for both benchmarked GPU methods.")
+
+    methods = parse_methods(args.methods)
+    device = torch.device("cuda")
+    dtype = torch.float32 if args.dtype == "float32" else torch.float64
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    csv_path = Path(args.output) if args.output else RESULTS_DIR / f"hiref_synthetic_2d_{timestamp}.csv"
+
+    print(f"Dataset: {DATASET}", flush=True)
+    print(f"Seed: {args.seed}", flush=True)
+    print(f"Device: {torch.cuda.get_device_name(0)}", flush=True)
+    print(f"Output: {csv_path}", flush=True)
+    print(f"Sample sizes: {sample_sizes(args.min_power, args.max_power)}", flush=True)
+
+    for n in sample_sizes(args.min_power, args.max_power):
+        print(f"\nN={n:,}", flush=True)
+        cleanup(device)
+        try:
+            source, target = make_points(n, args.seed, device, dtype)
+            sync_if_cuda(device)
+        except Exception as exc:
+            row = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "dataset": DATASET,
+                "seed": args.seed,
+                "n": n,
+                "method": "data_generation",
+                "status": "error",
+                "primal_ot_cost": math.nan,
+                "wall_time_s": math.nan,
+                "peak_gpu_gb": peak_gpu_gb(device),
+                "peak_gpu_extra_gb": math.nan,
+                "input_gpu_baseline_gb": current_gpu_gb(device),
+                "iterations": math.nan,
+                "rank_schedule": "",
+                "epsilon": "",
+                "batch_size": "",
+                "cost_function": "Euclidean L2",
+                "dtype": args.dtype,
+                "device": str(device),
+                "error": short_error(exc),
+            }
+            append_rows(csv_path, [row])
+            print_result(row)
+            if not args.keep_going:
+                break
+            continue
+
+        rows = []
+        if "rp2" in methods:
+            rows.append(run_rp2_two_level(source, target, args, device))
+            print_result(rows[-1])
+        if "hiref" in methods:
+            rows.append(run_hiref(source, target, args, device))
+            print_result(rows[-1])
+
+        for row in rows:
+            row.update(
+                {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "dataset": DATASET,
+                    "seed": args.seed,
+                    "n": n,
+                    "cost_function": "Euclidean L2",
+                    "dtype": args.dtype,
+                    "device": str(device),
+                }
+            )
+        append_rows(csv_path, rows)
+
+        statuses = {row["method"]: row["status"] for row in rows}
+        both_oom_seen = rows and all(row["status"] == "oom" for row in rows)
+        del source, target
+        cleanup(device)
+        if both_oom_seen and not args.keep_going:
+            print("Both selected methods OOMed; stopping sweep.", flush=True)
+            break
+        if any(status == "error" for status in statuses.values()) and not args.keep_going:
+            print("A selected method errored; stopping sweep.", flush=True)
+            break
+
+    print(f"\nWrote results to {csv_path}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
