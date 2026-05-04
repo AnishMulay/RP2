@@ -2,8 +2,8 @@
 """
 Standalone comparison sweep on synthetic 2D point clouds.
 
-Table 1 compares exact EMD, POT Sinkhorn, GeomLoss, and push-relabel on
-small point clouds. Table 2 compares scalable methods on larger point clouds.
+Table 1 compares exact EMD, POT Sinkhorn, and push-relabel on small point
+clouds. Table 2 compares scalable methods on larger point clouds.
 """
 
 import csv
@@ -17,6 +17,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
+# GeomLoss excluded: PyKeOps is incompatible with CUDA 13.x (system has CUDA 13.2).
+# POT sinkhorn_log is used as the sole Sinkhorn baseline.
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent.parent
 SRC_DIR = REPO_ROOT / "src"
@@ -29,12 +32,12 @@ from clustered_push_relabel.solvers.three_level_bipartite import ThreeLevelGPUSo
 EPSILON = 0.01
 BATCH_SIZE = 2048
 MAX_ITERS = 999_999_999
-SEED = 42
 
 DIAMETER_TILE = 1024
 ACCURACY_SIZES = [1_000, 5_000, 10_000]
+ACCURACY_SEEDS = [42, 123, 777, 999, 1337]  # 5 seeds for accuracy table
+SCALABILITY_SEEDS = [42, 123, 777]  # 3 seeds for scalability table
 SINKHORN_REGS = [0.1, 0.01, 0.001]
-GEOMLOSS_BLURS = [0.1, 0.05]
 
 
 def scalability_n_values():
@@ -176,6 +179,9 @@ def run_sinkhorn_pot(A_cuda, B_cuda, diameter, reg):
         a = torch.ones(N, device=A_cuda.device, dtype=torch.float32) / N
         b = torch.ones(N, device=A_cuda.device, dtype=torch.float32) / N
 
+        sync()
+        t0 = time.time()
+
         C = torch.cdist(
             B_cuda,
             A_cuda,
@@ -183,21 +189,34 @@ def run_sinkhorn_pot(A_cuda, B_cuda, diameter, reg):
             compute_mode="use_mm_for_euclid_dist_if_necessary",
         )
 
-        sync()
-        t0 = time.time()
-
-        T = pot.sinkhorn(
+        T, sinkhorn_log_dict = pot.sinkhorn_log(
             a,
             b,
             C,
             reg=reg,
             numItermax=10000,
             stopThr=1e-9,
-            backend="torch",
+            log=True,
         )
 
         sync()
         elapsed = time.time() - t0
+
+        converged = True
+        if "logu" in sinkhorn_log_dict:
+            err = sinkhorn_log_dict.get("err", [])
+            if len(err) > 0 and float(err[-1]) > 1e-9:
+                converged = False
+
+        if not converged:
+            print(
+                f"  [Sinkhorn eps_reg={reg}] DNC "
+                f"(did not converge, last_err={err[-1]:.2e})",
+                flush=True,
+            )
+            del T, C
+            cleanup()
+            return {"status": "dnc", "cost": math.nan, "time": elapsed}
 
         soft_cost_normalized = (T * C).sum().item()
         soft_cost = soft_cost_normalized * diameter
@@ -219,54 +238,6 @@ def run_sinkhorn_pot(A_cuda, B_cuda, diameter, reg):
     except Exception as exc:
         cleanup()
         print(f"  [Sinkhorn eps_reg={reg}] ERROR: {exc}", flush=True)
-        return {"status": "error", "cost": math.nan, "time": math.nan}
-
-
-def run_geomloss(A_cuda, B_cuda, diameter, blur):
-    """
-    GeomLoss SamplesLoss Sinkhorn divergence (debiased, L2 cost).
-    Output is the Sinkhorn divergence scalar, not average matched cost.
-    """
-    try:
-        from geomloss import SamplesLoss
-
-        loss_fn = SamplesLoss(
-            loss="sinkhorn",
-            p=2,
-            blur=blur,
-            debias=True,
-            scaling=0.9,
-            backend="online",
-        )
-
-        sync()
-        t0 = time.time()
-
-        div = loss_fn(B_cuda, A_cuda)
-        div_val = div.item()
-
-        sync()
-        elapsed = time.time() - t0
-
-        div_scaled = div_val * diameter
-
-        print(
-            f"  [GeomLoss blur={blur}] Time: {elapsed:.2f}s | "
-            f"Sinkhorn Divergence: {div_scaled:.5f}",
-            flush=True,
-        )
-        return {"status": "ok", "cost": div_scaled, "time": elapsed}
-
-    except ImportError:
-        print(f"  [GeomLoss blur={blur}] SKIP - geomloss/pykeops not installed", flush=True)
-        return {"status": "skip", "cost": math.nan, "time": math.nan}
-    except torch.cuda.OutOfMemoryError:
-        cleanup()
-        print(f"  [GeomLoss blur={blur}] OOM", flush=True)
-        return {"status": "oom", "cost": math.nan, "time": math.nan}
-    except Exception as exc:
-        cleanup()
-        print(f"  [GeomLoss blur={blur}] ERROR: {exc}", flush=True)
         return {"status": "error", "cost": math.nan, "time": math.nan}
 
 
@@ -361,6 +332,8 @@ def result_value(result, key):
     if result["status"] == "ok":
         value = result.get(key, math.nan)
         return f"{value:.5f}" if key == "cost" else f"{value:.2f}"
+    if result["status"] == "dnc":
+        return "DNC"
     return result["status"].upper()
 
 
@@ -371,6 +344,8 @@ def delta_from_exact(result, exact_cost):
 
 
 def delta_value(result, exact_cost):
+    if result["status"] == "dnc":
+        return "N/A"
     delta = delta_from_exact(result, exact_cost)
     if math.isfinite(delta):
         return f"{delta:.2f}"
@@ -383,10 +358,106 @@ def csv_float(value):
     return f"{value:.10g}"
 
 
+def csv_result_value(result, key):
+    if result["status"] == "dnc":
+        return "DNC"
+    return csv_float(result.get(key, math.nan))
+
+
 def progress_pair(result):
     if result["status"] == "ok":
         return f"{result_value(result, 'time')}s / {result_value(result, 'cost')}"
     return f"{result['status'].upper()} / {result['status'].upper()}"
+
+
+def mean_std_rows(rows, n, method, eps_or_blur, key):
+    """Extract values for all seeds matching (n, method, eps_or_blur), return (mean, std)."""
+    vals = [
+        r["result"].get(key, math.nan)
+        for r in rows
+        if r["n"] == n
+        and r["method"] == method
+        and str(r["epsilon_or_blur"]) == str(eps_or_blur)
+        and r["result"]["status"] in ("ok",)
+    ]
+    vals = [v for v in vals if math.isfinite(v)]
+    if not vals:
+        return math.nan, math.nan
+    import statistics
+
+    mean = sum(vals) / len(vals)
+    std = statistics.stdev(vals) if len(vals) > 1 else 0.0
+    return mean, std
+
+
+def mean_std_scalability(rows, n, method, key):
+    vals = [
+        r[method].get(key, math.nan)
+        for r in rows
+        if r["n"] == n and r[method]["status"] in ("ok",)
+    ]
+    vals = [v for v in vals if math.isfinite(v)]
+    if not vals:
+        return math.nan, math.nan
+    import statistics
+
+    mean = sum(vals) / len(vals)
+    std = statistics.stdev(vals) if len(vals) > 1 else 0.0
+    return mean, std
+
+
+def mean_std_delta(rows, n, method, eps_or_blur):
+    vals = [
+        delta_from_exact(r["result"], r["exact_cost"])
+        for r in rows
+        if r["n"] == n
+        and r["method"] == method
+        and str(r["epsilon_or_blur"]) == str(eps_or_blur)
+    ]
+    vals = [v for v in vals if math.isfinite(v)]
+    if not vals:
+        return math.nan, math.nan
+    import statistics
+
+    mean = sum(vals) / len(vals)
+    std = statistics.stdev(vals) if len(vals) > 1 else 0.0
+    return mean, std
+
+
+def mean_std_value(mean, std, key):
+    if not math.isfinite(mean):
+        return "N/A"
+    if key == "cost":
+        return f"{mean:.5f} ± {std:.5f}"
+    return f"{mean:.2f} ± {std:.2f}"
+
+
+def aggregate_status_value(rows, n, method, eps_or_blur):
+    statuses = [
+        r["result"]["status"]
+        for r in rows
+        if r["n"] == n
+        and r["method"] == method
+        and str(r["epsilon_or_blur"]) == str(eps_or_blur)
+    ]
+    if statuses and all(status == "dnc" for status in statuses):
+        return "DNC"
+    if statuses and all(status == "oom" for status in statuses):
+        return "OOM"
+    if statuses and all(status == "skip" for status in statuses):
+        return "SKIP"
+    if statuses and all(status == "error" for status in statuses):
+        return "ERROR"
+    return "N/A"
+
+
+def aggregate_scalability_status_value(rows, n, method):
+    statuses = [r[method]["status"] for r in rows if r["n"] == n]
+    if statuses and all(status == "oom" for status in statuses):
+        return "OOM"
+    if statuses and all(status == "error" for status in statuses):
+        return "ERROR"
+    return "N/A"
 
 
 def print_table(title, headers, table):
@@ -404,28 +475,43 @@ def print_accuracy_table(rows):
     headers = [
         "N",
         "Method",
-        "eps / blur",
+        "eps",
         "Time (s)",
-        "Avg Cost or Divergence",
+        "Avg Cost",
         "Delta from Exact (%)",
     ]
     table = []
+    seen = set()
+    groups = []
     for row in rows:
-        exact_cost = row["exact_cost"]
+        key = (row["n"], row["method"], row["epsilon_or_blur"])
+        if key not in seen:
+            seen.add(key)
+            groups.append(key)
+    for n, method, epsilon_or_blur in groups:
+        time_mean, time_std = mean_std_rows(rows, n, method, epsilon_or_blur, "time")
+        cost_mean, cost_std = mean_std_rows(rows, n, method, epsilon_or_blur, "cost")
+        delta_mean, delta_std = mean_std_delta(rows, n, method, epsilon_or_blur)
+        status_value = aggregate_status_value(rows, n, method, epsilon_or_blur)
         table.append(
             [
-                f"{row['n']:,}",
-                row["method"],
-                row["epsilon_or_blur"],
-                result_value(row["result"], "time"),
-                result_value(row["result"], "cost"),
-                delta_value(row["result"], exact_cost),
+                f"{n:,}",
+                method,
+                epsilon_or_blur,
+                mean_std_value(time_mean, time_std, "time")
+                if math.isfinite(time_mean)
+                else status_value,
+                mean_std_value(cost_mean, cost_std, "cost")
+                if math.isfinite(cost_mean)
+                else status_value,
+                mean_std_value(delta_mean, delta_std, "time")
+                if math.isfinite(delta_mean)
+                else "N/A",
             ]
         )
     print_table("Table 1 - Accuracy", headers, table)
     print(
         "\nNotes: Sinkhorn costs are soft plan costs and biased upper estimates of OT. "
-        "GeomLoss rows report Sinkhorn divergence, not average transport cost. "
         "Push-relabel rows report hard matching average L2 cost with additive epsilon guarantee.",
         flush=True,
     )
@@ -434,24 +520,40 @@ def print_accuracy_table(rows):
 def print_scalability_table(rows):
     headers = [
         "N",
-        "GeomLoss Time (s)",
-        "GeomLoss Div",
         "2-Level Time (s)",
         "2-Level Cost",
         "3-Level Time (s)",
         "3-Level Cost",
     ]
     table = []
+    seen = set()
+    n_values = []
     for row in rows:
+        if row["n"] not in seen:
+            seen.add(row["n"])
+            n_values.append(row["n"])
+    for n in n_values:
+        sol2_time_mean, sol2_time_std = mean_std_scalability(rows, n, "sol2", "time")
+        sol2_cost_mean, sol2_cost_std = mean_std_scalability(rows, n, "sol2", "cost")
+        sol3_time_mean, sol3_time_std = mean_std_scalability(rows, n, "sol3", "time")
+        sol3_cost_mean, sol3_cost_std = mean_std_scalability(rows, n, "sol3", "cost")
+        sol2_status = aggregate_scalability_status_value(rows, n, "sol2")
+        sol3_status = aggregate_scalability_status_value(rows, n, "sol3")
         table.append(
             [
-                f"{row['n']:,}",
-                result_value(row["geomloss"], "time"),
-                result_value(row["geomloss"], "cost"),
-                result_value(row["sol2"], "time"),
-                result_value(row["sol2"], "cost"),
-                result_value(row["sol3"], "time"),
-                result_value(row["sol3"], "cost"),
+                f"{n:,}",
+                mean_std_value(sol2_time_mean, sol2_time_std, "time")
+                if math.isfinite(sol2_time_mean)
+                else sol2_status,
+                mean_std_value(sol2_cost_mean, sol2_cost_std, "cost")
+                if math.isfinite(sol2_cost_mean)
+                else sol2_status,
+                mean_std_value(sol3_time_mean, sol3_time_std, "time")
+                if math.isfinite(sol3_time_mean)
+                else sol3_status,
+                mean_std_value(sol3_cost_mean, sol3_cost_std, "cost")
+                if math.isfinite(sol3_cost_mean)
+                else sol3_status,
             ]
         )
     print_table("Table 2 - Scalability", headers, table)
@@ -465,10 +567,11 @@ def save_accuracy_csv(rows, stamp):
         writer.writerow(
             [
                 "N",
+                "seed",
                 "Method",
                 "epsilon_or_blur",
                 "time_s",
-                "cost_or_divergence",
+                "cost",
                 "delta_from_exact_pct",
                 "cost_type",
             ]
@@ -479,10 +582,11 @@ def save_accuracy_csv(rows, stamp):
             writer.writerow(
                 [
                     row["n"],
+                    row["seed"],
                     row["method"],
                     row["epsilon_or_blur"],
-                    csv_float(result.get("time", math.nan)),
-                    csv_float(result.get("cost", math.nan)),
+                    csv_result_value(result, "time"),
+                    csv_result_value(result, "cost"),
                     csv_float(delta),
                     row["cost_type"],
                 ]
@@ -498,9 +602,7 @@ def save_scalability_csv(rows, stamp):
         writer.writerow(
             [
                 "N",
-                "geomloss_time_s",
-                "geomloss_divergence",
-                "geomloss_status",
+                "seed",
                 "two_level_time_s",
                 "two_level_cost",
                 "two_level_status",
@@ -514,14 +616,12 @@ def save_scalability_csv(rows, stamp):
             writer.writerow(
                 [
                     row["n"],
-                    csv_float(row["geomloss"].get("time", math.nan)),
-                    csv_float(row["geomloss"].get("cost", math.nan)),
-                    row["geomloss"]["status"],
-                    csv_float(row["sol2"].get("time", math.nan)),
-                    csv_float(row["sol2"].get("cost", math.nan)),
+                    row["seed"],
+                    csv_result_value(row["sol2"], "time"),
+                    csv_result_value(row["sol2"], "cost"),
                     row["sol2"]["status"],
-                    csv_float(row["sol3"].get("time", math.nan)),
-                    csv_float(row["sol3"].get("cost", math.nan)),
+                    csv_result_value(row["sol3"], "time"),
+                    csv_result_value(row["sol3"], "cost"),
                     row["sol3"]["status"],
                     "N/A (N x N matrix)",
                 ]
@@ -530,10 +630,11 @@ def save_scalability_csv(rows, stamp):
     return path
 
 
-def append_accuracy_row(rows, n, method, epsilon_or_blur, result, exact_cost, cost_type):
+def append_accuracy_row(rows, n, seed, method, epsilon_or_blur, result, exact_cost, cost_type):
     rows.append(
         {
             "n": n,
+            "seed": seed,
             "method": method,
             "epsilon_or_blur": epsilon_or_blur,
             "result": result,
@@ -549,61 +650,85 @@ def run_accuracy_phase():
 
     for n in ACCURACY_SIZES:
         print(f"\n=== Accuracy N = {n:,} ===", flush=True)
-        alloc, reserved = gpu_mem_gb()
-        print(f"GPU Memory: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved", flush=True)
+        for seed in ACCURACY_SEEDS:
+            print(f"\n--- Accuracy N = {n:,}, seed = {seed} ---", flush=True)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            alloc, reserved = gpu_mem_gb()
+            print(f"GPU Memory: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved", flush=True)
 
-        try:
-            A, B, diameter = make_data(n)
-        except torch.cuda.OutOfMemoryError:
-            cleanup()
-            print(f"DATA OOM while generating or normalizing accuracy N={n:,}; skipping.", flush=True)
-            continue
-        except Exception as exc:
-            cleanup()
-            print(f"DATA ERROR at accuracy N={n:,}: {exc}; skipping.", flush=True)
-            continue
+            try:
+                A, B, diameter = make_data(n)
+            except torch.cuda.OutOfMemoryError:
+                cleanup()
+                print(
+                    f"DATA OOM while generating or normalizing accuracy N={n:,}, "
+                    f"seed={seed}; skipping.",
+                    flush=True,
+                )
+                continue
+            except Exception as exc:
+                cleanup()
+                print(f"DATA ERROR at accuracy N={n:,}, seed={seed}: {exc}; skipping.", flush=True)
+                continue
 
-        cleanup()
-        exact = run_exact_emd(A, B, diameter)
-        exact_cost = exact["cost"] if exact["status"] == "ok" else math.nan
-        append_accuracy_row(rows, n, "Exact EMD", "", exact, exact_cost, "hard_matching_cost")
-
-        for reg in SINKHORN_REGS:
             cleanup()
-            sinkhorn = run_sinkhorn_pot(A, B, diameter, reg)
+            exact = run_exact_emd(A, B, diameter)
+            exact_cost = exact["cost"] if exact["status"] == "ok" else math.nan
+            cleanup()
             append_accuracy_row(
                 rows,
                 n,
-                "Sinkhorn (POT)",
-                reg,
-                sinkhorn,
+                seed,
+                "Exact EMD",
+                "",
+                exact,
                 exact_cost,
-                "soft_plan_cost",
+                "hard_matching_cost",
             )
 
-        for blur in GEOMLOSS_BLURS:
+            for reg in SINKHORN_REGS:
+                cleanup()
+                sinkhorn = run_sinkhorn_pot(A, B, diameter, reg)
+                append_accuracy_row(
+                    rows,
+                    n,
+                    seed,
+                    "Sinkhorn (POT)",
+                    reg,
+                    sinkhorn,
+                    exact_cost,
+                    "soft_plan_cost",
+                )
+
             cleanup()
-            geomloss = run_geomloss(A, B, diameter, blur)
+            sol2 = run_solver("2-Level", SimpleGPUSolver, A, B, diameter)
             append_accuracy_row(
                 rows,
                 n,
-                "GeomLoss Div. [divergence]",
-                blur,
-                geomloss,
+                seed,
+                "2-Level Push-Relabel",
+                EPSILON,
+                sol2,
                 exact_cost,
-                "sinkhorn_divergence",
+                "hard_matching_cost",
             )
 
-        cleanup()
-        sol2 = run_solver("2-Level", SimpleGPUSolver, A, B, diameter)
-        append_accuracy_row(rows, n, "2-Level Push-Relabel", EPSILON, sol2, exact_cost, "hard_matching_cost")
+            cleanup()
+            sol3 = run_solver("3-Level", ThreeLevelGPUSolver, A, B, diameter)
+            append_accuracy_row(
+                rows,
+                n,
+                seed,
+                "3-Level Push-Relabel",
+                EPSILON,
+                sol3,
+                exact_cost,
+                "hard_matching_cost",
+            )
 
-        cleanup()
-        sol3 = run_solver("3-Level", ThreeLevelGPUSolver, A, B, diameter)
-        append_accuracy_row(rows, n, "3-Level Push-Relabel", EPSILON, sol3, exact_cost, "hard_matching_cost")
-
-        del A, B
-        cleanup()
+            del A, B
+            cleanup()
 
     print_accuracy_table(rows)
     return rows
@@ -615,59 +740,70 @@ def run_scalability_phase():
     rows = []
     sol2_active = True
     sol3_active = True
+    stop_scalability = False
 
     for n in scalability_n_values():
         print(f"\n=== Scalability N = {n:,} ===", flush=True)
-        alloc, reserved = gpu_mem_gb()
-        print(f"GPU Memory: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved", flush=True)
+        for seed in SCALABILITY_SEEDS:
+            print(f"\n--- Scalability N = {n:,}, seed = {seed} ---", flush=True)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            alloc, reserved = gpu_mem_gb()
+            print(f"GPU Memory: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved", flush=True)
 
-        try:
-            A, B, diameter = make_data(n)
-        except torch.cuda.OutOfMemoryError:
+            try:
+                A, B, diameter = make_data(n)
+            except torch.cuda.OutOfMemoryError:
+                cleanup()
+                print(
+                    f"DATA OOM while generating or normalizing N={n:,}, seed={seed}; stopping.",
+                    flush=True,
+                )
+                stop_scalability = True
+                break
+            except Exception as exc:
+                cleanup()
+                print(f"DATA ERROR at N={n:,}, seed={seed}: {exc}; stopping.", flush=True)
+                stop_scalability = True
+                break
+
+            if sol2_active:
+                cleanup()
+                sol2 = run_solver("2-Level", SimpleGPUSolver, A, B, diameter)
+                if sol2["status"] == "oom":
+                    sol2_active = False
+            else:
+                sol2 = {"status": "oom", "time": math.nan, "cost": math.nan}
+                print("  [2-Level] OOM", flush=True)
+
+            if sol3_active:
+                cleanup()
+                sol3 = run_solver("3-Level", ThreeLevelGPUSolver, A, B, diameter)
+                if sol3["status"] == "oom":
+                    sol3_active = False
+            else:
+                sol3 = {"status": "oom", "time": math.nan, "cost": math.nan}
+                print("  [3-Level] OOM", flush=True)
+
+            rows.append({"n": n, "seed": seed, "sol2": sol2, "sol3": sol3})
+            print(
+                f"Row: {n:,}, seed {seed} | "
+                f"2-Level {progress_pair(sol2)} | 3-Level {progress_pair(sol3)}",
+                flush=True,
+            )
+
+            stop_for_error = sol2["status"] == "error" or sol3["status"] == "error"
+            del A, B
             cleanup()
-            print(f"DATA OOM while generating or normalizing N={n:,}; stopping.", flush=True)
-            break
-        except Exception as exc:
-            cleanup()
-            print(f"DATA ERROR at N={n:,}: {exc}; stopping.", flush=True)
-            break
-
-        cleanup()
-        geomloss = run_geomloss(A, B, diameter, 0.05)
-
-        if sol2_active:
-            cleanup()
-            sol2 = run_solver("2-Level", SimpleGPUSolver, A, B, diameter)
-            if sol2["status"] == "oom":
-                sol2_active = False
-        else:
-            sol2 = {"status": "oom", "time": math.nan, "cost": math.nan}
-            print("  [2-Level] OOM", flush=True)
-
-        if sol3_active:
-            cleanup()
-            sol3 = run_solver("3-Level", ThreeLevelGPUSolver, A, B, diameter)
-            if sol3["status"] == "oom":
-                sol3_active = False
-        else:
-            sol3 = {"status": "oom", "time": math.nan, "cost": math.nan}
-            print("  [3-Level] OOM", flush=True)
-
-        rows.append({"n": n, "geomloss": geomloss, "sol2": sol2, "sol3": sol3})
-        print(
-            f"Row: {n:,} | GeomLoss {progress_pair(geomloss)} | "
-            f"2-Level {progress_pair(sol2)} | 3-Level {progress_pair(sol3)}",
-            flush=True,
-        )
-
-        stop_for_error = sol2["status"] == "error" or sol3["status"] == "error"
-        del A, B
-        cleanup()
-        if stop_for_error:
-            print("Unrecoverable solver error recorded; stopping.", flush=True)
-            break
-        if not sol2_active and not sol3_active:
-            print("Both push-relabel solvers have OOMed; stopping.", flush=True)
+            if stop_for_error:
+                print("Unrecoverable solver error recorded; stopping.", flush=True)
+                stop_scalability = True
+                break
+            if not sol2_active and not sol3_active:
+                print("Both push-relabel solvers have OOMed; stopping.", flush=True)
+                stop_scalability = True
+                break
+        if stop_scalability:
             break
 
     print_scalability_table(rows)
@@ -677,8 +813,6 @@ def run_scalability_phase():
 def main():
     assert torch.cuda.is_available(), "CUDA is required"
     print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
 
     accuracy_rows = run_accuracy_phase()
     scalability_rows = run_scalability_phase()
