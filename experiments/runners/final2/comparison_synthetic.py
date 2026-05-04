@@ -39,7 +39,7 @@ ACCURACY_SIZES = [1_000, 5_000, 10_000, 15_000]
 SEED = 42
 SINKHORN_REGS = [0.1, 0.01, 0.001]
 MAX_SINKHORN_N = 15_000
-MAX_EXACT_EMD_N = 2_000  # exact EMD is O(N^3); impractical above this
+MAX_EXACT_EMD_N = 15_000
 
 
 def scalability_n_values():
@@ -618,7 +618,7 @@ def run_accuracy_phase():
     print(
         "\n=== Table 1: Accuracy ===\n"
         f"Sizes: {ACCURACY_SIZES}\n"
-        f"Exact EMD: N <= {MAX_EXACT_EMD_N} only (O(N^3) CPU solver).\n"
+        f"Exact EMD: N <= {MAX_EXACT_EMD_N} (O(N^3) CPU solver).\n"
         f"Sinkhorn:  N <= {MAX_SINKHORN_N} only (N x N GPU matrix).\n"
         "Peak GPU memory measured per solver via torch.cuda.reset_peak_memory_stats()\n"
         "+ torch.cuda.max_memory_allocated(). GPU cleared between every solver call.\n"
