@@ -42,6 +42,7 @@ class SimpleGPUSolver:
         set1_pair_batch=64,
         diameter: float = 1.0,
         sample_factor: float = 1.0,
+        adj_chunk_size: int = 4096,
         clustering_class=None,
         precomputed_clustering=None,
     ):
@@ -51,6 +52,8 @@ class SimpleGPUSolver:
 
         if epsilon <= 0:
             raise ValueError("epsilon must be positive")
+
+        self.adj_chunk_size = int(adj_chunk_size)
 
         if precomputed_clustering is not None:
             self.N = int(precomputed_clustering["adj_ptr"].shape[0]) - 1
@@ -625,31 +628,43 @@ class SimpleGPUSolver:
         starts = self.adj_ptr[B_free]
         ends = self.adj_ptr[B_free + 1]
         lengths = ends - starts
-        total_edges = int(lengths.sum().item())
-        if total_edges != 0:
-            edge_range = _ensure_long_arange(
-                self, "_delta_set2_edge_arange", total_edges, self.device
-            )
-            free_pos = _ensure_long_arange(
-                self, "_delta_set2_free_pos", num_free, self.device
-            )
-            cum_len = torch.cumsum(lengths, dim=0)
-            packed_starts = cum_len - lengths
+        chunk = self.adj_chunk_size
+        for c_start in range(0, num_free, chunk):
+            c_end = min(c_start + chunk, num_free)
+            c_len = lengths[c_start:c_end]
+            c_total = int(c_len.sum().item())
+            if c_total == 0:
+                continue
+            c_starts = starts[c_start:c_end]
+            c_size = c_end - c_start
 
-            active_free_pos = torch.repeat_interleave(free_pos, lengths)
-            active_edge_idx = (
-                torch.repeat_interleave(starts, lengths)
-                + edge_range
-                - torch.repeat_interleave(packed_starts, lengths)
+            c_free_pos = torch.arange(c_size, device=self.device, dtype=torch.long)
+            c_edge_range = torch.arange(c_total, device=self.device, dtype=torch.long)
+            c_cum = c_len.cumsum(0)
+            c_packed = c_cum - c_len
+
+            c_active_pos = torch.repeat_interleave(c_free_pos, c_len)
+            c_active_edge = (
+                torch.repeat_interleave(c_starts, c_len)
+                + c_edge_range
+                - torch.repeat_interleave(c_packed, c_len)
+            )
+            c_active_a = self.adj_col[c_active_edge]
+            c_term = (
+                self.adj_dist_int[c_active_edge].to(torch.long)
+                - self.y_A[c_active_a].to(torch.long)
             )
 
-            active_a = self.adj_col[active_edge_idx]
-            adj_term = (
-                self.adj_dist_int[active_edge_idx].to(torch.long)
-                - self.y_A[active_a].to(torch.long)
+            c_min = torch.full(
+                (c_size,), sentinel, device=self.device, dtype=torch.long
             )
-            min_adj_term.scatter_reduce_(
-                0, active_free_pos, adj_term, reduce="amin", include_self=True
+            c_min.scatter_reduce_(
+                0, c_active_pos, c_term, reduce="amin", include_self=True
+            )
+
+            chunk_slice = slice(c_start, c_end)
+            min_adj_term[chunk_slice] = torch.minimum(
+                min_adj_term[chunk_slice], c_min
             )
 
         min_slack2_per_blue = torch.full(
@@ -685,30 +700,40 @@ class SimpleGPUSolver:
         if total_edges == 0:
             return set2_count_per_blue
 
-        edge_range = _ensure_long_arange(
-            self, "_set2_edge_arange", total_edges, self.device
-        )
-        free_pos = _ensure_long_arange(self, "_set2_free_pos", num_free, self.device)
-        cum_len = torch.cumsum(lengths, dim=0)
-        packed_starts = cum_len - lengths
+        chunk = self.adj_chunk_size
+        for c_start in range(0, num_free, chunk):
+            c_end = min(c_start + chunk, num_free)
+            c_b = B_free[c_start:c_end]
+            c_size = c_end - c_start
 
-        active_free_pos = torch.repeat_interleave(free_pos, lengths)
-        active_b = B_free[active_free_pos]
-        active_edge_idx = (
-            torch.repeat_interleave(starts, lengths)
-            + edge_range
-            - torch.repeat_interleave(packed_starts, lengths)
-        )
+            c_starts = self.adj_ptr[c_b]
+            c_ends = self.adj_ptr[c_b + 1]
+            c_len = c_ends - c_starts
+            c_total = int(c_len.sum().item())
+            if c_total == 0:
+                continue
 
-        active_a = self.adj_col[active_edge_idx]
-        target_y_a = self.adj_dist_int[active_edge_idx] + 1 - self.y_B[active_b]
-        is_candidate = self.y_A[active_a] == target_y_a
-        cand_free_pos = active_free_pos[is_candidate]
+            c_free_pos = torch.arange(c_size, device=self.device, dtype=torch.long)
+            c_edge_range = torch.arange(c_total, device=self.device, dtype=torch.long)
+            c_cum = c_len.cumsum(0)
+            c_packed = c_cum - c_len
 
-        if cand_free_pos.numel() != 0:
-            set2_count_per_blue.scatter_add_(
-                0, cand_free_pos, torch.ones_like(cand_free_pos)
+            c_active_pos = torch.repeat_interleave(c_free_pos, c_len)
+            c_active_edge = (
+                torch.repeat_interleave(c_starts, c_len)
+                + c_edge_range
+                - torch.repeat_interleave(c_packed, c_len)
             )
+            c_active_b = c_b[c_active_pos]
+            c_active_a = self.adj_col[c_active_edge]
+
+            c_target = self.adj_dist_int[c_active_edge] + 1 - self.y_B[c_active_b]
+            c_cand = self.y_A[c_active_a] == c_target
+            c_cand_pos = c_active_pos[c_cand]
+            if c_cand_pos.numel() != 0:
+                set2_count_per_blue[c_start:c_end].scatter_add_(
+                    0, c_cand_pos, torch.ones_like(c_cand_pos)
+                )
         return set2_count_per_blue
 
     def _set2_sample(self, B_free, choose_set2):
