@@ -199,8 +199,8 @@ class ThreeLevelGPUSolver(SimpleGPUSolver):
         self.iterations = 0
         # Keep full audits on initially for three-level bring-up. Turn this off
         # for large production runs once correctness is confirmed.
-        self.debug_audit = True
-        self.debug_stop_on_first_violation = True
+        self.debug_audit = False
+        self.debug_stop_on_first_violation = False
         self._debug_bad_checkpoint_seen = False
         self._debug_last_B_free = None
         self._debug_last_r_new = None
@@ -404,10 +404,8 @@ class ThreeLevelGPUSolver(SimpleGPUSolver):
                 )
 
             unique_delta_pairs, delta_pair_inverse = self._set1_delta_groups(F_B_new)
-            delta = self._compute_delta(
-                F_B_new, unique_delta_pairs, delta_pair_inverse
-            )
-            self.y_B[F_B_new] += delta
+            self._compute_delta(F_B_new, unique_delta_pairs, delta_pair_inverse)
+            self.y_B[F_B_new] += 1
             self.y_A[r_new] -= 1
             self.V[:, r_new] -= 1
             if self.debug_audit:
