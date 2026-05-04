@@ -11,6 +11,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -27,12 +28,11 @@ BATCH_SIZE = 2048
 MAX_ITERS = 999_999_999
 SEED = 42
 DIAMETER_TILE = 1024
+VALIDATION_SIZES = [1_000, 5_000, 10_000]
 
 
-def n_values():
-    yield 10_000
-    yield 50_000
-    n = 100_000
+def scalability_n_values():
+    n = 50_000
     while True:
         yield n
         n += 50_000
@@ -96,6 +96,43 @@ def avg_matching_cost(A, B, match_B, diameter):
     return torch.norm(B - A[match_B], p=2, dim=1).mean().item() * diameter
 
 
+def run_exact_solver(A, B, diameter):
+    """
+    Exact optimal transport cost via POT (Earth Mover's Distance).
+    A, B: normalized CUDA float32 tensors of shape (N, d).
+    Returns average matching cost in original coordinates.
+    """
+    try:
+        import ot as pot
+    except ImportError:
+        print("[Exact] ERROR: POT library not installed (pip install POT)", flush=True)
+        return {"status": "error", "cost": math.nan}
+
+    try:
+        sync()
+        N = A.shape[0]
+        A_cpu = A.cpu().numpy().astype(np.float64)
+        B_cpu = B.cpu().numpy().astype(np.float64)
+
+        C = np.empty((N, N), dtype=np.float64)
+        dim = A_cpu.shape[1]
+        block = max(1, min(N, int(32_000_000 // max(1, N * dim))))
+        for start in range(0, N, block):
+            end = min(start + block, N)
+            diff = B_cpu[start:end, None, :] - A_cpu[None, :, :]
+            C[start:end] = np.sqrt((diff ** 2).sum(axis=2))
+
+        weights = np.ones(N, dtype=np.float64) / N
+        avg_cost_normalized = pot.emd2(weights, weights, C)
+        avg_cost = float(avg_cost_normalized) * diameter
+
+        print(f"[Exact]   Avg Cost: {avg_cost:.5f}", flush=True)
+        return {"status": "ok", "cost": avg_cost}
+    except Exception as exc:
+        print(f"[Exact] ERROR: {exc}", flush=True)
+        return {"status": "error", "cost": math.nan}
+
+
 def run_solver(label, solver_cls, A, B, diameter):
     cleanup()
     solver = None
@@ -138,7 +175,36 @@ def status_value(result, key):
     return result["status"].upper()
 
 
-def print_summary(rows):
+def exact_value(result):
+    if result["status"] == "ok":
+        return f"{result['cost']:.5f}"
+    return result["status"].upper()
+
+
+def print_validation_summary(rows):
+    headers = [
+        "N",
+        "Exact Avg Cost",
+        "2-Level Time (s)",
+        "2-Level Avg Cost",
+        "3-Level Time (s)",
+        "3-Level Avg Cost",
+    ]
+    table = [
+        [
+            f"{row['n']:,}",
+            exact_value(row["exact"]),
+            status_value(row["sol2"], "time"),
+            status_value(row["sol2"], "cost"),
+            status_value(row["sol3"], "time"),
+            status_value(row["sol3"], "cost"),
+        ]
+        for row in rows
+    ]
+    print_table("Validation Summary", headers, table)
+
+
+def print_scalability_summary(rows):
     headers = [
         "N",
         "2-Level Time (s)",
@@ -146,30 +212,62 @@ def print_summary(rows):
         "3-Level Time (s)",
         "3-Level Avg Cost",
     ]
-    table = []
-    for row in rows:
-        table.append(
-            [
-                f"{row['n']:,}",
-                status_value(row["sol2"], "time"),
-                status_value(row["sol2"], "cost"),
-                status_value(row["sol3"], "time"),
-                status_value(row["sol3"], "cost"),
-            ]
-        )
+    table = [
+        [
+            f"{row['n']:,}",
+            status_value(row["sol2"], "time"),
+            status_value(row["sol2"], "cost"),
+            status_value(row["sol3"], "time"),
+            status_value(row["sol3"], "cost"),
+        ]
+        for row in rows
+    ]
+    print_table("Scalability Summary", headers, table)
+
+
+def print_table(title, headers, table):
     widths = [len(h) for h in headers]
     for row in table:
         widths = [max(w, len(v)) for w, v in zip(widths, row)]
-    print("\nSummary", flush=True)
+    print(f"\n{title}", flush=True)
     print(" | ".join(f"{h:>{w}}" for h, w in zip(headers, widths)), flush=True)
     print("-+-".join("-" * w for w in widths), flush=True)
     for row in table:
         print(" | ".join(f"{v:>{w}}" for v, w in zip(row, widths)), flush=True)
 
 
-def save_csv(rows):
+def save_validation_csv(rows):
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = SCRIPT_DIR / f"scalability_synthetic_results_{stamp}.csv"
+    path = SCRIPT_DIR / f"scalability_synthetic_validation_{stamp}.csv"
+    with path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "N",
+                "Exact Avg Cost",
+                "2-Level Time (s)",
+                "2-Level Avg Cost",
+                "3-Level Time (s)",
+                "3-Level Avg Cost",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    row["n"],
+                    exact_value(row["exact"]),
+                    status_value(row["sol2"], "time"),
+                    status_value(row["sol2"], "cost"),
+                    status_value(row["sol3"], "time"),
+                    status_value(row["sol3"], "cost"),
+                ]
+            )
+    print(f"\nSaved validation CSV: {path}", flush=True)
+
+
+def save_scalability_csv(rows):
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = SCRIPT_DIR / f"scalability_synthetic_scalability_{stamp}.csv"
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(
@@ -191,20 +289,47 @@ def save_csv(rows):
                     status_value(row["sol3"], "cost"),
                 ]
             )
-    print(f"\nSaved CSV: {path}", flush=True)
+    print(f"\nSaved scalability CSV: {path}", flush=True)
 
 
-def main():
-    assert torch.cuda.is_available(), "CUDA is required"
-    print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
+def run_validation_phase():
+    print("\n=== Phase 1: Validation ===", flush=True)
+    val_rows = []
+    for n in VALIDATION_SIZES:
+        print(f"\n=== Validation N = {n} ===", flush=True)
+        alloc, reserved = gpu_mem_gb()
+        print(f"GPU Memory: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved", flush=True)
+        try:
+            A, B, diameter = make_data(n)
+        except torch.cuda.OutOfMemoryError:
+            cleanup()
+            print(f"DATA OOM while generating or normalizing validation N={n:,}; skipping.", flush=True)
+            continue
+        except Exception as exc:
+            cleanup()
+            print(f"DATA ERROR at validation N={n:,}: {exc}; skipping.", flush=True)
+            continue
 
+        exact = run_exact_solver(A, B, diameter)
+        sol2 = run_solver("2-Level", SimpleGPUSolver, A, B, diameter)
+        sol3 = run_solver("3-Level", ThreeLevelGPUSolver, A, B, diameter)
+        val_rows.append({"n": n, "exact": exact, "sol2": sol2, "sol3": sol3})
+
+        del A, B
+        cleanup()
+
+    print_validation_summary(val_rows)
+    save_validation_csv(val_rows)
+    return val_rows
+
+
+def run_scalability_phase():
+    print("\n=== Phase 2: Scalability ===", flush=True)
     rows = []
     sol2_active = True
     sol3_active = True
 
-    for n in n_values():
+    for n in scalability_n_values():
         print(f"\n=== N = {n} ===", flush=True)
         alloc, reserved = gpu_mem_gb()
         print(f"GPU Memory: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved", flush=True)
@@ -254,8 +379,19 @@ def main():
             print("Both solvers have OOMed; stopping.", flush=True)
             break
 
-    print_summary(rows)
-    save_csv(rows)
+    print_scalability_summary(rows)
+    save_scalability_csv(rows)
+    return rows
+
+
+def main():
+    assert torch.cuda.is_available(), "CUDA is required"
+    print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+
+    run_validation_phase()
+    run_scalability_phase()
 
 
 if __name__ == "__main__":
