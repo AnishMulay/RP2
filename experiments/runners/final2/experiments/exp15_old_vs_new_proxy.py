@@ -73,17 +73,25 @@ OLD_RADIUS_SCHEME = "geometric"
 OLD_PAIR_CHUNK = 128
 VALIDATION_TOL = 1e-5
 
-DEFAULT_DATASETS = ["synthetic2d", "mnist_equal", "mnist_biased"]
+DEFAULT_DATASETS = [
+    "synthetic2d",
+    "mnist_equal",
+    "mnist_biased",
+    "emnist_equal",
+    "emnist_biased",
+    "newsgroups",
+    "cifar_sift",
+]
+FINAL_N_VALUES = [500, 1000, 1500, 2000, 2500]
 DEFAULT_N_BY_DATASET = {
-    "synthetic2d": [500, 1000, 2000, 5000],
-    "mnist_equal": [500, 1000, 2000, 5000],
-    "mnist_biased": [500, 1000, 2000, 5000],
-    "emnist_equal": [500, 1000, 2000, 5000],
-    "emnist_biased": [500, 1000, 2000, 5000],
-    "cifar_sift": [500, 1000, 2000, 3000],
-    "newsgroups": [500, 1000, 2000, 3000],
+    "synthetic2d": FINAL_N_VALUES,
+    "mnist_equal": FINAL_N_VALUES,
+    "mnist_biased": FINAL_N_VALUES,
+    "emnist_equal": FINAL_N_VALUES,
+    "emnist_biased": FINAL_N_VALUES,
+    "newsgroups": FINAL_N_VALUES,
+    "cifar_sift": FINAL_N_VALUES,
 }
-QUICK_N_VALUES = [500, 1000]
 
 BLUE_DIGITS = list(range(5))
 RED_DIGITS = list(range(5, 10))
@@ -965,7 +973,7 @@ def run_experiment(
 
 def run(device: torch.device, **kwargs) -> list[dict]:
     dataset_keys = kwargs.get("dataset_keys", DEFAULT_DATASETS)
-    n_values = kwargs.get("n_values", QUICK_N_VALUES)
+    n_values = kwargs.get("n_values", FINAL_N_VALUES)
     seed = int(kwargs.get("seed", SEED))
     epsilon = float(kwargs.get("epsilon", EPSILON))
     if not kwargs.get("skip_validation", False):
@@ -1104,21 +1112,31 @@ def write_outputs(rows: list[dict], validation: dict, output_dir: Path, seed: in
     return {"markdown": str(md_path), "json": str(json_path), "csv": str(csv_path)}
 
 
-def _parse_datasets(raw: str) -> list[str]:
+def parse_csv_datasets(raw: str) -> list[str]:
     if raw.strip().lower() == "all":
-        return list(DATASET_LOADERS.keys())
+        return list(DEFAULT_DATASETS)
     keys = [x.strip().lower() for x in raw.split(",") if x.strip()]
     unknown = [k for k in keys if k not in DATASET_LOADERS]
     if unknown:
-        raise ValueError(f"unknown dataset key(s): {', '.join(unknown)}")
+        supported = ", ".join(DEFAULT_DATASETS)
+        raise ValueError(
+            f"unknown dataset key(s): {', '.join(unknown)}. Supported: all,{supported}"
+        )
     return keys
+
+
+def parse_csv_ints(raw: str) -> list[int]:
+    values = [int(x.strip()) for x in raw.split(",") if x.strip()]
+    if not values:
+        raise ValueError("at least one N value is required")
+    return values
 
 
 def _parse_n_values(raw: str | None, dataset_keys: list[str]) -> dict[str, list[int]]:
     if raw:
-        values = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        values = parse_csv_ints(raw)
         return {key: values for key in dataset_keys}
-    return {key: QUICK_N_VALUES if key in DEFAULT_DATASETS else DEFAULT_N_BY_DATASET[key] for key in dataset_keys}
+    return {key: list(DEFAULT_N_BY_DATASET[key]) for key in dataset_keys}
 
 
 def main() -> None:
@@ -1148,8 +1166,11 @@ def main() -> None:
     if args.validate_old_proxy:
         return
 
-    dataset_keys = _parse_datasets(args.datasets)
-    n_values_by_dataset = _parse_n_values(args.n_values, dataset_keys)
+    try:
+        dataset_keys = parse_csv_datasets(args.datasets)
+        n_values_by_dataset = _parse_n_values(args.n_values, dataset_keys)
+    except ValueError as exc:
+        parser.error(str(exc))
     rows = run_experiment(dataset_keys, n_values_by_dataset, device, args.seed, args.epsilon)
     print_table(rows)
     write_outputs(rows, validation, Path(args.output_dir), args.seed, args.epsilon, device)
