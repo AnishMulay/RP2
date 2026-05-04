@@ -136,9 +136,14 @@ def run_exact_solver(A, B, diameter):
 def run_solver(label, solver_cls, A, B, diameter):
     cleanup()
     solver = None
+    t_cluster_start = None
+    t_cluster_end = None
+    t_solve_start = None
+    t_solve_end = None
+
     try:
         sync()
-        start = time.time()
+        t_cluster_start = time.time()
         solver = solver_cls(
             A,
             B,
@@ -148,22 +153,68 @@ def run_solver(label, solver_cls, A, B, diameter):
             diameter=1.0,
             max_iters=MAX_ITERS,
         )
+        sync()
+        t_cluster_end = time.time()
+        print(
+            f"[{label}] Clustering done in {t_cluster_end - t_cluster_start:.2f}s",
+            flush=True,
+        )
+    except torch.cuda.OutOfMemoryError:
+        cleanup()
+        print(f"[{label}] OOM during CLUSTERING -- see last [MEM] line above", flush=True)
+        return {"status": "oom", "phase": "clustering", "time": math.nan, "cost": math.nan}
+    except Exception as exc:
+        cleanup()
+        print(f"[{label}] ERROR during CLUSTERING: {exc}", flush=True)
+        return {"status": "error", "phase": "clustering", "time": math.nan, "cost": math.nan}
+
+    match_B = None
+    try:
+        sync()
+        t_solve_start = time.time()
         match_B = solver.solve()
         sync()
-        elapsed = time.time() - start
+        t_solve_end = time.time()
+    except torch.cuda.OutOfMemoryError:
+        cleanup()
+        phase = getattr(solver, "_oom_phase", "unknown")
+        print(f"[{label}] OOM during SOLVE at sub-step: {phase}", flush=True)
+        del solver
+        solver = None
+        cleanup()
+        return {"status": "oom", "phase": f"solve:{phase}", "time": math.nan, "cost": math.nan}
+    except Exception as exc:
+        cleanup()
+        phase = getattr(solver, "_oom_phase", "unknown")
+        print(f"[{label}] ERROR during SOLVE at sub-step {phase}: {exc}", flush=True)
+        del solver
+        solver = None
+        cleanup()
+        return {"status": "error", "phase": f"solve:{phase}", "time": math.nan, "cost": math.nan}
+
+    try:
         if match_B is None:
             match_B = solver.match_B
         cost = avg_matching_cost(A, B, match_B, diameter)
-        print(f"[{label}] Time: {elapsed:.2f}s | Avg Cost: {cost:.5f}", flush=True)
-        return {"status": "ok", "time": elapsed, "cost": cost}
-    except torch.cuda.OutOfMemoryError:
-        cleanup()
-        print(f"[{label}] OOM", flush=True)
-        return {"status": "oom", "time": math.nan, "cost": math.nan}
+        t_total = (t_cluster_end - t_cluster_start) + (t_solve_end - t_solve_start)
+        print(
+            f"[{label}] Cluster: {t_cluster_end - t_cluster_start:.2f}s  "
+            f"Solve: {t_solve_end - t_solve_start:.2f}s  "
+            f"Total: {t_total:.2f}s  |  Avg Cost: {cost:.5f}",
+            flush=True,
+        )
+        return {
+            "status": "ok",
+            "phase": "done",
+            "time": t_total,
+            "time_cluster": t_cluster_end - t_cluster_start,
+            "time_solve": t_solve_end - t_solve_start,
+            "cost": cost,
+        }
     except Exception as exc:
         cleanup()
-        print(f"[{label}] ERROR: {exc}", flush=True)
-        return {"status": "error", "time": math.nan, "cost": math.nan}
+        print(f"[{label}] ERROR during cost computation: {exc}", flush=True)
+        return {"status": "error", "phase": "cost", "time": math.nan, "cost": math.nan}
     finally:
         del solver
         cleanup()
@@ -171,7 +222,8 @@ def run_solver(label, solver_cls, A, B, diameter):
 
 def status_value(result, key):
     if result["status"] == "ok":
-        return f"{result[key]:.5f}" if key == "cost" else f"{result[key]:.2f}"
+        value = result.get(key, math.nan)
+        return f"{value:.5f}" if key == "cost" else f"{value:.2f}"
     return result["status"].upper()
 
 
@@ -186,8 +238,12 @@ def print_validation_summary(rows):
         "N",
         "Exact Avg Cost",
         "2-Level Time (s)",
+        "2-Level Cluster Time (s)",
+        "2-Level Solve Time (s)",
         "2-Level Avg Cost",
         "3-Level Time (s)",
+        "3-Level Cluster Time (s)",
+        "3-Level Solve Time (s)",
         "3-Level Avg Cost",
     ]
     table = [
@@ -195,8 +251,12 @@ def print_validation_summary(rows):
             f"{row['n']:,}",
             exact_value(row["exact"]),
             status_value(row["sol2"], "time"),
+            status_value(row["sol2"], "time_cluster"),
+            status_value(row["sol2"], "time_solve"),
             status_value(row["sol2"], "cost"),
             status_value(row["sol3"], "time"),
+            status_value(row["sol3"], "time_cluster"),
+            status_value(row["sol3"], "time_solve"),
             status_value(row["sol3"], "cost"),
         ]
         for row in rows
@@ -208,16 +268,24 @@ def print_scalability_summary(rows):
     headers = [
         "N",
         "2-Level Time (s)",
+        "2-Level Cluster Time (s)",
+        "2-Level Solve Time (s)",
         "2-Level Avg Cost",
         "3-Level Time (s)",
+        "3-Level Cluster Time (s)",
+        "3-Level Solve Time (s)",
         "3-Level Avg Cost",
     ]
     table = [
         [
             f"{row['n']:,}",
             status_value(row["sol2"], "time"),
+            status_value(row["sol2"], "time_cluster"),
+            status_value(row["sol2"], "time_solve"),
             status_value(row["sol2"], "cost"),
             status_value(row["sol3"], "time"),
+            status_value(row["sol3"], "time_cluster"),
+            status_value(row["sol3"], "time_solve"),
             status_value(row["sol3"], "cost"),
         ]
         for row in rows

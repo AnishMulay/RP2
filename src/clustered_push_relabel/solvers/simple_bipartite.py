@@ -209,6 +209,7 @@ class SimpleGPUSolver:
         self._debug_last_V_at_proposal = None
 
     def solve(self):
+        self._oom_phase = "start"
         N = self.N
         device = self.device
         B_free = torch.arange(N, device=device, dtype=torch.long)
@@ -236,10 +237,12 @@ class SimpleGPUSolver:
                 )
                 self._snapshot_phase_context(B_free=B_free, reset_phase=True)
 
+            self._oom_phase = "set1_groups"
             pair_inverse, set1_counts, set1_offsets, set1_values = (
                 self._set1_groups(B_free)
             )
             set1_count_per_blue = set1_counts[pair_inverse]
+            self._oom_phase = "set2_counts"
             set2_count_per_blue = self._set2_counts(B_free)
             if self.debug_audit:
                 set1_eligible = self._set1_eligible_mask(B_free)
@@ -263,6 +266,7 @@ class SimpleGPUSolver:
             proposal_a_parts = []
             proposal_b_parts = []
 
+            self._oom_phase = "set1_sample"
             b1, a1 = self._sample_set1_choices(
                 B_free,
                 pair_inverse,
@@ -275,6 +279,7 @@ class SimpleGPUSolver:
                 proposal_a_parts.append(a1)
                 proposal_b_parts.append(b1)
 
+            self._oom_phase = "set2_sample"
             b2, a2 = self._set2_sample(B_free, choose_set2)
             if a2.numel() != 0:
                 proposal_a_parts.append(a2)
@@ -307,10 +312,13 @@ class SimpleGPUSolver:
                         iteration,
                         require_matched_equality=True,
                     )
+                self._oom_phase = "set1_delta_groups"
                 unique_delta_pairs, delta_pair_inverse = self._set1_delta_groups(B_free)
+                self._oom_phase = "compute_delta"
                 delta = self._compute_delta(
                     B_free, unique_delta_pairs, delta_pair_inverse
                 )
+                self._oom_phase = "dual_yB_update"
                 self.y_B[B_free] += delta
                 if self.debug_audit:
                     self.audit_full_feasibility(
@@ -357,6 +365,7 @@ class SimpleGPUSolver:
                     require_matched_equality=True,
                 )
 
+            self._oom_phase = "conflict_resolution"
             r_new, b_new = self._resolve_conflicts(proposal_a, proposal_b)
             if self.debug_audit:
                 self._snapshot_phase_context(r_new=r_new, b_new=b_new)
@@ -375,10 +384,13 @@ class SimpleGPUSolver:
                         iteration,
                         require_matched_equality=True,
                     )
+                self._oom_phase = "set1_delta_groups"
                 unique_delta_pairs, delta_pair_inverse = self._set1_delta_groups(B_free)
+                self._oom_phase = "compute_delta"
                 delta = self._compute_delta(
                     B_free, unique_delta_pairs, delta_pair_inverse
                 )
+                self._oom_phase = "dual_yB_update"
                 self.y_B[B_free] += delta
                 if self.debug_audit:
                     self.audit_full_feasibility(
@@ -401,6 +413,7 @@ class SimpleGPUSolver:
             accepted_is_set1 = proposal_is_set1[accepted_prop_idx]
             self.phase_match_is_set1[b_new] = accepted_is_set1
 
+            self._oom_phase = "update_matching"
             F_B_new = self._update_matching(B_free, r_new, b_new)
             if self.debug_audit:
                 self._snapshot_phase_context(F_B_new=F_B_new)
@@ -410,12 +423,17 @@ class SimpleGPUSolver:
                     require_matched_equality=False,
                 )
 
+            self._oom_phase = "set1_delta_groups"
             unique_delta_pairs, delta_pair_inverse = self._set1_delta_groups(F_B_new)
+            self._oom_phase = "compute_delta"
             delta = self._compute_delta(
                 F_B_new, unique_delta_pairs, delta_pair_inverse
             )
+            self._oom_phase = "dual_yB_update"
             self.y_B[F_B_new] += delta
+            self._oom_phase = "dual_yA_update"
             self.y_A[r_new] -= 1
+            self._oom_phase = "V_column_update"
             self.V[:, r_new] -= 1
             if self.debug_audit:
                 self.audit_full_feasibility(
