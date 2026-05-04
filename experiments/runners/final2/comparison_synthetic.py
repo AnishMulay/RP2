@@ -11,6 +11,7 @@ import gc
 import math
 import sys
 import time
+import warnings as _warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -137,10 +138,25 @@ def run_exact_emd(A_cuda, B_cuda, diameter):
         a = np.ones(N, dtype=np.float64) / N
         b = np.ones(N, dtype=np.float64) / N
 
-        cost_normalized = pot.emd2(a, b, C)
+        with _warnings.catch_warnings(record=True) as caught_warnings:
+            _warnings.simplefilter("always")
+            cost_normalized = pot.emd2(a, b, C, numItermax=1_000_000)
+
+        did_not_converge = any(
+            "numItermax" in str(w.message) for w in caught_warnings
+        )
         sync()
         elapsed = time.time() - t0
         cost = float(cost_normalized) * diameter
+
+        if did_not_converge:
+            print(
+                f"  [Exact EMD] DNC — numItermax=1,000,000 reached before optimality "
+                f"at N={N}. Reported cost {cost:.5f} "
+                f"is an UPPER BOUND, not the true optimum.",
+                flush=True,
+            )
+            return {"status": "dnc", "cost": cost, "time": elapsed, "peak_gb": 0.0}
 
         print(f"  [Exact EMD] Time: {elapsed:.2f}s | Avg Cost: {cost:.5f}", flush=True)
         return {"status": "ok", "cost": cost, "time": elapsed, "peak_gb": 0.0}
@@ -395,6 +411,11 @@ def result_value(result, key):
             return "N/A"
         return f"{value:.5f}" if key == "cost" else f"{value:.2f}"
     if status == "dnc":
+        value = result.get(key, math.nan)
+        if math.isfinite(value) and key == "cost":
+            return f"{value:.5f}*"
+        if math.isfinite(value) and key == "time":
+            return f"{value:.2f}"
         return "DNC"
     if status == "skip":
         return "SKIP"
@@ -486,6 +507,13 @@ def print_accuracy_table(rows):
     print(
         "\nNotes: Sinkhorn costs are soft plan costs and biased upper estimates of OT. "
         "Push-relabel rows report hard matching average L2 cost with additive epsilon guarantee.",
+        flush=True,
+    )
+    print(
+        "* Exact EMD marked DNC: numItermax=1,000,000 reached before optimality. "
+        "Cost shown is a feasible upper bound, not the true optimum. "
+        "Sinkhorn (eps_reg=0.001) may legitimately show a lower cost than "
+        "a non-converged exact solution.",
         flush=True,
     )
 
