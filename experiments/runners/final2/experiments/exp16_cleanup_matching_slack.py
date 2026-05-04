@@ -366,12 +366,15 @@ def _summarize_slack(
         else torch.empty(0, device=solver.device, dtype=torch.float32)
     )
     unit = float(EPSILON) * float(scale)
-    proxy_slack = (proxy_int.to(torch.float32) - dual_int) * unit
-    true_slack = true_costs.to(solver.device, dtype=torch.float32) - dual_int * unit
+    proxy_slack_total_scale = (proxy_int.to(torch.float32) - dual_int) * unit
+    true_slack_total_scale = true_costs.to(solver.device, dtype=torch.float32) - dual_int * unit
+    proxy_slack = proxy_slack_total_scale / float(n)
+    true_slack = true_slack_total_scale / float(n)
 
+    proxy_total = float(proxy_slack_total_scale.sum().item()) if proxy_slack.numel() else 0.0
+    true_total = float(true_slack_total_scale.sum().item()) if true_slack.numel() else 0.0
     proxy_sum = float(proxy_slack.sum().item()) if proxy_slack.numel() else 0.0
     true_sum = float(true_slack.sum().item()) if true_slack.numel() else 0.0
-    exact_total = float(exact_cost) * float(n)
 
     return {
         "dataset": display_name,
@@ -383,12 +386,14 @@ def _summarize_slack(
         "epsilon": EPSILON,
         "scale": float(scale),
         "exact_cost": float(exact_cost),
-        "exact_total_cost": exact_total,
+        "exact_total_cost": float(exact_cost) * float(n),
         "exact_time_ms": float(exact_time_ms),
         "solve_time_ms": float(solve_time_ms),
         "iterations": int(solver.iterations),
         "cleanup_count": int(cleanup_b.numel()),
         "cleanup_direct_count": int(direct_count),
+        "proxy_slack_cost_total": proxy_total,
+        "true_slack_cost_total": true_total,
         "proxy_slack_cost_sum": proxy_sum,
         "true_slack_cost_sum": true_sum,
         "proxy_slack_cost_avg": proxy_sum / max(int(cleanup_b.numel()), 1),
@@ -397,8 +402,8 @@ def _summarize_slack(
         "true_slack_cost_min": float(true_slack.min().item()) if true_slack.numel() else 0.0,
         "proxy_slack_cost_max": float(proxy_slack.max().item()) if proxy_slack.numel() else 0.0,
         "true_slack_cost_max": float(true_slack.max().item()) if true_slack.numel() else 0.0,
-        "proxy_slack_fraction": compute_ratio(exact_total, proxy_sum),
-        "true_slack_fraction": compute_ratio(exact_total, true_sum),
+        "proxy_slack_fraction": compute_ratio(exact_cost, proxy_sum),
+        "true_slack_fraction": compute_ratio(exact_cost, true_sum),
     }
 
 
@@ -420,6 +425,8 @@ def _skip_row(display_name: str, n: int, exc: Exception | str) -> dict:
         "iterations": nan,
         "cleanup_count": nan,
         "cleanup_direct_count": nan,
+        "proxy_slack_cost_total": nan,
+        "true_slack_cost_total": nan,
         "proxy_slack_cost_sum": nan,
         "true_slack_cost_sum": nan,
         "proxy_slack_cost_avg": nan,
@@ -514,7 +521,7 @@ def run(device: torch.device, **kwargs) -> list[dict]:
     print(f"  Device: {device}  epsilon={EPSILON}", flush=True)
     print(f"{'=' * 65}", flush=True)
     print(
-        "  Fractions use total exact matching cost: exact_ot_cost * N.",
+        "  Slack costs are reported as sum(cleanup slack) / N; fractions divide by exact OT cost.",
         flush=True,
     )
 
