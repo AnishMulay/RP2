@@ -17,8 +17,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# GeomLoss excluded: PyKeOps is incompatible with CUDA 13.x (system has CUDA 13.2).
-# POT sinkhorn_log is used as the sole Sinkhorn baseline.
+# GeomLoss/PyKeOps excluded: PyKeOps requires runtime CUDA kernel compilation
+# which is incompatible with CUDA 13.x (system: CUDA 13.2, PyKeOps 2.3).
+# POT sinkhorn (log-domain stabilized) is used as the Sinkhorn baseline.
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent.parent
@@ -35,8 +36,8 @@ MAX_ITERS = 999_999_999
 
 DIAMETER_TILE = 1024
 ACCURACY_SIZES = [1_000, 5_000, 10_000]
-ACCURACY_SEEDS = [42, 123, 777, 999, 1337]  # 5 seeds for accuracy table
-SCALABILITY_SEEDS = [42, 123, 777]  # 3 seeds for scalability table
+ACCURACY_SEEDS = [42, 123, 777, 999, 1337]
+SCALABILITY_SEEDS = [42, 123, 777]
 SINKHORN_REGS = [0.1, 0.01, 0.001]
 
 
@@ -189,11 +190,12 @@ def run_sinkhorn_pot(A_cuda, B_cuda, diameter, reg):
             compute_mode="use_mm_for_euclid_dist_if_necessary",
         )
 
-        T, sinkhorn_log_dict = pot.sinkhorn_log(
+        T, sinkhorn_log_dict = pot.sinkhorn(
             a,
             b,
             C,
             reg=reg,
+            method="sinkhorn_log",
             numItermax=10000,
             stopThr=1e-9,
             log=True,
@@ -202,16 +204,13 @@ def run_sinkhorn_pot(A_cuda, B_cuda, diameter, reg):
         sync()
         elapsed = time.time() - t0
 
-        converged = True
-        if "logu" in sinkhorn_log_dict:
-            err = sinkhorn_log_dict.get("err", [])
-            if len(err) > 0 and float(err[-1]) > 1e-9:
-                converged = False
+        err_list = sinkhorn_log_dict.get("err", [])
+        converged = (len(err_list) == 0) or (float(err_list[-1]) <= 1e-9)
 
         if not converged:
             print(
                 f"  [Sinkhorn eps_reg={reg}] DNC "
-                f"(did not converge, last_err={err[-1]:.2e})",
+                f"(did not converge, last_err={err_list[-1]:.2e})",
                 flush=True,
             )
             del T, C
@@ -370,94 +369,31 @@ def progress_pair(result):
     return f"{result['status'].upper()} / {result['status'].upper()}"
 
 
-def mean_std_rows(rows, n, method, eps_or_blur, key):
-    """Extract values for all seeds matching (n, method, eps_or_blur), return (mean, std)."""
+import statistics as _statistics
+
+
+def _aggregate(rows, n, method, eps_or_blur, key):
     vals = [
         r["result"].get(key, math.nan)
         for r in rows
         if r["n"] == n
         and r["method"] == method
         and str(r["epsilon_or_blur"]) == str(eps_or_blur)
-        and r["result"]["status"] in ("ok",)
+        and r["result"]["status"] == "ok"
+        and math.isfinite(r["result"].get(key, math.nan))
     ]
-    vals = [v for v in vals if math.isfinite(v)]
     if not vals:
         return math.nan, math.nan
-    import statistics
-
     mean = sum(vals) / len(vals)
-    std = statistics.stdev(vals) if len(vals) > 1 else 0.0
+    std = _statistics.stdev(vals) if len(vals) > 1 else 0.0
     return mean, std
 
 
-def mean_std_scalability(rows, n, method, key):
-    vals = [
-        r[method].get(key, math.nan)
-        for r in rows
-        if r["n"] == n and r[method]["status"] in ("ok",)
-    ]
-    vals = [v for v in vals if math.isfinite(v)]
-    if not vals:
-        return math.nan, math.nan
-    import statistics
-
-    mean = sum(vals) / len(vals)
-    std = statistics.stdev(vals) if len(vals) > 1 else 0.0
-    return mean, std
-
-
-def mean_std_delta(rows, n, method, eps_or_blur):
-    vals = [
-        delta_from_exact(r["result"], r["exact_cost"])
-        for r in rows
-        if r["n"] == n
-        and r["method"] == method
-        and str(r["epsilon_or_blur"]) == str(eps_or_blur)
-    ]
-    vals = [v for v in vals if math.isfinite(v)]
-    if not vals:
-        return math.nan, math.nan
-    import statistics
-
-    mean = sum(vals) / len(vals)
-    std = statistics.stdev(vals) if len(vals) > 1 else 0.0
-    return mean, std
-
-
-def mean_std_value(mean, std, key):
+def _fmt_mean_std(mean, std, decimals):
     if not math.isfinite(mean):
         return "N/A"
-    if key == "cost":
-        return f"{mean:.5f} ± {std:.5f}"
-    return f"{mean:.2f} ± {std:.2f}"
-
-
-def aggregate_status_value(rows, n, method, eps_or_blur):
-    statuses = [
-        r["result"]["status"]
-        for r in rows
-        if r["n"] == n
-        and r["method"] == method
-        and str(r["epsilon_or_blur"]) == str(eps_or_blur)
-    ]
-    if statuses and all(status == "dnc" for status in statuses):
-        return "DNC"
-    if statuses and all(status == "oom" for status in statuses):
-        return "OOM"
-    if statuses and all(status == "skip" for status in statuses):
-        return "SKIP"
-    if statuses and all(status == "error" for status in statuses):
-        return "ERROR"
-    return "N/A"
-
-
-def aggregate_scalability_status_value(rows, n, method):
-    statuses = [r[method]["status"] for r in rows if r["n"] == n]
-    if statuses and all(status == "oom" for status in statuses):
-        return "OOM"
-    if statuses and all(status == "error" for status in statuses):
-        return "ERROR"
-    return "N/A"
+    fmt = f".{decimals}f"
+    return f"{mean:{fmt}}±{std:{fmt}}"
 
 
 def print_table(title, headers, table):
@@ -475,10 +411,10 @@ def print_accuracy_table(rows):
     headers = [
         "N",
         "Method",
-        "eps",
-        "Time (s)",
-        "Avg Cost",
-        "Delta from Exact (%)",
+        "eps/blur",
+        "Time (s) mean±std",
+        "Cost mean±std",
+        "Δ mean (%)",
     ]
     table = []
     seen = set()
@@ -489,24 +425,20 @@ def print_accuracy_table(rows):
             seen.add(key)
             groups.append(key)
     for n, method, epsilon_or_blur in groups:
-        time_mean, time_std = mean_std_rows(rows, n, method, epsilon_or_blur, "time")
-        cost_mean, cost_std = mean_std_rows(rows, n, method, epsilon_or_blur, "cost")
-        delta_mean, delta_std = mean_std_delta(rows, n, method, epsilon_or_blur)
-        status_value = aggregate_status_value(rows, n, method, epsilon_or_blur)
+        time_mean, time_std = _aggregate(rows, n, method, epsilon_or_blur, "time")
+        cost_mean, cost_std = _aggregate(rows, n, method, epsilon_or_blur, "cost")
+        exact_mean, _ = _aggregate(rows, n, "Exact EMD", "", "cost")
+        delta = math.nan
+        if math.isfinite(cost_mean) and math.isfinite(exact_mean):
+            delta = (cost_mean - exact_mean) / exact_mean * 100.0
         table.append(
             [
                 f"{n:,}",
                 method,
                 epsilon_or_blur,
-                mean_std_value(time_mean, time_std, "time")
-                if math.isfinite(time_mean)
-                else status_value,
-                mean_std_value(cost_mean, cost_std, "cost")
-                if math.isfinite(cost_mean)
-                else status_value,
-                mean_std_value(delta_mean, delta_std, "time")
-                if math.isfinite(delta_mean)
-                else "N/A",
+                _fmt_mean_std(time_mean, time_std, 2),
+                _fmt_mean_std(cost_mean, cost_std, 5),
+                f"{delta:.2f}" if math.isfinite(delta) else "N/A",
             ]
         )
     print_table("Table 1 - Accuracy", headers, table)
@@ -526,34 +458,24 @@ def print_scalability_table(rows):
         "3-Level Cost",
     ]
     table = []
-    seen = set()
-    n_values = []
     for row in rows:
-        if row["n"] not in seen:
-            seen.add(row["n"])
-            n_values.append(row["n"])
-    for n in n_values:
-        sol2_time_mean, sol2_time_std = mean_std_scalability(rows, n, "sol2", "time")
-        sol2_cost_mean, sol2_cost_std = mean_std_scalability(rows, n, "sol2", "cost")
-        sol3_time_mean, sol3_time_std = mean_std_scalability(rows, n, "sol3", "time")
-        sol3_cost_mean, sol3_cost_std = mean_std_scalability(rows, n, "sol3", "cost")
-        sol2_status = aggregate_scalability_status_value(rows, n, "sol2")
-        sol3_status = aggregate_scalability_status_value(rows, n, "sol3")
+        n = row["n"]
+        flat_rows = []
+        for result in row["sol2"]:
+            flat_rows.append({"n": n, "method": "sol2", "epsilon_or_blur": "", "result": result})
+        for result in row["sol3"]:
+            flat_rows.append({"n": n, "method": "sol3", "epsilon_or_blur": "", "result": result})
+        sol2_time_mean, sol2_time_std = _aggregate(flat_rows, n, "sol2", "", "time")
+        sol2_cost_mean, sol2_cost_std = _aggregate(flat_rows, n, "sol2", "", "cost")
+        sol3_time_mean, sol3_time_std = _aggregate(flat_rows, n, "sol3", "", "time")
+        sol3_cost_mean, sol3_cost_std = _aggregate(flat_rows, n, "sol3", "", "cost")
         table.append(
             [
                 f"{n:,}",
-                mean_std_value(sol2_time_mean, sol2_time_std, "time")
-                if math.isfinite(sol2_time_mean)
-                else sol2_status,
-                mean_std_value(sol2_cost_mean, sol2_cost_std, "cost")
-                if math.isfinite(sol2_cost_mean)
-                else sol2_status,
-                mean_std_value(sol3_time_mean, sol3_time_std, "time")
-                if math.isfinite(sol3_time_mean)
-                else sol3_status,
-                mean_std_value(sol3_cost_mean, sol3_cost_std, "cost")
-                if math.isfinite(sol3_cost_mean)
-                else sol3_status,
+                _fmt_mean_std(sol2_time_mean, sol2_time_std, 2),
+                _fmt_mean_std(sol2_cost_mean, sol2_cost_std, 5),
+                _fmt_mean_std(sol3_time_mean, sol3_time_std, 2),
+                _fmt_mean_std(sol3_cost_mean, sol3_cost_std, 5),
             ]
         )
     print_table("Table 2 - Scalability", headers, table)
@@ -574,6 +496,7 @@ def save_accuracy_csv(rows, stamp):
                 "cost",
                 "delta_from_exact_pct",
                 "cost_type",
+                "hardware",
             ]
         )
         for row in rows:
@@ -589,6 +512,7 @@ def save_accuracy_csv(rows, stamp):
                     csv_result_value(result, "cost"),
                     csv_float(delta),
                     row["cost_type"],
+                    row["hardware"],
                 ]
             )
     print(f"\nSaved accuracy CSV: {path}", flush=True)
@@ -602,7 +526,6 @@ def save_scalability_csv(rows, stamp):
         writer.writerow(
             [
                 "N",
-                "seed",
                 "two_level_time_s",
                 "two_level_cost",
                 "two_level_status",
@@ -613,16 +536,25 @@ def save_scalability_csv(rows, stamp):
             ]
         )
         for row in rows:
+            n = row["n"]
+            flat_rows = []
+            for result in row["sol2"]:
+                flat_rows.append({"n": n, "method": "sol2", "epsilon_or_blur": "", "result": result})
+            for result in row["sol3"]:
+                flat_rows.append({"n": n, "method": "sol3", "epsilon_or_blur": "", "result": result})
+            sol2_time_mean, sol2_time_std = _aggregate(flat_rows, n, "sol2", "", "time")
+            sol2_cost_mean, sol2_cost_std = _aggregate(flat_rows, n, "sol2", "", "cost")
+            sol3_time_mean, sol3_time_std = _aggregate(flat_rows, n, "sol3", "", "time")
+            sol3_cost_mean, sol3_cost_std = _aggregate(flat_rows, n, "sol3", "", "cost")
             writer.writerow(
                 [
-                    row["n"],
-                    row["seed"],
-                    csv_result_value(row["sol2"], "time"),
-                    csv_result_value(row["sol2"], "cost"),
-                    row["sol2"]["status"],
-                    csv_result_value(row["sol3"], "time"),
-                    csv_result_value(row["sol3"], "cost"),
-                    row["sol3"]["status"],
+                    n,
+                    _fmt_mean_std(sol2_time_mean, sol2_time_std, 2),
+                    _fmt_mean_std(sol2_cost_mean, sol2_cost_std, 5),
+                    "ok" if math.isfinite(sol2_time_mean) else "N/A",
+                    _fmt_mean_std(sol3_time_mean, sol3_time_std, 2),
+                    _fmt_mean_std(sol3_cost_mean, sol3_cost_std, 5),
+                    "ok" if math.isfinite(sol3_time_mean) else "N/A",
                     "N/A (N x N matrix)",
                 ]
             )
@@ -630,7 +562,17 @@ def save_scalability_csv(rows, stamp):
     return path
 
 
-def append_accuracy_row(rows, n, seed, method, epsilon_or_blur, result, exact_cost, cost_type):
+def append_accuracy_row(
+    rows,
+    n,
+    seed,
+    method,
+    epsilon_or_blur,
+    result,
+    exact_cost,
+    cost_type,
+    hardware,
+):
     rows.append(
         {
             "n": n,
@@ -640,37 +582,46 @@ def append_accuracy_row(rows, n, seed, method, epsilon_or_blur, result, exact_co
             "result": result,
             "exact_cost": exact_cost,
             "cost_type": cost_type,
+            "hardware": hardware,
         }
     )
 
 
 def run_accuracy_phase():
     print("\n=== Table 1: Accuracy ===", flush=True)
+    print(
+        "\nNote: Sinkhorn eps_reg values span high/medium/low regularization "
+        "relative to mean pairwise L2 ~0.52 in normalized [0,1]^2 uniform data.\n"
+        "Our solver eps=0.01 is an additive per-pair error bound -- a different "
+        "quantity. Sinkhorn costs are soft-plan expected costs biased upward by "
+        "entropic smoothing. Delta from Exact includes this bias.",
+        flush=True,
+    )
     rows = []
 
     for n in ACCURACY_SIZES:
         print(f"\n=== Accuracy N = {n:,} ===", flush=True)
         for seed in ACCURACY_SEEDS:
-            print(f"\n--- Accuracy N = {n:,}, seed = {seed} ---", flush=True)
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
-            alloc, reserved = gpu_mem_gb()
-            print(f"GPU Memory: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved", flush=True)
 
             try:
                 A, B, diameter = make_data(n)
             except torch.cuda.OutOfMemoryError:
                 cleanup()
-                print(
-                    f"DATA OOM while generating or normalizing accuracy N={n:,}, "
-                    f"seed={seed}; skipping.",
-                    flush=True,
-                )
+                print(f"  DATA OOM at N={n}, seed={seed}; skipping.", flush=True)
                 continue
             except Exception as exc:
                 cleanup()
-                print(f"DATA ERROR at accuracy N={n:,}, seed={seed}: {exc}; skipping.", flush=True)
+                print(f"  DATA ERROR at N={n}, seed={seed}: {exc}; skipping.", flush=True)
                 continue
+
+            print(f"--- Accuracy N = {n:,}, seed = {seed} ---", flush=True)
+            alloc, reserved = gpu_mem_gb()
+            print(
+                f"GPU Memory: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved",
+                flush=True,
+            )
 
             cleanup()
             exact = run_exact_emd(A, B, diameter)
@@ -685,6 +636,7 @@ def run_accuracy_phase():
                 exact,
                 exact_cost,
                 "hard_matching_cost",
+                "CPU (single-thread C++)",
             )
 
             for reg in SINKHORN_REGS:
@@ -699,6 +651,7 @@ def run_accuracy_phase():
                     sinkhorn,
                     exact_cost,
                     "soft_plan_cost",
+                    "GPU (RTX 2060 Super, 8GB VRAM)",
                 )
 
             cleanup()
@@ -712,6 +665,7 @@ def run_accuracy_phase():
                 sol2,
                 exact_cost,
                 "hard_matching_cost",
+                "GPU (RTX 2060 Super, 8GB VRAM)",
             )
 
             cleanup()
@@ -725,6 +679,7 @@ def run_accuracy_phase():
                 sol3,
                 exact_cost,
                 "hard_matching_cost",
+                "GPU (RTX 2060 Super, 8GB VRAM)",
             )
 
             del A, B
