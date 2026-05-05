@@ -39,7 +39,7 @@ DATASET = "HiRef halfmoon_Scurve"
 HIREF_SYNTHETIC_SEED = 0
 DEFAULT_MIN_POWER = 5
 DEFAULT_MAX_POWER = 20
-DEFAULT_RP2_EPSILON = 0.001
+DEFAULT_RP2_EPSILONS = "0.01,0.001"
 DEFAULT_BATCH_SIZE = 2048
 DEFAULT_MAX_ITERS = 999_999_999
 DEFAULT_HIREF_HIERARCHY_DEPTH = 6
@@ -123,7 +123,7 @@ def short_error(exc):
     return text.replace("\n", " ")
 
 
-def run_rp2_two_level(source, target, args, device):
+def run_rp2_two_level(source, target, args, device, epsilon):
     solver = None
     cleanup(device)
     baseline = current_gpu_gb(device)
@@ -135,7 +135,7 @@ def run_rp2_two_level(source, target, args, device):
         solver = SimpleGPUSolver(
             source,
             target,
-            epsilon=args.rp2_epsilon,
+            epsilon=epsilon,
             batch_size=args.batch_size,
             tile_size=args.batch_size,
             verbose=args.verbose,
@@ -156,7 +156,7 @@ def run_rp2_two_level(source, target, args, device):
             "input_gpu_baseline_gb": baseline,
             "iterations": getattr(solver, "iterations", math.nan),
             "rank_schedule": "",
-            "epsilon": args.rp2_epsilon,
+            "epsilon": epsilon,
             "batch_size": args.batch_size,
             "error": "",
         }
@@ -172,7 +172,7 @@ def run_rp2_two_level(source, target, args, device):
             "input_gpu_baseline_gb": baseline,
             "iterations": getattr(solver, "iterations", math.nan) if solver else math.nan,
             "rank_schedule": "",
-            "epsilon": args.rp2_epsilon,
+            "epsilon": epsilon,
             "batch_size": args.batch_size,
             "error": short_error(exc),
         }
@@ -187,7 +187,7 @@ def run_rp2_two_level(source, target, args, device):
             "input_gpu_baseline_gb": baseline,
             "iterations": getattr(solver, "iterations", math.nan) if solver else math.nan,
             "rank_schedule": "",
-            "epsilon": args.rp2_epsilon,
+            "epsilon": epsilon,
             "batch_size": args.batch_size,
             "error": short_error(exc),
         }
@@ -311,6 +311,49 @@ def print_result(row):
     )
 
 
+def method_label(row):
+    if row["method"].startswith("RP2_"):
+        return f"RP2 eps={float(row['epsilon']):.3g}"
+    return "HiRef"
+
+
+def print_summary_table(n, rows):
+    if not rows:
+        return
+    headers = ("Method", "Status", "Avg Cost", "Time")
+    body = []
+    for row in rows:
+        cost = row["primal_ot_cost"]
+        wall = row["wall_time_s"]
+        body.append(
+            (
+                method_label(row),
+                row["status"],
+                "N/A" if not math.isfinite(float(cost)) else f"{float(cost):.6f}",
+                "N/A" if not math.isfinite(float(wall)) else f"{float(wall):.2f}s",
+            )
+        )
+
+    widths = [
+        max(len(headers[i]), *(len(r[i]) for r in body))
+        for i in range(len(headers))
+    ]
+    sep = "+-" + "-+-".join("-" * w for w in widths) + "-+"
+    print(f"\nSummary for N={n:,}", flush=True)
+    print(sep, flush=True)
+    print(
+        "| " + " | ".join(f"{headers[i]:<{widths[i]}}" for i in range(len(headers))) + " |",
+        flush=True,
+    )
+    print(sep, flush=True)
+    for row in body:
+        print(
+            "| " + " | ".join(f"{row[i]:>{widths[i]}}" for i in range(len(row))) + " |",
+            flush=True,
+        )
+    print(sep, flush=True)
+
+
 def parse_methods(raw):
     aliases = {
         "rp2": "rp2",
@@ -334,6 +377,21 @@ def parse_methods(raw):
     return methods
 
 
+def parse_float_list(raw):
+    values = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        value = float(part)
+        if value <= 0.0:
+            raise ValueError("epsilon values must be positive")
+        values.append(value)
+    if not values:
+        raise ValueError("at least one epsilon is required")
+    return values
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Benchmark RP2 2-level solver against HiRef on HiRef Half-Moon/S-Curve."
@@ -342,7 +400,17 @@ def main():
     parser.add_argument("--max-power", type=int, default=DEFAULT_MAX_POWER)
     parser.add_argument("--seed", type=int, default=HIREF_SYNTHETIC_SEED)
     parser.add_argument("--methods", default="rp2,hiref")
-    parser.add_argument("--rp2-epsilon", type=float, default=DEFAULT_RP2_EPSILON)
+    parser.add_argument(
+        "--rp2-epsilons",
+        default=DEFAULT_RP2_EPSILONS,
+        help="Comma-separated RP2 epsilon values to run. Default: 0.01,0.001.",
+    )
+    parser.add_argument(
+        "--rp2-epsilon",
+        type=float,
+        default=None,
+        help="Run a single RP2 epsilon value; overrides --rp2-epsilons.",
+    )
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--max-iters", type=int, default=DEFAULT_MAX_ITERS)
     parser.add_argument("--hiref-hierarchy-depth", type=int, default=DEFAULT_HIREF_HIERARCHY_DEPTH)
@@ -358,6 +426,12 @@ def main():
         raise RuntimeError("CUDA is required for both benchmarked GPU methods.")
 
     methods = parse_methods(args.methods)
+    if args.rp2_epsilon is not None:
+        if args.rp2_epsilon <= 0.0:
+            raise ValueError("--rp2-epsilon must be positive")
+        rp2_epsilons = [args.rp2_epsilon]
+    else:
+        rp2_epsilons = parse_float_list(args.rp2_epsilons)
     device = torch.device("cuda")
     dtype = torch.float32 if args.dtype == "float32" else torch.float64
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -368,6 +442,8 @@ def main():
     print(f"Device: {torch.cuda.get_device_name(0)}", flush=True)
     print(f"Output: {csv_path}", flush=True)
     print(f"Sample sizes: {sample_sizes(args.min_power, args.max_power)}", flush=True)
+    if "rp2" in methods:
+        print(f"RP2 epsilons: {', '.join(str(v) for v in rp2_epsilons)}", flush=True)
 
     for n in sample_sizes(args.min_power, args.max_power):
         print(f"\nN={n:,}", flush=True)
@@ -405,8 +481,9 @@ def main():
 
         rows = []
         if "rp2" in methods:
-            rows.append(run_rp2_two_level(source, target, args, device))
-            print_result(rows[-1])
+            for epsilon in rp2_epsilons:
+                rows.append(run_rp2_two_level(source, target, args, device, epsilon))
+                print_result(rows[-1])
         if "hiref" in methods:
             rows.append(run_hiref(source, target, args, device))
             print_result(rows[-1])
@@ -424,15 +501,15 @@ def main():
                 }
             )
         append_rows(csv_path, rows)
+        print_summary_table(n, rows)
 
-        statuses = {row["method"]: row["status"] for row in rows}
         both_oom_seen = rows and all(row["status"] == "oom" for row in rows)
         del source, target
         cleanup(device)
         if both_oom_seen and not args.keep_going:
             print("Both selected methods OOMed; stopping sweep.", flush=True)
             break
-        if any(status == "error" for status in statuses.values()) and not args.keep_going:
+        if any(row["status"] == "error" for row in rows) and not args.keep_going:
             print("A selected method errored; stopping sweep.", flush=True)
             break
 

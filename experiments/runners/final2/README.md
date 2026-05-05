@@ -27,8 +27,11 @@ experiments/runners/final2/results/hiref_synthetic_2d_<timestamp>.csv
 Each CSV row records `n`, method, status, primal OT cost, wall-clock runtime,
 peak GPU memory, RP2 iterations, and the HiRef rank schedule. The default sweep
 uses powers of two from `2^5` through `2^20`, matching the sample sizes in
-HiRef's saved synthetic cost table, and stops when both selected methods OOM or
-a method errors. Use `--keep-going` to continue after failures.
+HiRef's saved synthetic cost table. By default, the RP2 method is run twice for
+each `N`, with `epsilon=0.01` and `epsilon=0.001`, and HiRef is run once. After
+each `N`, the runner prints a compact summary table with average cost and wall
+time. It stops when all selected method rows OOM or a method errors. Use
+`--keep-going` to continue after failures.
 
 HiRef's notebook stores primal costs through `compute_OT_cost()` but does not
 persist a runtime table for this synthetic sweep. This runner records wall-clock
@@ -40,7 +43,8 @@ Useful options:
 python experiments/runners/final2/experiment_hiref_synthetic_2d.py --max-power 17
 python experiments/runners/final2/experiment_hiref_synthetic_2d.py --methods rp2
 python experiments/runners/final2/experiment_hiref_synthetic_2d.py --methods hiref
-python experiments/runners/final2/experiment_hiref_synthetic_2d.py --rp2-epsilon 0.001 --batch-size 2048
+python experiments/runners/final2/experiment_hiref_synthetic_2d.py --rp2-epsilons 0.01,0.001 --batch-size 2048
+python experiments/runners/final2/experiment_hiref_synthetic_2d.py --rp2-epsilon 0.001
 ```
 
 Runtime dependencies are the union of RP2 and HiRef's synthetic notebook stack:
