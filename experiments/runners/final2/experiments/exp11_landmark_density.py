@@ -54,6 +54,8 @@ COL_SPECS = [
     ("2L Landmarks",   14),
     ("3L A1 Landmarks", 16),
     ("2L Local Pairs", 14),
+    ("DR Matrix Size",   14),
+    ("Total Repr Size",  14),
     ("2L Mean",         9),
     ("2L Median",      10),
     ("2L P90",          8),
@@ -69,6 +71,8 @@ FMT_FNS = {
     "2L Landmarks":   lambda r: f"{int(r['landmarks2l_mean']):,}" if not math.isnan(r["landmarks2l_mean"]) else "N/A",
     "3L A1 Landmarks": lambda r: f"{int(r['landmarks3l_mean']):,}" if not math.isnan(r["landmarks3l_mean"]) else "N/A",
     "2L Local Pairs": lambda r: f"{int(r['local_pairs_mean']):,}" if not math.isnan(r["local_pairs_mean"]) else "N/A",
+    "DR Matrix Size":  lambda r: f"{int(r['dr_matrix_size_mean']):,}" if not math.isnan(r.get("dr_matrix_size_mean", math.nan)) else "N/A",
+    "Total Repr Size": lambda r: f"{int(r['total_repr_size_mean']):,}" if not math.isnan(r.get("total_repr_size_mean", math.nan)) else "N/A",
     "2L Mean":        lambda r: fmt_stat(r["r2_mean"]),
     "2L Median":      lambda r: fmt_stat(r["r2_median"]),
     "2L P90":         lambda r: fmt_stat(r["r2_p90"]),
@@ -92,7 +96,6 @@ def load_mnist_equal(n_samples, seed):
         raise ValueError(f"n_samples={n_samples} too small for {len(classes)} classes")
 
     rng_r = np.random.RandomState(seed)
-    rng_b = np.random.RandomState(seed + 1)
     red_parts, blue_parts = [], []
     for cls in classes:
         idx = np.flatnonzero(labels == cls).copy()
@@ -179,6 +182,8 @@ def run(device, **kwargs):
         for c in C_VALUES:
             print(f"    c = {c:.1f}", flush=True)
 
+            _trial_c_seed = int(seed * 1000 + int(c * 10))
+            torch.manual_seed(_trial_c_seed)
             prx2_cost = math.nan
             prx3_cost = math.nan
             try:
@@ -191,10 +196,14 @@ def run(device, **kwargs):
                 t0 = time.perf_counter()
                 plan = ot.emd(a, b, C, numItermax=10**6)
                 elapsed = (time.perf_counter() - t0) * 1000.0
-                match = torch.from_numpy(plan.argmax(axis=1).astype(np.int64))
+                match = torch.from_numpy(plan.argmax(axis=0).astype(np.int64))
                 prx2_cost = (blue.to(device) - red.to(device)[match.to(device)]).abs().sum(dim=1).mean().item()
                 accum[c]["landmarks2l"].append(float(c_result["sampled_idx"].numel()))
                 accum[c]["local_pairs"].append(float(c_result["adj_col"].numel()))
+                _dr_entries    = float(c_result["DR"].numel())
+                _local_entries = float(c_result["adj_col"].numel())
+                accum[c].setdefault("dr_matrix_size", []).append(_dr_entries)
+                accum[c].setdefault("total_repr_size", []).append(_dr_entries + _local_entries)
                 accum[c]["prx2_times"].append(elapsed)
                 print(f"      2L: cost={prx2_cost:.4f}", flush=True)
             except Exception as exc:
@@ -213,7 +222,7 @@ def run(device, **kwargs):
                 t0 = time.perf_counter()
                 plan = ot.emd(a, b, C, numItermax=10**6)
                 elapsed = (time.perf_counter() - t0) * 1000.0
-                match = torch.from_numpy(plan.argmax(axis=1).astype(np.int64))
+                match = torch.from_numpy(plan.argmax(axis=0).astype(np.int64))
                 prx3_cost = (blue.to(device) - red.to(device)[match.to(device)]).abs().sum(dim=1).mean().item()
                 accum[c]["landmarks3l"].append(float(c3_result["sampled_idx_A1"].numel()))
                 accum[c]["prx3_times"].append(elapsed)
@@ -240,6 +249,8 @@ def run(device, **kwargs):
             "c": c,
             "landmarks2l_mean": agg_mean(vals["landmarks2l"]),
             "local_pairs_mean": agg_mean(vals["local_pairs"]),
+            "dr_matrix_size_mean": agg_mean(vals.get("dr_matrix_size", [])),
+            "total_repr_size_mean": agg_mean(vals.get("total_repr_size", [])),
             "landmarks3l_mean": agg_mean(vals["landmarks3l"]),
             "r2_mean": agg_mean(r2_vals),
             "r2_median": agg_median(r2_vals),
@@ -260,6 +271,8 @@ def _fmt_row_terminal(row):
         f"{FMT_FNS['2L Landmarks'](row):>14}",
         f"{FMT_FNS['3L A1 Landmarks'](row):>16}",
         f"{FMT_FNS['2L Local Pairs'](row):>14}",
+        f"{FMT_FNS['DR Matrix Size'](row):>14}",
+        f"{FMT_FNS['Total Repr Size'](row):>14}",
         f"{fmt_stat(row['r2_mean']):>9}",
         f"{fmt_stat(row['r2_median']):>10}",
         f"{fmt_stat(row['r2_p90']):>8}",
@@ -273,6 +286,7 @@ def _fmt_row_terminal(row):
 
 def print_table(rows):
     headers = ["    c", " 2L Landmarks", "3L A1 Landmarks", "2L Local Pairs",
+               "DR Matrix Size", "Total Repr Size",
                "  2L Mean", " 2L Median", " 2L P90", "  3L Mean",
                " 3L Median", " 3L P90", "     2L Time", "     3L Time"]
     sep = "-+-".join("-" * len(h) for h in headers)

@@ -94,7 +94,7 @@ class ThreeLevelL1Clustering:
         T = self.tile_size
         eps = self.epsilon
 
-        rate1 = 1.0 / (self.sample_factor * (float(N) ** (1.0 / 3.0)))
+        rate1 = self.sample_factor / (float(N) ** (1.0 / 3.0))
         mask_A1 = torch.rand(N, device=device) < rate1
         if not mask_A1.any():
             mask_A1[torch.randint(N, (1,), device=device)] = True
@@ -102,7 +102,7 @@ class ThreeLevelL1Clustering:
         A1 = A[sampled_idx_A1]
         S1 = sampled_idx_A1.shape[0]
 
-        rate2 = 1.0 / (self.sample_factor * (float(N) ** (1.0 / 3.0)))
+        rate2 = self.sample_factor / (float(N) ** (1.0 / 3.0))
         mask_A2 = torch.rand(S1, device=device) < rate2
         if not mask_A2.any():
             mask_A2[torch.randint(S1, (1,), device=device)] = True

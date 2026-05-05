@@ -49,7 +49,7 @@ class SimpleL1Clustering:
         eps = self.epsilon
 
         sample_mask = torch.rand(N, device=device) < (
-            1.0 / (self.sample_factor * math.sqrt(N))
+            self.sample_factor / math.sqrt(N)
         )
         if not sample_mask.any():
             sample_mask[torch.randint(N, (1,), device=device)] = True
