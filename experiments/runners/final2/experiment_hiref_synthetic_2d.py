@@ -81,6 +81,13 @@ def cleanup(device):
         torch.cuda.empty_cache()
 
 
+def aggressive_cache_flush(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    gc.collect()
+
+
 def current_gpu_gb(device):
     if device.type != "cuda":
         return 0.0
@@ -100,6 +107,17 @@ def peak_gpu_gb(device):
 
 def sample_sizes(min_power, max_power):
     return [2**p for p in range(min_power, max_power + 1)]
+
+
+def get_tile_size(n):
+    if n <= 8192:
+        return 2048
+    elif n <= 32768:
+        return 1024
+    elif n <= 131072:
+        return 512
+    else:
+        return 256
 
 
 def _dist2(a, b):
@@ -204,6 +222,7 @@ def short_error(exc):
 def run_rp2_two_level(source, target, args, device, epsilon):
     solver = None
     cleanup(device)
+    aggressive_cache_flush(device)
     baseline = current_gpu_gb(device)
     try:
         set_torch_seed(args.seed)
@@ -215,7 +234,7 @@ def run_rp2_two_level(source, target, args, device, epsilon):
             target,
             epsilon=epsilon,
             batch_size=args.batch_size,
-            tile_size=args.batch_size,
+            tile_size=get_tile_size(source.shape[0]),
             verbose=args.verbose,
             max_iters=args.max_iters,
             diameter=1.0,
@@ -282,6 +301,7 @@ def run_hiref(source, target, args, device):
     hrot = None
     rank_schedule = []
     cleanup(device)
+    aggressive_cache_flush(device)
     baseline = current_gpu_gb(device)
     try:
         set_torch_seed(args.seed)
@@ -396,7 +416,7 @@ def method_label(row):
     return "HiRef"
 
 
-def print_summary_table(n, rows):
+def print_summary_table(n, rows, diameter):
     if not rows:
         return
     headers = ("Method", "Status", "Avg Cost", "Time")
@@ -419,6 +439,7 @@ def print_summary_table(n, rows):
     ]
     sep = "+-" + "-+-".join("-" * w for w in widths) + "-+"
     print(f"\nSummary for N={n:,}", flush=True)
+    print(f"Normalized by joint diameter: {diameter:.6f}", flush=True)
     print(sep, flush=True)
     print(
         "| " + " | ".join(f"{headers[i]:<{widths[i]}}" for i in range(len(headers))) + " |",
@@ -584,7 +605,7 @@ def main():
                 }
             )
         append_rows(csv_path, rows)
-        print_summary_table(n, rows)
+        print_summary_table(n, rows, diameter)
 
         both_oom_seen = rows and all(row["status"] == "oom" for row in rows)
         del source, target
