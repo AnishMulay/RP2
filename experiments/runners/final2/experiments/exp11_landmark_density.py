@@ -196,7 +196,7 @@ def run(device, **kwargs):
                 t0 = time.perf_counter()
                 plan = ot.emd(a, b, C, numItermax=10**6)
                 elapsed = (time.perf_counter() - t0) * 1000.0
-                match = torch.from_numpy(plan.argmax(axis=0).astype(np.int64))
+                match = torch.from_numpy(plan.argmax(axis=1).astype(np.int64))
                 prx2_cost = (blue.to(device) - red.to(device)[match.to(device)]).abs().sum(dim=1).mean().item()
                 accum[c]["landmarks2l"].append(float(c_result["sampled_idx"].numel()))
                 accum[c]["local_pairs"].append(float(c_result["adj_col"].numel()))
@@ -222,7 +222,7 @@ def run(device, **kwargs):
                 t0 = time.perf_counter()
                 plan = ot.emd(a, b, C, numItermax=10**6)
                 elapsed = (time.perf_counter() - t0) * 1000.0
-                match = torch.from_numpy(plan.argmax(axis=0).astype(np.int64))
+                match = torch.from_numpy(plan.argmax(axis=1).astype(np.int64))
                 prx3_cost = (blue.to(device) - red.to(device)[match.to(device)]).abs().sum(dim=1).mean().item()
                 accum[c]["landmarks3l"].append(float(c3_result["sampled_idx_A1"].numel()))
                 accum[c]["prx3_times"].append(elapsed)
