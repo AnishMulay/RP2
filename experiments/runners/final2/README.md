@@ -112,3 +112,60 @@ embeddings. The notebook splits the embedding matrix into two equal point clouds
 `X` and `Y`, uses Euclidean cost (`p = 1`), computes a HiRef rank schedule with
 `hierarchy_depth=6`, `max_Q=2^11`, and `max_rank=64`, then reports
 `compute_OT_cost()`.
+
+## MNIST Distribution Benchmark
+
+The MNIST runner compares RP2's 2-level solver against HiRef on the sampling
+families used by the earlier final2 MNIST proxy experiments, but with Euclidean
+L2 cost instead of L1/Manhattan cost:
+
+```bash
+python experiments/runners/final2/experiment_hiref_mnist_distributions.py
+```
+
+The default MNIST root is:
+
+```text
+experiments/runners/final2/data
+```
+
+This matches `helpers/download_mnist.py` and the existing final2 MNIST
+experiments. If the data is missing, run:
+
+```bash
+python experiments/runners/final2/helpers/download_mnist.py
+```
+
+The sampling modes are:
+
+- `equal`: source and target are balanced over digits `0-9`, with disjoint
+  images within each digit.
+- `biased`: target uses digits `0-4`, source uses digits `5-9`.
+- `dissimilar`: target uses digits `1,2,4,7`, source uses digits `8,6,9,3`.
+
+Images are flattened to 784-dimensional vectors, scaled to `[0, 1]`, and by
+default normalized so each image sums to `1`. The solver inputs are divided by
+the analytic L2 diameter before timing, RP2 is called with `diameter=1.0`, and
+reported costs are multiplied back to the original pre-normalized image scale.
+HiRef is called with `sq_Euclidean=False`, so it uses Euclidean distance, not
+squared Euclidean distance.
+
+By default the runner chooses `N` values from `5,000` upward in `5,000`
+increments and adds the largest feasible no-replacement balanced sample size for
+the selected sampling mode. Results are written incrementally after each
+completed `(sampling, N)`:
+
+```text
+experiments/runners/final2/results/hiref_mnist_distributions_<timestamp>.csv
+experiments/runners/final2/results/hiref_mnist_distributions_<timestamp>.md
+```
+
+Useful options:
+
+```bash
+python experiments/runners/final2/experiment_hiref_mnist_distributions.py --sampling all
+python experiments/runners/final2/experiment_hiref_mnist_distributions.py --sampling biased --max-n 25000
+python experiments/runners/final2/experiment_hiref_mnist_distributions.py --n-values 5000,10000,20000
+python experiments/runners/final2/experiment_hiref_mnist_distributions.py --rp2-epsilons 0.01,0.001
+python experiments/runners/final2/experiment_hiref_mnist_distributions.py --data-dir experiments/runners/final2/data
+```
