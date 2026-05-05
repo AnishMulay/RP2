@@ -396,6 +396,61 @@ def append_rows(csv_path, rows):
             writer.writerow({k: csv_value(row.get(k, "")) for k in CSV_FIELDS})
 
 
+def md_escape(value):
+    return str(value).replace("\n", " ").replace("|", "\\|")
+
+
+def md_float(value, digits=6):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if not math.isfinite(value):
+        return "N/A"
+    return f"{value:.{digits}f}"
+
+
+def write_incremental_markdown(md_path, title, metadata, rows):
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"# {title}",
+        "",
+        f"Updated: {datetime.now().isoformat(timespec='seconds')}",
+        "",
+        "## Setup",
+    ]
+    for key, value in metadata:
+        lines.append(f"- **{md_escape(key)}:** {md_escape(value)}")
+
+    lines.extend(
+        [
+            "",
+            "## Results",
+            "",
+            "| N | Method | Status | Avg Cost | Time (s) | Peak GPU (GB) | Diameter | Error |",
+            "|---:|---|---|---:|---:|---:|---:|---|",
+        ]
+    )
+    for row in rows:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    f"{int(row.get('n', 0)):,}",
+                    md_escape(method_label(row)),
+                    md_escape(row.get("status", "")),
+                    md_float(row.get("primal_ot_cost"), 6),
+                    md_float(row.get("wall_time_s"), 2),
+                    md_float(row.get("peak_gpu_gb"), 3),
+                    md_float(row.get("normalization_diameter"), 6),
+                    md_escape(row.get("error", "")),
+                ]
+            )
+            + " |"
+        )
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def print_result(row):
     cost = row["primal_ot_cost"]
     cost_s = "N/A" if not math.isfinite(float(cost)) else f"{float(cost):.6f}"
@@ -413,7 +468,9 @@ def print_result(row):
 def method_label(row):
     if row["method"].startswith("RP2_"):
         return f"RP2 eps={float(row['epsilon']):.3g}"
-    return "HiRef"
+    if row["method"].startswith("HiRef"):
+        return "HiRef"
+    return row["method"]
 
 
 def print_summary_table(n, rows, diameter):
@@ -518,6 +575,11 @@ def main():
     parser.add_argument("--hiref-max-rank", type=int, default=DEFAULT_HIREF_MAX_RANK)
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--output", default=None)
+    parser.add_argument(
+        "--markdown-output",
+        default=None,
+        help="Incremental markdown output path. Default: same as --output with .md.",
+    )
     parser.add_argument("--keep-going", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -536,14 +598,28 @@ def main():
     dtype = torch.float32 if args.dtype == "float32" else torch.float64
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     csv_path = Path(args.output) if args.output else RESULTS_DIR / f"hiref_synthetic_2d_{timestamp}.csv"
+    md_path = Path(args.markdown_output) if args.markdown_output else csv_path.with_suffix(".md")
+    markdown_rows = []
 
     print(f"Dataset: {DATASET}", flush=True)
     print(f"Seed: {args.seed}", flush=True)
     print(f"Device: {torch.cuda.get_device_name(0)}", flush=True)
     print(f"Output: {csv_path}", flush=True)
+    print(f"Markdown: {md_path}", flush=True)
     print(f"Sample sizes: {sample_sizes(args.min_power, args.max_power)}", flush=True)
     if "rp2" in methods:
         print(f"RP2 epsilons: {', '.join(str(v) for v in rp2_epsilons)}", flush=True)
+
+    markdown_metadata = [
+        ("Dataset", DATASET),
+        ("Seed", args.seed),
+        ("Sample sizes", sample_sizes(args.min_power, args.max_power)),
+        ("Methods", ",".join(methods)),
+        ("RP2 epsilons", ",".join(str(v) for v in rp2_epsilons) if "rp2" in methods else "N/A"),
+        ("Cost function", "Euclidean L2"),
+        ("Diameter", "Exact joint 2D diameter computed before timing; inputs normalized by this value"),
+        ("CSV", csv_path),
+    ]
 
     for n in sample_sizes(args.min_power, args.max_power):
         print(f"\nN={n:,}", flush=True)
@@ -577,6 +653,13 @@ def main():
                 "error": short_error(exc),
             }
             append_rows(csv_path, [row])
+            markdown_rows.append(row)
+            write_incremental_markdown(
+                md_path,
+                "HiRef Synthetic 2D Benchmark",
+                markdown_metadata,
+                markdown_rows,
+            )
             print_result(row)
             if not args.keep_going:
                 break
@@ -605,6 +688,13 @@ def main():
                 }
             )
         append_rows(csv_path, rows)
+        markdown_rows.extend(rows)
+        write_incremental_markdown(
+            md_path,
+            "HiRef Synthetic 2D Benchmark",
+            markdown_metadata,
+            markdown_rows,
+        )
         print_summary_table(n, rows, diameter)
 
         both_oom_seen = rows and all(row["status"] == "oom" for row in rows)
@@ -618,6 +708,7 @@ def main():
             break
 
     print(f"\nWrote results to {csv_path}", flush=True)
+    print(f"Wrote markdown to {md_path}", flush=True)
 
 
 if __name__ == "__main__":

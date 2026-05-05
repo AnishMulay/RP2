@@ -64,6 +64,7 @@ CSV_FIELDS = [
     "rank_schedule",
     "epsilon",
     "batch_size",
+    "normalization_diameter",
     "cost_function",
     "dtype",
     "device",
@@ -80,6 +81,13 @@ def cleanup(device):
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
+
+
+def aggressive_cache_flush(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    gc.collect()
 
 
 def current_gpu_gb(device):
@@ -107,6 +115,27 @@ def set_torch_seed(seed):
 
 def sample_sizes(min_power, max_power):
     return [2**p for p in range(min_power, max_power + 1)]
+
+
+def get_tile_size(n):
+    if n <= 8192:
+        return 2048
+    elif n <= 32768:
+        return 1024
+    elif n <= 131072:
+        return 512
+    else:
+        return 256
+
+
+def normalization_diameter(normalization):
+    if normalization == "probability":
+        return math.sqrt(2.0)
+    if normalization == "l2":
+        return 2.0
+    if normalization == "pixel01":
+        return math.sqrt(784.0)
+    raise ValueError(f"unknown normalization {normalization!r}")
 
 
 def load_emnist_arrays(data_dir, split):
@@ -217,14 +246,17 @@ def make_emnist_points(args, device, dtype):
 
     source_np = normalize_images(source_np, args.normalization)
     target_np = normalize_images(target_np, args.normalization)
+    diameter = normalization_diameter(args.normalization)
+    source_np = source_np / diameter
+    target_np = target_np / diameter
     source = torch.from_numpy(source_np).to(device=device, dtype=dtype)
     target = torch.from_numpy(target_np).to(device=device, dtype=dtype)
-    return source, target
+    return source, target, diameter
 
 
-def average_l2_matching_cost(source, target, match_target_to_source):
+def average_l2_matching_cost(source, target, match_target_to_source, diameter):
     match = match_target_to_source.to(device=source.device, dtype=torch.long)
-    return float(torch.norm(target - source[match], p=2, dim=1).mean().item())
+    return float(torch.norm(target - source[match], p=2, dim=1).mean().item()) * diameter
 
 
 def short_error(exc):
@@ -235,6 +267,7 @@ def short_error(exc):
 def run_rp2_two_level(source, target, args, device):
     solver = None
     cleanup(device)
+    aggressive_cache_flush(device)
     baseline = current_gpu_gb(device)
     try:
         set_torch_seed(args.seed)
@@ -246,15 +279,16 @@ def run_rp2_two_level(source, target, args, device):
             target,
             epsilon=args.rp2_epsilon,
             batch_size=args.batch_size,
-            tile_size=args.batch_size,
+            tile_size=get_tile_size(source.shape[0]),
             verbose=args.verbose,
             max_iters=args.max_iters,
+            diameter=1.0,
         )
         match = solver.solve()
         sync_if_cuda(device)
         wall = time.perf_counter() - t0
         peak = peak_gpu_gb(device)
-        cost = average_l2_matching_cost(source, target, match)
+        cost = average_l2_matching_cost(source, target, match, args.current_diameter)
         return {
             "method": "RP2_2level_gpu_push_relabel",
             "status": "ok",
@@ -312,6 +346,7 @@ def run_hiref(source, target, args, device):
     hrot = None
     rank_schedule = []
     cleanup(device)
+    aggressive_cache_flush(device)
     baseline = current_gpu_gb(device)
     try:
         set_torch_seed(args.seed)
@@ -333,7 +368,7 @@ def run_hiref(source, target, args, device):
             sq_Euclidean=False,
         )
         hrot.run(return_as_coupling=False)
-        cost = float(hrot.compute_OT_cost().item())
+        cost = float(hrot.compute_OT_cost().item()) * args.current_diameter
         sync_if_cuda(device)
         wall = time.perf_counter() - t0
         peak = peak_gpu_gb(device)
@@ -406,6 +441,70 @@ def append_rows(csv_path, rows):
             writer.writerow({k: csv_value(row.get(k, "")) for k in CSV_FIELDS})
 
 
+def md_escape(value):
+    return str(value).replace("\n", " ").replace("|", "\\|")
+
+
+def md_float(value, digits=6):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if not math.isfinite(value):
+        return "N/A"
+    return f"{value:.{digits}f}"
+
+
+def method_label(row):
+    method = row.get("method", "")
+    if method.startswith("RP2_"):
+        return f"RP2 eps={float(row['epsilon']):.3g}"
+    if method.startswith("HiRef"):
+        return "HiRef"
+    return method
+
+
+def write_incremental_markdown(md_path, title, metadata, rows):
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"# {title}",
+        "",
+        f"Updated: {datetime.now().isoformat(timespec='seconds')}",
+        "",
+        "## Setup",
+    ]
+    for key, value in metadata:
+        lines.append(f"- **{md_escape(key)}:** {md_escape(value)}")
+
+    lines.extend(
+        [
+            "",
+            "## Results",
+            "",
+            "| N | Method | Status | Avg Cost | Time (s) | Peak GPU (GB) | Diameter | Error |",
+            "|---:|---|---|---:|---:|---:|---:|---|",
+        ]
+    )
+    for row in rows:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    f"{int(row.get('n', 0)):,}",
+                    md_escape(method_label(row)),
+                    md_escape(row.get("status", "")),
+                    md_float(row.get("primal_ot_cost"), 6),
+                    md_float(row.get("wall_time_s"), 2),
+                    md_float(row.get("peak_gpu_gb"), 3),
+                    md_float(row.get("normalization_diameter"), 6),
+                    md_escape(row.get("error", "")),
+                ]
+            )
+            + " |"
+        )
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def print_result(row):
     cost = row["primal_ot_cost"]
     cost_s = "N/A" if not math.isfinite(float(cost)) else f"{float(cost):.6f}"
@@ -467,6 +566,11 @@ def main():
     parser.add_argument("--hiref-max-rank", type=int, default=DEFAULT_HIREF_MAX_RANK)
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--output", default=None)
+    parser.add_argument(
+        "--markdown-output",
+        default=None,
+        help="Incremental markdown output path. Default: same as --output with .md.",
+    )
     parser.add_argument("--keep-going", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -479,6 +583,8 @@ def main():
     dtype = torch.float32 if args.dtype == "float32" else torch.float64
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     csv_path = Path(args.output) if args.output else RESULTS_DIR / f"hiref_emnist_{timestamp}.csv"
+    md_path = Path(args.markdown_output) if args.markdown_output else csv_path.with_suffix(".md")
+    markdown_rows = []
 
     warnings.filterwarnings("default")
     print(f"Dataset: {DATASET}", flush=True)
@@ -488,15 +594,32 @@ def main():
     print(f"Device: {torch.cuda.get_device_name(0)}", flush=True)
     print(f"Data dir: {args.data_dir}", flush=True)
     print(f"Output: {csv_path}", flush=True)
+    print(f"Markdown: {md_path}", flush=True)
     print(f"Sample sizes: {sample_sizes(args.min_power, args.max_power)}", flush=True)
+
+    markdown_metadata = [
+        ("Dataset", DATASET),
+        ("Split", args.split),
+        ("Sampling", args.sampling),
+        ("Normalization", args.normalization),
+        ("Seed", args.seed),
+        ("Sample sizes", sample_sizes(args.min_power, args.max_power)),
+        ("Methods", ",".join(methods)),
+        ("RP2 epsilon", args.rp2_epsilon if "rp2" in methods else "N/A"),
+        ("Cost function", "Euclidean L2 on 784-D image vectors"),
+        ("Diameter", "Analytic preprocessing diameter computed before timing; inputs normalized by this value"),
+        ("CSV", csv_path),
+    ]
 
     for n in sample_sizes(args.min_power, args.max_power):
         print(f"\nN={n:,} | dim=784", flush=True)
         cleanup(device)
         args.current_n = n
         try:
-            source, target = make_emnist_points(args, device, dtype)
+            source, target, diameter = make_emnist_points(args, device, dtype)
+            args.current_diameter = diameter
             sync_if_cuda(device)
+            print(f"  Normalization diameter: {diameter:.6f}", flush=True)
         except Exception as exc:
             row = {
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -518,12 +641,20 @@ def main():
                 "rank_schedule": "",
                 "epsilon": "",
                 "batch_size": "",
+                "normalization_diameter": "",
                 "cost_function": "Euclidean L2 on 784-D image vectors",
                 "dtype": args.dtype,
                 "device": str(device),
                 "error": short_error(exc),
             }
             append_rows(csv_path, [row])
+            markdown_rows.append(row)
+            write_incremental_markdown(
+                md_path,
+                "HiRef EMNIST Benchmark",
+                markdown_metadata,
+                markdown_rows,
+            )
             print_result(row)
             if not args.keep_going:
                 break
@@ -551,9 +682,17 @@ def main():
                     "cost_function": "Euclidean L2 on 784-D image vectors",
                     "dtype": args.dtype,
                     "device": str(device),
+                    "normalization_diameter": diameter,
                 }
             )
         append_rows(csv_path, rows)
+        markdown_rows.extend(rows)
+        write_incremental_markdown(
+            md_path,
+            "HiRef EMNIST Benchmark",
+            markdown_metadata,
+            markdown_rows,
+        )
 
         statuses = {row["method"]: row["status"] for row in rows}
         both_oom_seen = rows and all(row["status"] == "oom" for row in rows)
@@ -567,6 +706,7 @@ def main():
             break
 
     print(f"\nWrote results to {csv_path}", flush=True)
+    print(f"Wrote markdown to {md_path}", flush=True)
 
 
 if __name__ == "__main__":

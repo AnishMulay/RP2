@@ -29,6 +29,7 @@ Results are written to:
 
 ```text
 experiments/runners/final2/results/hiref_synthetic_2d_<timestamp>.csv
+experiments/runners/final2/results/hiref_synthetic_2d_<timestamp>.md
 ```
 
 Each CSV row records `n`, method, status, primal OT cost, wall-clock runtime,
@@ -37,8 +38,9 @@ schedule. The default sweep uses powers of two from `2^5` through `2^20`,
 matching the sample sizes in HiRef's saved synthetic cost table. By default, the
 RP2 method is run twice for each `N`, with `epsilon=0.01` and `epsilon=0.001`,
 and HiRef is run once. After each `N`, the runner prints a compact summary table
-with average cost and wall time. It stops when all selected method rows OOM or a
-method errors. Use `--keep-going` to continue after failures.
+with average cost and wall time, appends the CSV rows, and rewrites the markdown
+sidecar with the table accumulated so far. It stops when all selected method
+rows OOM or a method errors. Use `--keep-going` to continue after failures.
 
 HiRef's notebook stores primal costs through `compute_OT_cost()` but does not
 persist a runtime table for this synthetic sweep. This runner records wall-clock
@@ -52,6 +54,7 @@ python experiments/runners/final2/experiment_hiref_synthetic_2d.py --methods rp2
 python experiments/runners/final2/experiment_hiref_synthetic_2d.py --methods hiref
 python experiments/runners/final2/experiment_hiref_synthetic_2d.py --rp2-epsilons 0.01,0.001 --batch-size 2048
 python experiments/runners/final2/experiment_hiref_synthetic_2d.py --rp2-epsilon 0.001
+python experiments/runners/final2/experiment_hiref_synthetic_2d.py --markdown-output experiments/runners/final2/results/synthetic_progress.md
 ```
 
 Runtime dependencies are the union of RP2 and HiRef's synthetic notebook stack:
@@ -84,7 +87,12 @@ Results are written to:
 
 ```text
 experiments/runners/final2/results/hiref_emnist_<timestamp>.csv
+experiments/runners/final2/results/hiref_emnist_<timestamp>.md
 ```
+
+The EMNIST runner uses the same incremental output behavior as the synthetic
+runner: after each completed `N`, it appends the CSV rows and rewrites the
+markdown sidecar table through that `N`.
 
 Useful options:
 
@@ -93,6 +101,7 @@ python experiments/runners/final2/experiment_hiref_emnist.py --max-power 14
 python experiments/runners/final2/experiment_hiref_emnist.py --sampling biased
 python experiments/runners/final2/experiment_hiref_emnist.py --normalization pixel01
 python experiments/runners/final2/experiment_hiref_emnist.py --methods rp2
+python experiments/runners/final2/experiment_hiref_emnist.py --markdown-output experiments/runners/final2/results/emnist_progress.md
 ```
 
 HiRef's own image notebook uses ImageNet rather than EMNIST. It loads ImageNet
