@@ -237,14 +237,15 @@ def _run_solver3(D_br_norm, D_rr_norm, device, diameter):
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     solver = ThreeLevelGPUSolver(None, None, epsilon=EPSILON, batch_size=BATCH_SIZE,
-                                 verbose=False, diameter=1.0, precomputed_clustering=c)
+                                 verbose=False, diameter=1.0, max_iters=500000,
+                                 precomputed_clustering=c)
     solver.solve()
     _sync(device)
     peak_mem = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else math.nan
     elapsed = (time.perf_counter() - t0) * 1000.0
     n = D_br_norm.shape[0]
     D_cpu = D_br_norm.detach().cpu()
-    cost = D_cpu[torch.arange(n), solver.match_B.cpu()].mean().item() * diameter
+    cost = D_cpu[torch.arange(n), solver.match_B.cpu()].mean().item() * diameter * c["proxy_max"]
     iters = solver.iterations
     del solver, c
     return elapsed, cost, iters, peak_mem

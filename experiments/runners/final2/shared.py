@@ -127,13 +127,13 @@ def _group_offsets(b_idx: torch.Tensor) -> torch.Tensor:
 
 
 def _build_csr_adjacency(dist_mat, threshold_per_row, N_rows, N_cols,
-                          epsilon, tile_size, device):
+                          epsilon, tile_size, device, distance_scale=1.0):
     """
     Build CSR adjacency where entry (i, j) is included iff
     dist_mat[i, j] < threshold_per_row[i].
 
     dist_mat   : (N_rows, N_cols) float32 on device
-    threshold  : (N_rows,) float32 on device
+    threshold  : (N_rows,) float32 on device, in scaled distance units
 
     Returns (ptr, col, dist_int, dist_float).
     """
@@ -141,7 +141,7 @@ def _build_csr_adjacency(dist_mat, threshold_per_row, N_rows, N_cols,
     counts = torch.zeros(N_rows, dtype=torch.long, device=device)
     for start in range(0, N_cols, tile_size):
         end = min(start + tile_size, N_cols)
-        counts.add_((dist_mat[:, start:end] < thr).sum(dim=1))
+        counts.add_((dist_mat[:, start:end] / distance_scale < thr).sum(dim=1))
 
     ptr = torch.zeros(N_rows + 1, dtype=torch.long, device=device)
     ptr[1:] = counts.cumsum(0)
@@ -156,13 +156,14 @@ def _build_csr_adjacency(dist_mat, threshold_per_row, N_rows, N_cols,
         for start in range(0, N_cols, tile_size):
             end = min(start + tile_size, N_cols)
             tile = dist_mat[:, start:end]
-            mask = tile < thr
+            scaled_tile = tile / distance_scale
+            mask = scaled_tile < thr
             ri, ti = mask.nonzero(as_tuple=True)
             if ri.numel() == 0:
                 continue
             wp = cursor[ri] + _group_offsets(ri)
             col[wp] = (ti + start).long()
-            d = tile[ri, ti]
+            d = scaled_tile[ri, ti]
             dist_float[wp] = d
             dist_int[wp] = (d / epsilon).ceil_().to(torch.int32)
             cursor.scatter_add_(0, ri, torch.ones_like(ri))
@@ -210,40 +211,61 @@ def run_three_level_precomputed(D_rr, D_br, epsilon, tile_size=512):
 
     # 3. DR: (S2, N) distances from A2 centers to all reds
     DR = D_rr[sampled_idx_A2, :]
-    DR_int = (DR / eps).ceil_().to(torch.int32)
 
     # 4. Nearest A2 center for each blue
     DB_to_A2 = D_br[:, sampled_idx_A2]          # (N, S2)
     d_min_b_A2, nearest_s2 = DB_to_A2.min(dim=1)
     del DB_to_A2
-    d_min_b_A2_int = (d_min_b_A2 / eps).ceil_().to(torch.int32)
 
     # 5. Nearest A2 for each A1 center
     D_A1_to_A2 = D_rr[sampled_idx_A1][:, sampled_idx_A2]  # (S1, S2)
     d_min_A1_A2, nearest_s2_A1 = D_A1_to_A2.min(dim=1)
     del D_A1_to_A2
-    d_min_A1_A2_int = (d_min_A1_A2 / eps).ceil_().to(torch.int32)
 
     # 6. Nearest A1 center for each blue
     DB_to_A1 = D_br[:, sampled_idx_A1]          # (N, S1)
     d_min_b_A1, nearest_s1 = DB_to_A1.min(dim=1)
     del DB_to_A1
-    d_min_b_A1_int = (d_min_b_A1 / eps).ceil_().to(torch.int32)
 
     D_A1_to_reds = D_rr[sampled_idx_A1, :]      # (S1, N)
 
+    # The push-relabel solver (Lahn et al. 2022) requires max cost = 1.
+    # The 3-level Thorup-Zwick proxy has worst-case distortion 2k-1 = 5x.
+    # We normalize all proxy distances by proxy_max so the solver sees
+    # costs in [0,1], restoring the O(1/eps^2) phase bound.
+    # The caller multiplies matching costs by proxy_max to recover
+    # costs in the original normalized scale.
+    proxy_max = max(
+        float(d_min_b_A2.max()) + float(DR.max()),
+        float(d_min_b_A1.max()) + float(D_A1_to_reds.max()),
+        1.0,
+        1e-6,
+    )
+
+    DR = DR / proxy_max
+    d_min_b_A2 = d_min_b_A2 / proxy_max
+    d_min_b_A1 = d_min_b_A1 / proxy_max
+    d_min_A1_A2 = d_min_A1_A2 / proxy_max
+
+    DR_int = (DR / eps).ceil_().to(torch.int32)
+    d_min_b_A2_int = (d_min_b_A2 / eps).ceil_().to(torch.int32)
+    d_min_A1_A2_int = (d_min_A1_A2 / eps).ceil_().to(torch.int32)
+    d_min_b_A1_int = (d_min_b_A1 / eps).ceil_().to(torch.int32)
+
     # 7. Adj_B: {a : d(b, a) < d_min_b_A1[b]}
     adj_B_ptr, adj_B_col, adj_B_dist_int, adj_B_dist_float = _build_csr_adjacency(
-        D_br, d_min_b_A1, N, N, eps, tile_size, device
+        D_br, d_min_b_A1, N, N, eps, tile_size, device, distance_scale=proxy_max
     )
 
     # 8. Adj_A1: {a : d(a1, a) < d_min_A1_A2[a1]}
     adj_A1_ptr, adj_A1_col, adj_A1_dist_int, adj_A1_dist_float = _build_csr_adjacency(
-        D_A1_to_reds, d_min_A1_A2, S1, N, eps, tile_size, device
+        D_A1_to_reds, d_min_A1_A2, S1, N, eps, tile_size, device,
+        distance_scale=proxy_max
     )
     del D_A1_to_reds
 
     return {
+        "proxy_max": proxy_max,
         "sampled_idx_A1": sampled_idx_A1,
         "sampled_idx_A2": sampled_idx_A2,
         "A1_sampled": None,
