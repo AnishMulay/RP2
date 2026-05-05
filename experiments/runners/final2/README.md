@@ -18,6 +18,13 @@ methods using the Half-Moon/S-Curve code from HiRef's
 default JAX random seed `0`. The cost function is Euclidean distance
 `||x - y||_2`, matching the notebook's `p = 1` / Table S2 setup.
 
+Before either solver is timed, the runner computes the exact joint 2D diameter
+of `source ∪ target`, divides both point clouds by that diameter, and passes the
+normalized point clouds to both methods. RP2 is called with `diameter=1.0`,
+which is the diameter of the normalized coordinates. Reported costs are then
+multiplied back by the original diameter, so CSV costs remain in the original
+HiRef coordinate scale.
+
 Results are written to:
 
 ```text
@@ -25,13 +32,13 @@ experiments/runners/final2/results/hiref_synthetic_2d_<timestamp>.csv
 ```
 
 Each CSV row records `n`, method, status, primal OT cost, wall-clock runtime,
-peak GPU memory, RP2 iterations, and the HiRef rank schedule. The default sweep
-uses powers of two from `2^5` through `2^20`, matching the sample sizes in
-HiRef's saved synthetic cost table. By default, the RP2 method is run twice for
-each `N`, with `epsilon=0.01` and `epsilon=0.001`, and HiRef is run once. After
-each `N`, the runner prints a compact summary table with average cost and wall
-time. It stops when all selected method rows OOM or a method errors. Use
-`--keep-going` to continue after failures.
+peak GPU memory, normalization diameter, RP2 iterations, and the HiRef rank
+schedule. The default sweep uses powers of two from `2^5` through `2^20`,
+matching the sample sizes in HiRef's saved synthetic cost table. By default, the
+RP2 method is run twice for each `N`, with `epsilon=0.01` and `epsilon=0.001`,
+and HiRef is run once. After each `N`, the runner prints a compact summary table
+with average cost and wall time. It stops when all selected method rows OOM or a
+method errors. Use `--keep-going` to continue after failures.
 
 HiRef's notebook stores primal costs through `compute_OT_cost()` but does not
 persist a runtime table for this synthetic sweep. This runner records wall-clock

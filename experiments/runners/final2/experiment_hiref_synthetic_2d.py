@@ -20,6 +20,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -61,6 +62,7 @@ CSV_FIELDS = [
     "rank_schedule",
     "epsilon",
     "batch_size",
+    "normalization_diameter",
     "cost_function",
     "dtype",
     "device",
@@ -100,11 +102,87 @@ def sample_sizes(min_power, max_power):
     return [2**p for p in range(min_power, max_power + 1)]
 
 
+def _dist2(a, b):
+    diff = a - b
+    return float(diff[0] * diff[0] + diff[1] * diff[1])
+
+
+def _cross(o, a, b):
+    return float((a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]))
+
+
+def _monotonic_chain(points):
+    order = np.lexsort((points[:, 1], points[:, 0]))
+    pts = points[order]
+    if pts.shape[0] <= 1:
+        return pts
+
+    # Drop exact duplicate coordinates before constructing the hull.
+    keep = np.ones(pts.shape[0], dtype=bool)
+    keep[1:] = np.any(pts[1:] != pts[:-1], axis=1)
+    pts = pts[keep]
+    if pts.shape[0] <= 2:
+        return pts
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and _cross(lower[-2], lower[-1], p) <= 0.0:
+            lower.pop()
+        lower.append(p)
+
+    upper = []
+    for p in pts[::-1]:
+        while len(upper) >= 2 and _cross(upper[-2], upper[-1], p) <= 0.0:
+            upper.pop()
+        upper.append(p)
+
+    return np.asarray(lower[:-1] + upper[:-1], dtype=np.float64)
+
+
+def _convex_hull(points):
+    try:
+        from scipy.spatial import ConvexHull
+
+        hull = ConvexHull(points)
+        return points[hull.vertices].astype(np.float64, copy=False)
+    except Exception:
+        return _monotonic_chain(points.astype(np.float64, copy=False))
+
+
+def _convex_polygon_diameter(hull):
+    h = hull.shape[0]
+    if h <= 1:
+        return 0.0
+    if h == 2:
+        return math.sqrt(_dist2(hull[0], hull[1]))
+
+    def area2(i, j, k):
+        return abs(_cross(hull[i], hull[j], hull[k]))
+
+    max_d2 = 0.0
+    j = 1
+    for i in range(h):
+        ni = (i + 1) % h
+        while area2(i, ni, (j + 1) % h) > area2(i, ni, j):
+            j = (j + 1) % h
+        max_d2 = max(max_d2, _dist2(hull[i], hull[j]), _dist2(hull[ni], hull[j]))
+    return math.sqrt(max_d2)
+
+
+def joint_diameter_2d(x_np, y_np):
+    points = np.concatenate([x_np, y_np], axis=0).astype(np.float64, copy=False)
+    hull = _convex_hull(points)
+    return max(_convex_polygon_diameter(hull), 1e-12)
+
+
 def make_points(n, seed, device, dtype):
     x_np, y_np = ret_halfmoon_scurve(n_points=n, seed=seed)
+    diameter = joint_diameter_2d(x_np, y_np)
+    x_np = x_np / diameter
+    y_np = y_np / diameter
     x = torch.from_numpy(x_np).to(device=device, dtype=dtype)
     y = torch.from_numpy(y_np).to(device=device, dtype=dtype)
-    return x, y
+    return x, y, diameter
 
 
 def set_torch_seed(seed):
@@ -113,9 +191,9 @@ def set_torch_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def average_l2_matching_cost(source, target, match_target_to_source):
+def average_l2_matching_cost(source, target, match_target_to_source, diameter):
     match = match_target_to_source.to(device=source.device, dtype=torch.long)
-    return float(torch.norm(target - source[match], p=2, dim=1).mean().item())
+    return float(torch.norm(target - source[match], p=2, dim=1).mean().item()) * diameter
 
 
 def short_error(exc):
@@ -140,12 +218,13 @@ def run_rp2_two_level(source, target, args, device, epsilon):
             tile_size=args.batch_size,
             verbose=args.verbose,
             max_iters=args.max_iters,
+            diameter=1.0,
         )
         match = solver.solve()
         sync_if_cuda(device)
         wall = time.perf_counter() - t0
         peak = peak_gpu_gb(device)
-        cost = average_l2_matching_cost(source, target, match)
+        cost = average_l2_matching_cost(source, target, match, args.current_diameter)
         return {
             "method": "RP2_2level_gpu_push_relabel",
             "status": "ok",
@@ -224,7 +303,7 @@ def run_hiref(source, target, args, device):
             sq_Euclidean=False,
         )
         hrot.run(return_as_coupling=False)
-        cost = float(hrot.compute_OT_cost().item())
+        cost = float(hrot.compute_OT_cost().item()) * args.current_diameter
         sync_if_cuda(device)
         wall = time.perf_counter() - t0
         peak = peak_gpu_gb(device)
@@ -449,8 +528,10 @@ def main():
         print(f"\nN={n:,}", flush=True)
         cleanup(device)
         try:
-            source, target = make_points(n, args.seed, device, dtype)
+            source, target, diameter = make_points(n, args.seed, device, dtype)
+            args.current_diameter = diameter
             sync_if_cuda(device)
+            print(f"  Normalization diameter: {diameter:.6f}", flush=True)
         except Exception as exc:
             row = {
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -468,6 +549,7 @@ def main():
                 "rank_schedule": "",
                 "epsilon": "",
                 "batch_size": "",
+                "normalization_diameter": "",
                 "cost_function": "Euclidean L2",
                 "dtype": args.dtype,
                 "device": str(device),
@@ -498,6 +580,7 @@ def main():
                     "cost_function": "Euclidean L2",
                     "dtype": args.dtype,
                     "device": str(device),
+                    "normalization_diameter": diameter,
                 }
             )
         append_rows(csv_path, rows)
