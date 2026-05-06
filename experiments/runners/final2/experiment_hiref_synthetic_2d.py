@@ -23,6 +23,86 @@ from pathlib import Path
 import numpy as np
 import torch
 
+
+def verify_gpu_backends(abort_on_failure=True):
+    """
+    Confirm that both PyTorch and JAX are running on GPU.
+    Prints a clear confirmation or failure message for each backend.
+    If abort_on_failure=True, raises RuntimeError if either backend
+    is not on GPU, so the experiment fails loudly rather than silently
+    producing CPU-based timing results.
+    """
+    print("\n" + "="*60, flush=True)
+    print("  GPU BACKEND VERIFICATION", flush=True)
+    print("="*60, flush=True)
+
+    failures = []
+
+    # --- PyTorch check ---
+    import torch
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"  [PyTorch] OK — CUDA available: {gpu_name}", flush=True)
+        print(f"  [PyTorch] Device count: {torch.cuda.device_count()}",
+              flush=True)
+    else:
+        msg = "[PyTorch] FAIL — CUDA not available. " \
+              "2-Level solver will run on CPU."
+        print(f"  {msg}", flush=True)
+        failures.append(msg)
+
+    # --- JAX check ---
+    try:
+        import jax
+        jax_devices = jax.devices()
+        jax_backend = jax.default_backend()
+        print(f"  [JAX] Backend: {jax_backend}", flush=True)
+        print(f"  [JAX] Devices: {jax_devices}", flush=True)
+        if jax_backend != "gpu":
+            msg = (
+                f"[JAX] FAIL — JAX backend is '{jax_backend}', not 'gpu'. "
+                f"HiRef will run on {jax_backend.upper()}. "
+                f"This makes runtime comparisons with the GPU 2-Level "
+                f"solver invalid."
+            )
+            print(f"  {msg}", flush=True)
+            failures.append(msg)
+        else:
+            # Run a tiny JAX op on GPU to confirm it actually executes
+            import jax.numpy as jnp
+            _ = jnp.ones((4, 4), dtype=jnp.float32) @ jnp.ones((4, 4), dtype=jnp.float32)
+            _.block_until_ready()
+            print(f"  [JAX] OK — test op executed successfully on GPU",
+                  flush=True)
+    except Exception as e:
+        msg = f"[JAX] FAIL — could not verify JAX backend: {e}"
+        print(f"  {msg}", flush=True)
+        failures.append(msg)
+
+    # --- Cross-backend device name reconciliation ---
+    # Confirm both backends see the same physical GPU
+    try:
+        import torch
+        import jax
+        torch_gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
+        jax_device_str = str(jax.devices()[0]) if jax.devices() else "N/A"
+        print(f"  [Cross-check] PyTorch GPU: {torch_gpu}", flush=True)
+        print(f"  [Cross-check] JAX device:  {jax_device_str}", flush=True)
+    except Exception as e:
+        print(f"  [Cross-check] Could not reconcile devices: {e}", flush=True)
+
+    print("="*60 + "\n", flush=True)
+
+    if failures and abort_on_failure:
+        raise RuntimeError(
+            "GPU backend verification failed. Aborting experiment to prevent "
+            "invalid CPU/GPU mixed comparisons.\n" +
+            "\n".join(failures)
+        )
+
+    return len(failures) == 0
+
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent.parent
 RP2_SRC_DIR = REPO_ROOT / "src"
@@ -66,6 +146,8 @@ CSV_FIELDS = [
     "cost_function",
     "dtype",
     "device",
+    "pytorch_device",
+    "jax_backend",
     "error",
 ]
 
@@ -227,6 +309,13 @@ def run_rp2_two_level(source, target, args, device, epsilon):
     try:
         set_torch_seed(args.seed)
         reset_peak(device)
+        # Confirm 2-Level solver inputs are on CUDA before timing
+        assert source.is_cuda, \
+            f"2-Level solver input 'source' is on {source.device}, not CUDA"
+        assert target.is_cuda, \
+            f"2-Level solver input 'target' is on {target.device}, not CUDA"
+        print(f"  [2-Level] inputs confirmed on {source.device}",
+              flush=True)
         sync_if_cuda(device)
         t0 = time.perf_counter()
         solver = SimpleGPUSolver(
@@ -256,6 +345,8 @@ def run_rp2_two_level(source, target, args, device, epsilon):
             "rank_schedule": "",
             "epsilon": epsilon,
             "batch_size": args.batch_size,
+            "pytorch_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+            "jax_backend": "N/A",
             "error": "",
         }
     except torch.cuda.OutOfMemoryError as exc:
@@ -272,6 +363,8 @@ def run_rp2_two_level(source, target, args, device, epsilon):
             "rank_schedule": "",
             "epsilon": epsilon,
             "batch_size": args.batch_size,
+            "pytorch_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+            "jax_backend": "N/A",
             "error": short_error(exc),
         }
     except Exception as exc:
@@ -287,6 +380,8 @@ def run_rp2_two_level(source, target, args, device, epsilon):
             "rank_schedule": "",
             "epsilon": epsilon,
             "batch_size": args.batch_size,
+            "pytorch_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+            "jax_backend": "N/A",
             "error": short_error(exc),
         }
     finally:
@@ -312,6 +407,14 @@ def run_hiref(source, target, args, device):
             max_rank=args.hiref_max_rank,
         )
         reset_peak(device)
+        import jax
+        import jax.numpy as jnp
+        # Confirm JAX is still on GPU immediately before HiRef runs
+        _jax_backend = jax.default_backend()
+        assert _jax_backend == "gpu", \
+            f"JAX backend is '{_jax_backend}' immediately before HiRef call. " \
+            f"Expected 'gpu'. Aborting to prevent invalid comparison."
+        print(f"  [HiRef] JAX backend confirmed: {_jax_backend}", flush=True)
         sync_if_cuda(device)
         t0 = time.perf_counter()
         hrot = HR_OT.HierarchicalRefinementOT.init_from_point_clouds(
@@ -339,6 +442,8 @@ def run_hiref(source, target, args, device):
             "rank_schedule": " ".join(str(v) for v in rank_schedule),
             "epsilon": "",
             "batch_size": "",
+            "pytorch_device": "N/A",
+            "jax_backend": jax.default_backend(),
             "error": "",
         }
     except torch.cuda.OutOfMemoryError as exc:
@@ -355,6 +460,8 @@ def run_hiref(source, target, args, device):
             "rank_schedule": " ".join(str(v) for v in rank_schedule),
             "epsilon": "",
             "batch_size": "",
+            "pytorch_device": "N/A",
+            "jax_backend": jax.default_backend(),
             "error": short_error(exc),
         }
     except Exception as exc:
@@ -370,6 +477,8 @@ def run_hiref(source, target, args, device):
             "rank_schedule": " ".join(str(v) for v in rank_schedule),
             "epsilon": "",
             "batch_size": "",
+            "pytorch_device": "N/A",
+            "jax_backend": jax.default_backend(),
             "error": short_error(exc),
         }
     finally:
@@ -550,6 +659,8 @@ def parse_float_list(raw):
 
 
 def main():
+    verify_gpu_backends(abort_on_failure=True)
+
     parser = argparse.ArgumentParser(
         description="Benchmark RP2 2-level solver against HiRef on HiRef Half-Moon/S-Curve."
     )
