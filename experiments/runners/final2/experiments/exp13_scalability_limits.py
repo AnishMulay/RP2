@@ -7,6 +7,7 @@ the 2-level / 3-level L1 proxy solvers. A method is not retried at larger N
 after its first OOM for a dataset.
 """
 
+import argparse
 import gzip
 import math
 import pathlib
@@ -182,6 +183,43 @@ DATASET_CONFIGS = [
 ]
 
 
+def _dataset_key(name):
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def _select_dataset_configs(dataset_filter):
+    if dataset_filter is None:
+        return DATASET_CONFIGS
+
+    if isinstance(dataset_filter, str):
+        requested = [part.strip() for part in dataset_filter.split(",") if part.strip()]
+    else:
+        requested = [str(part).strip() for part in dataset_filter if str(part).strip()]
+
+    if not requested:
+        return DATASET_CONFIGS
+
+    configs_by_key = {_dataset_key(cfg["name"]): cfg for cfg in DATASET_CONFIGS}
+    selected = []
+    unknown = []
+    seen = set()
+    for name in requested:
+        key = _dataset_key(name)
+        cfg = configs_by_key.get(key)
+        if cfg is None:
+            unknown.append(name)
+            continue
+        if key not in seen:
+            selected.append(cfg)
+            seen.add(key)
+
+    if unknown:
+        valid = ", ".join(cfg["name"] for cfg in DATASET_CONFIGS)
+        raise ValueError(f"Unknown dataset filter(s): {', '.join(unknown)}. Valid datasets: {valid}")
+
+    return selected
+
+
 def _is_cuda_oom(exc):
     return isinstance(exc, torch.cuda.OutOfMemoryError) or (
         isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
@@ -289,8 +327,14 @@ def _label_row(row, seen_dataset):
 
 def run(device, **kwargs):
     rows = []
+    dataset_filter = kwargs.get("dataset", kwargs.get("datasets"))
+    dataset_configs = _select_dataset_configs(dataset_filter)
 
-    for ds_cfg in DATASET_CONFIGS:
+    if dataset_filter is not None:
+        selected_names = ", ".join(cfg["name"] for cfg in dataset_configs)
+        print(f"Dataset filter: {selected_names}", flush=True)
+
+    for ds_cfg in dataset_configs:
         ds_name = ds_cfg["name"]
         if ds_cfg["type"] == "skip":
             print(f"\nSkipping {ds_name}: data file is not present.", flush=True)
@@ -423,8 +467,16 @@ FMT_FNS = {
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run Experiment 13 scalability limits.")
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help="Optional dataset filter, e.g. EMNIST. Comma-separated values are allowed.",
+    )
+    args = parser.parse_args()
+
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    results = run(dev)
+    results = run(dev, dataset=args.dataset)
     for r in results:
         print(
             f"{r.get('dataset_label', r['dataset']):<14} N={r['n']:>9,} "

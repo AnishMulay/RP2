@@ -17,9 +17,16 @@ PATH=/usr/bin:/bin:$PATH conda activate clusterenv
 echo "=============================="
 echo "Scalability Limits Sweep"
 echo "Started: $(date)"
+if [ -n "${FINAL2_EXP13_DATASET:-}" ]; then
+  echo "Dataset filter: ${FINAL2_EXP13_DATASET}"
+fi
 echo "=============================="
 
-python -u experiments/runners/final2/run_experiments.py --run 13
+if [ -n "${FINAL2_EXP13_DATASET:-}" ]; then
+  python -u experiments/runners/final2/run_experiments.py --run 13 --exp13-dataset "${FINAL2_EXP13_DATASET}"
+else
+  python -u experiments/runners/final2/run_experiments.py --run 13
+fi
 
 echo "Finished: $(date)"
 conda deactivate || true

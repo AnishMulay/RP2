@@ -181,6 +181,8 @@ def main():
                         help="Path to NYC taxi parquet file (for Exp 5).")
     parser.add_argument("--nyc-day",  default=None,
                         help="Date filter for NYC taxi data (YYYY-MM-DD).")
+    parser.add_argument("--exp13-dataset", default=None,
+                        help="Dataset filter for Exp 13 scalability limits, e.g. EMNIST.")
     parser.add_argument("--results-dir", default=None,
                         help="Absolute path to the timestamped run directory for this batch.")
     args = parser.parse_args()
@@ -224,6 +226,8 @@ def main():
                 kwargs["nyc_data_path"] = args.nyc_data
             if args.nyc_day:
                 kwargs["nyc_day"] = args.nyc_day
+        if mod.EXP_ID == 13 and args.exp13_dataset:
+            kwargs["dataset"] = args.exp13_dataset
 
         t0 = time.perf_counter()
         try:
