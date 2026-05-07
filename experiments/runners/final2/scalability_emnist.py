@@ -5,6 +5,7 @@ Standalone GPU scalability sweep on EMNIST image vectors.
 
 import csv
 import gc
+import argparse
 import math
 import sys
 import time
@@ -25,23 +26,24 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from clustered_push_relabel.clustering.simple_l1 import SimpleL1Clustering
+from clustered_push_relabel.clustering.simple_three_level_l1 import ThreeLevelL1Clustering
 from clustered_push_relabel.solvers.simple_bipartite import SimpleGPUSolver
 from clustered_push_relabel.solvers.three_level_bipartite import ThreeLevelGPUSolver
 
 EPSILON = 0.01
-BATCH_SIZE = 2048
 MAX_ITERS = 999_999_999
 SEED = 42
-DIAMETER_TILE = 512
+L1_DIAMETER = 2.0
 SPLITS = ("byclass", "letters")
 VALIDATION_SIZES = [1_000, 5_000, 10_000]
 
 
-def scalability_n_values():
-    n = 50_000
-    while True:
+def scalability_n_values(start_n, step_n, max_n=None):
+    n = start_n
+    while max_n is None or n <= max_n:
         yield n
-        n += 50_000
+        n += step_n
 
 
 def sync():
@@ -115,34 +117,10 @@ def load_emnist_dataset():
 def _flatten_emnist(train, test):
     images = torch.cat([train.data, test.data], dim=0)
     images = images.reshape(-1, 28, 28).transpose(1, 2).reshape(-1, 784)
-    return images.to(dtype=torch.float32).div_(255.0).contiguous()
-
-
-def _diameter_with_tile(points, tile_size):
-    max_dist = 0.0
-    for start in range(0, points.shape[0], tile_size):
-        end = min(start + tile_size, points.shape[0])
-        dists = torch.cdist(
-            points[start:end],
-            points,
-            p=2,
-            compute_mode="use_mm_for_euclid_dist_if_necessary",
-        )
-        max_dist = max(max_dist, float(dists.max().item()))
-        del dists
-    return max_dist
-
-
-def joint_diameter(A, B):
-    points = torch.cat([A, B], dim=0)
-    tile = min(DIAMETER_TILE, points.shape[0])
-    while tile >= 32:
-        try:
-            return _diameter_with_tile(points, tile)
-        except torch.cuda.OutOfMemoryError:
-            cleanup()
-            tile //= 2
-    return _diameter_with_tile(points, 16)
+    images = images.to(dtype=torch.float32).div_(255.0)
+    sums = images.sum(dim=1, keepdim=True).clamp_min_(1e-8)
+    images.div_(sums)
+    return images.contiguous()
 
 
 def make_data(images_cpu, n, rng):
@@ -158,23 +136,19 @@ def make_data(images_cpu, n, rng):
         idx_b = rng.integers(0, total, size=n)
     A = images_cpu[torch.as_tensor(idx_a, dtype=torch.long)].to("cuda", non_blocking=True)
     B = images_cpu[torch.as_tensor(idx_b, dtype=torch.long)].to("cuda", non_blocking=True)
-    diameter = joint_diameter(A, B)
-    if diameter > 0.0:
-        A = A / diameter
-        B = B / diameter
-    return A, B, diameter
+    return A, B, L1_DIAMETER
 
 
 def avg_matching_cost(A, B, match_B, diameter):
     match_B = match_B.to(device=A.device, dtype=torch.long)
-    return torch.norm(B - A[match_B], p=2, dim=1).mean().item() * diameter
+    return (B - A[match_B]).abs().sum(dim=1).mean().item()
 
 
 def run_exact_solver(A, B, diameter):
     """
     Exact optimal transport cost via POT (Earth Mover's Distance).
-    A, B: normalized CUDA float32 tensors of shape (N, d).
-    Returns average matching cost in original coordinates.
+    A, B: probability-normalized CUDA float32 tensors of shape (N, d).
+    Returns average L1 matching cost in natural [0, 2] units.
     """
     try:
         import ot as pot
@@ -194,11 +168,10 @@ def run_exact_solver(A, B, diameter):
         for start in range(0, N, block):
             end = min(start + block, N)
             diff = B_cpu[start:end, None, :] - A_cpu[None, :, :]
-            C[start:end] = np.sqrt((diff ** 2).sum(axis=2))
+            C[start:end] = np.abs(diff).sum(axis=2)
 
         weights = np.ones(N, dtype=np.float64) / N
-        avg_cost_normalized = pot.emd2(weights, weights, C)
-        avg_cost = float(avg_cost_normalized) * diameter
+        avg_cost = float(pot.emd2(weights, weights, C))
 
         print(f"[Exact]   Avg Cost: {avg_cost:.5f}", flush=True)
         return {"status": "ok", "cost": avg_cost}
@@ -207,7 +180,7 @@ def run_exact_solver(A, B, diameter):
         return {"status": "error", "cost": math.nan}
 
 
-def run_solver(label, solver_cls, A, B, diameter):
+def run_solver(label, solver_cls, clustering_cls, A, B, diameter, batch_size):
     cleanup()
     solver = None
     t_cluster_start = None
@@ -222,10 +195,11 @@ def run_solver(label, solver_cls, A, B, diameter):
             A,
             B,
             epsilon=EPSILON,
-            batch_size=BATCH_SIZE,
+            batch_size=batch_size,
             verbose=False,
-            diameter=1.0,
+            diameter=diameter,
             max_iters=MAX_ITERS,
+            clustering_class=clustering_cls,
         )
         sync()
         t_cluster_end = time.time()
@@ -388,8 +362,12 @@ def save_validation_csv(rows):
                 "N",
                 "Exact Avg Cost",
                 "2-Level Time (s)",
+                "2-Level Cluster Time (s)",
+                "2-Level Solve Time (s)",
                 "2-Level Avg Cost",
                 "3-Level Time (s)",
+                "3-Level Cluster Time (s)",
+                "3-Level Solve Time (s)",
                 "3-Level Avg Cost",
             ]
         )
@@ -399,8 +377,12 @@ def save_validation_csv(rows):
                     row["n"],
                     exact_value(row["exact"]),
                     status_value(row["sol2"], "time"),
+                    status_value(row["sol2"], "time_cluster"),
+                    status_value(row["sol2"], "time_solve"),
                     status_value(row["sol2"], "cost"),
                     status_value(row["sol3"], "time"),
+                    status_value(row["sol3"], "time_cluster"),
+                    status_value(row["sol3"], "time_solve"),
                     status_value(row["sol3"], "cost"),
                 ]
             )
@@ -416,8 +398,12 @@ def save_scalability_csv(rows):
             [
                 "N",
                 "2-Level Time (s)",
+                "2-Level Cluster Time (s)",
+                "2-Level Solve Time (s)",
                 "2-Level Avg Cost",
                 "3-Level Time (s)",
+                "3-Level Cluster Time (s)",
+                "3-Level Solve Time (s)",
                 "3-Level Avg Cost",
             ]
         )
@@ -426,15 +412,19 @@ def save_scalability_csv(rows):
                 [
                     row["n"],
                     status_value(row["sol2"], "time"),
+                    status_value(row["sol2"], "time_cluster"),
+                    status_value(row["sol2"], "time_solve"),
                     status_value(row["sol2"], "cost"),
                     status_value(row["sol3"], "time"),
+                    status_value(row["sol3"], "time_cluster"),
+                    status_value(row["sol3"], "time_solve"),
                     status_value(row["sol3"], "cost"),
                 ]
             )
     print(f"\nSaved scalability CSV: {path}", flush=True)
 
 
-def run_validation_phase(images_cpu, rng):
+def run_validation_phase(images_cpu, rng, batch_size):
     print("\n=== Phase 1: Validation ===", flush=True)
     val_rows = []
     for n in VALIDATION_SIZES:
@@ -453,8 +443,8 @@ def run_validation_phase(images_cpu, rng):
             continue
 
         exact = run_exact_solver(A, B, diameter)
-        sol2 = run_solver("2-Level", SimpleGPUSolver, A, B, diameter)
-        sol3 = run_solver("3-Level", ThreeLevelGPUSolver, A, B, diameter)
+        sol2 = run_solver("2-Level", SimpleGPUSolver, SimpleL1Clustering, A, B, diameter, batch_size)
+        sol3 = run_solver("3-Level", ThreeLevelGPUSolver, ThreeLevelL1Clustering, A, B, diameter, batch_size)
         val_rows.append({"n": n, "exact": exact, "sol2": sol2, "sol3": sol3})
 
         del A, B
@@ -465,13 +455,13 @@ def run_validation_phase(images_cpu, rng):
     return val_rows
 
 
-def run_scalability_phase(images_cpu, rng):
+def run_scalability_phase(images_cpu, rng, start_n, step_n, max_n, batch_size):
     print("\n=== Phase 2: Scalability ===", flush=True)
     rows = []
     sol2_active = True
     sol3_active = True
 
-    for n in scalability_n_values():
+    for n in scalability_n_values(start_n, step_n, max_n):
         print(f"\n=== N = {n} ===", flush=True)
         alloc, reserved = gpu_mem_gb()
         print(f"GPU Memory: {alloc:.2f} GB allocated, {reserved:.2f} GB reserved", flush=True)
@@ -488,7 +478,7 @@ def run_scalability_phase(images_cpu, rng):
             break
 
         if sol2_active:
-            sol2 = run_solver("2-Level", SimpleGPUSolver, A, B, diameter)
+            sol2 = run_solver("2-Level", SimpleGPUSolver, SimpleL1Clustering, A, B, diameter, batch_size)
             if sol2["status"] == "oom":
                 sol2_active = False
         else:
@@ -496,7 +486,7 @@ def run_scalability_phase(images_cpu, rng):
             print("[2-Level] OOM", flush=True)
 
         if sol3_active:
-            sol3 = run_solver("3-Level", ThreeLevelGPUSolver, A, B, diameter)
+            sol3 = run_solver("3-Level", ThreeLevelGPUSolver, ThreeLevelL1Clustering, A, B, diameter, batch_size)
             if sol3["status"] == "oom":
                 sol3_active = False
         else:
@@ -527,8 +517,25 @@ def run_scalability_phase(images_cpu, rng):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Standalone L1/Manhattan EMNIST push-relabel scalability sweep."
+    )
+    parser.add_argument("--skip-validation", action="store_true", help="Skip exact/POT validation and run only scalability.")
+    parser.add_argument("--start-n", type=int, default=50_000)
+    parser.add_argument("--step-n", type=int, default=50_000)
+    parser.add_argument("--max-n", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=2048)
+    args = parser.parse_args()
+
     assert torch.cuda.is_available(), "CUDA is required"
     print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
+    print("Metric: L1 / Manhattan on probability-normalized EMNIST histograms", flush=True)
+    print(f"Analytic L1 diameter: {L1_DIAMETER}", flush=True)
+    print(
+        f"Scalability N: start={args.start_n:,}, step={args.step_n:,}, "
+        f"max={'unbounded' if args.max_n is None else f'{args.max_n:,}'}",
+        flush=True,
+    )
     torch.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)
     rng = np.random.default_rng(SEED)
@@ -540,8 +547,9 @@ def main():
         return
     print(f"EMNIST images: {images_cpu.shape[0]:,} split={split} root={root}", flush=True)
 
-    run_validation_phase(images_cpu, rng)
-    run_scalability_phase(images_cpu, rng)
+    if not args.skip_validation:
+        run_validation_phase(images_cpu, rng, args.batch_size)
+    run_scalability_phase(images_cpu, rng, args.start_n, args.step_n, args.max_n, args.batch_size)
 
 
 if __name__ == "__main__":
