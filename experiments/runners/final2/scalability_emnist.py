@@ -136,18 +136,20 @@ def make_data(images_cpu, n, rng):
         idx_b = rng.integers(0, total, size=n)
     A = images_cpu[torch.as_tensor(idx_a, dtype=torch.long)].to("cuda", non_blocking=True)
     B = images_cpu[torch.as_tensor(idx_b, dtype=torch.long)].to("cuda", non_blocking=True)
+    A = A / L1_DIAMETER
+    B = B / L1_DIAMETER
     return A, B, L1_DIAMETER
 
 
 def avg_matching_cost(A, B, match_B, diameter):
     match_B = match_B.to(device=A.device, dtype=torch.long)
-    return (B - A[match_B]).abs().sum(dim=1).mean().item()
+    return (B - A[match_B]).abs().sum(dim=1).mean().item() * diameter
 
 
 def run_exact_solver(A, B, diameter):
     """
     Exact optimal transport cost via POT (Earth Mover's Distance).
-    A, B: probability-normalized CUDA float32 tensors of shape (N, d).
+    A, B: probability-normalized CUDA float32 tensors divided by L1 diameter.
     Returns average L1 matching cost in natural [0, 2] units.
     """
     try:
@@ -171,7 +173,7 @@ def run_exact_solver(A, B, diameter):
             C[start:end] = np.abs(diff).sum(axis=2)
 
         weights = np.ones(N, dtype=np.float64) / N
-        avg_cost = float(pot.emd2(weights, weights, C))
+        avg_cost = float(pot.emd2(weights, weights, C)) * diameter
 
         print(f"[Exact]   Avg Cost: {avg_cost:.5f}", flush=True)
         return {"status": "ok", "cost": avg_cost}
