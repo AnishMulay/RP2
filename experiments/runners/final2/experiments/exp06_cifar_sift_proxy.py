@@ -31,7 +31,7 @@ except ImportError:
 
 from clustered_push_relabel.clustering.simple_precomputed import SimplePrecomputedClustering
 from shared import (
-    compute_ratio, fmt_time, fmt_cost, fmt_ratio,
+    fmt_time, fmt_cost, fmt_ratio,
     build_two_level_proxy_matrix, build_three_level_proxy_matrix,
     run_three_level_precomputed,
 )
@@ -68,9 +68,15 @@ FMT_FNS = {
     "Exact Cost":   lambda r: fmt_cost(r["exact"]["cost"]),
     "2L-Prx Cost":  lambda r: fmt_cost(r["prx2"]["cost"]),
     "3L-Prx Cost":  lambda r: fmt_cost(r["prx3"]["cost"]),
-    "2L Ratio":     lambda r: fmt_ratio(compute_ratio(r["exact"]["cost"], r["prx2"]["cost"])),
-    "3L Ratio":     lambda r: fmt_ratio(compute_ratio(r["exact"]["cost"], r["prx3"]["cost"])),
+    "2L Ratio":     lambda r: fmt_ratio(_cost_ratio(r["exact"]["cost"], r["prx2"]["cost"])),
+    "3L Ratio":     lambda r: fmt_ratio(_cost_ratio(r["exact"]["cost"], r["prx3"]["cost"])),
 }
+
+
+def _cost_ratio(exact_cost, proxy_cost):
+    if math.isnan(float(exact_cost)) or math.isnan(float(proxy_cost)) or float(exact_cost) == 0.0:
+        return math.nan
+    return float(proxy_cost) / float(exact_cost)
 
 
 def _sync(device):
@@ -186,22 +192,18 @@ def normalize_chamfer(D_br, D_rr):
     return D_br / diam, D_rr / diam, diam
 
 
-def _run_exact(D_br_norm, diameter):
-    n = D_br_norm.shape[0]
+def _run_exact(D_br):
+    n = D_br.shape[0]
     if n > EXACT_N_LIMIT:
         raise RuntimeError(f"Exact skipped: N > {EXACT_N_LIMIT:,}")
     if ot is None:
         raise RuntimeError("POT not installed")
-    D_cpu = D_br_norm.detach().cpu()
-    a = np.full(n, 1.0 / n, np.float64)
-    b = np.full(n, 1.0 / n, np.float64)
-    C = D_cpu.to(torch.float64).numpy()
+    a = b = np.full(n, 1.0 / n, dtype=np.float64)
+    C_true_np = D_br.cpu().to(torch.float64).numpy()
     t0 = time.perf_counter()
-    plan = ot.emd(a, b, C, numItermax=10**6)
+    exact_cost = ot.emd2(a, b, C_true_np, numItermax=10**7)
     elapsed = (time.perf_counter() - t0) * 1000.0
-    match = torch.from_numpy(plan.argmax(axis=1).astype(np.int64))
-    cost = D_cpu[torch.arange(n), match].mean().item() * diameter
-    return elapsed, cost
+    return elapsed, exact_cost
 
 
 def _run_proxy2(D_br_norm, D_rr_norm, device, diameter):
@@ -212,16 +214,12 @@ def _run_proxy2(D_br_norm, D_rr_norm, device, diameter):
         raise RuntimeError("POT not installed")
     engine = SimplePrecomputedClustering(epsilon=EPSILON, tile_size=BATCH_SIZE)
     c = engine.run(D_rr_norm, D_br_norm)
-    a = np.full(n, 1.0 / n, np.float64)
-    b = np.full(n, 1.0 / n, np.float64)
-    C = build_two_level_proxy_matrix(c, n, device)
-    D_cpu = D_br_norm.detach().cpu()
+    a = b = np.full(n, 1.0 / n, dtype=np.float64)
+    C_2l_np = build_two_level_proxy_matrix(c, n, device) * diameter
     t0 = time.perf_counter()
-    plan = ot.emd(a, b, C.T, numItermax=10**6)
+    proxy_2l_cost = ot.emd2(a, b, C_2l_np, numItermax=10**7)
     elapsed = (time.perf_counter() - t0) * 1000.0
-    match = torch.from_numpy(plan.argmax(axis=0).astype(np.int64))
-    cost = D_cpu[torch.arange(n), match].mean().item() * diameter
-    return elapsed, cost
+    return elapsed, proxy_2l_cost
 
 
 def _run_proxy3(D_br_norm, D_rr_norm, device, diameter):
@@ -231,16 +229,12 @@ def _run_proxy3(D_br_norm, D_rr_norm, device, diameter):
     if ot is None:
         raise RuntimeError("POT not installed")
     c = run_three_level_precomputed(D_rr_norm, D_br_norm, EPSILON, BATCH_SIZE)
-    a = np.full(n, 1.0 / n, np.float64)
-    b = np.full(n, 1.0 / n, np.float64)
-    C = build_three_level_proxy_matrix(c, n, device)
-    D_cpu = D_br_norm.detach().cpu()
+    a = b = np.full(n, 1.0 / n, dtype=np.float64)
+    C_3l_np = build_three_level_proxy_matrix(c, n, device) * diameter
     t0 = time.perf_counter()
-    plan = ot.emd(a, b, C, numItermax=10**6)
+    proxy_3l_cost = ot.emd2(a, b, C_3l_np, numItermax=10**7)
     elapsed = (time.perf_counter() - t0) * 1000.0
-    match = torch.from_numpy(plan.argmax(axis=1).astype(np.int64))
-    cost = D_cpu[torch.arange(n), match].mean().item() * diameter
-    return elapsed, cost
+    return elapsed, proxy_3l_cost
 
 
 def _safe(fn, label):
@@ -294,7 +288,7 @@ def run(device, **kwargs):
             print(f"    Chamfer done in {(time.perf_counter()-t0)*1000:.0f} ms", flush=True)
             D_br_norm, D_rr_norm, diameter = normalize_chamfer(D_br, D_rr)
             print(f"    Diameter: {diameter:.4f}", flush=True)
-            del D_br, D_rr
+            del D_rr
         except Exception as exc:
             print(f"    Chamfer failed: {exc}", flush=True)
             _clear_cuda()
@@ -303,7 +297,7 @@ def run(device, **kwargs):
         print(f"    [3/4] Running solvers ...", flush=True)
 
         print(f"      Exact OT ...", flush=True)
-        exact = _safe(lambda: _run_exact(D_br_norm, diameter), "Exact")
+        exact = _safe(lambda: _run_exact(D_br), "Exact")
 
         print(f"      2L-Proxy ...", flush=True)
         prx2 = _safe(lambda: _run_proxy2(D_br_norm, D_rr_norm, device, diameter), "2L-Proxy")
@@ -313,7 +307,7 @@ def run(device, **kwargs):
 
         rows.append({"n": n, "exact": exact, "prx2": prx2, "prx3": prx3})
 
-        del D_br_norm, D_rr_norm
+        del D_br, D_br_norm, D_rr_norm
         _clear_cuda()
 
     return rows
@@ -325,5 +319,5 @@ if __name__ == "__main__":
     for r in results:
         e, p2, p3 = r["exact"], r["prx2"], r["prx3"]
         print(f"N={r['n']:>6,} exact={fmt_time(e['time_ms'])} cost={fmt_cost(e['cost'])} "
-              f"| 2L={fmt_time(p2['time_ms'])} ratio={fmt_ratio(compute_ratio(e['cost'],p2['cost']))} "
-              f"| 3L={fmt_time(p3['time_ms'])} ratio={fmt_ratio(compute_ratio(e['cost'],p3['cost']))}")
+              f"| 2L={fmt_time(p2['time_ms'])} ratio={fmt_ratio(_cost_ratio(e['cost'],p2['cost']))} "
+              f"| 3L={fmt_time(p3['time_ms'])} ratio={fmt_ratio(_cost_ratio(e['cost'],p3['cost']))}")

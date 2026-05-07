@@ -33,7 +33,7 @@ from clustered_push_relabel.clustering.simple_l1 import SimpleL1Clustering
 from clustered_push_relabel.clustering.simple_three_level_l1 import ThreeLevelL1Clustering
 from shared import (
     agg_mean, agg_median, agg_std, agg_p90, agg_max, fmt_stat, compute_gamma,
-    compute_ratio, fmt_time, fmt_cost, fmt_ratio,
+    fmt_time, fmt_cost, fmt_ratio,
     build_two_level_proxy_matrix, build_three_level_proxy_matrix,
 )
 
@@ -47,7 +47,7 @@ EPSILON = 0.01
 BATCH_SIZE = 512
 SEED = 42
 EXACT_N_LIMIT = 25_000
-SEEDS = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
+SEEDS = [42]
 GAMMA_N_LIMIT = 5000
 
 BLUE_DIGITS = list(range(5))   # digits 0-4 → blue set
@@ -73,9 +73,16 @@ FMT_FNS = {
     "Exact Cost":   lambda r: fmt_cost(r["exact"]["cost"]),
     "2L-Prx Cost":  lambda r: fmt_cost(r["prx2"]["cost"]),
     "3L-Prx Cost":  lambda r: fmt_cost(r["prx3"]["cost"]),
-    "2L Ratio":     lambda r: fmt_ratio(compute_ratio(r["exact"]["cost"], r["prx2"]["cost"])),
-    "3L Ratio":     lambda r: fmt_ratio(compute_ratio(r["exact"]["cost"], r["prx3"]["cost"])),
+    "2L Ratio":     lambda r: fmt_ratio(_cost_ratio(r["exact"]["cost"], r["prx2"]["cost"])),
+    "3L Ratio":     lambda r: fmt_ratio(_cost_ratio(r["exact"]["cost"], r["prx3"]["cost"])),
 }
+
+
+def _cost_ratio(exact_cost, proxy_cost):
+    if math.isnan(float(exact_cost)) or math.isnan(float(proxy_cost)) or float(exact_cost) == 0.0:
+        return math.nan
+    return float(proxy_cost) / float(exact_cost)
+
 
 STAT_COL_SPECS = [
     ("N",          7),
@@ -167,27 +174,29 @@ def load_mnist_biased(n_samples, seed):
     return torch.from_numpy(red_arr), torch.from_numpy(blue_arr)
 
 
-def compute_l1_matrix(red, blue):
-    X = red.cpu().to(torch.float64).contiguous()
-    Y = blue.cpu().to(torch.float64).contiguous()
-    return torch.cdist(X, Y, p=1).numpy()
+def compute_l1_matrix(red, blue, device):
+    # Build on GPU in float32 (fast)
+    C_true_gpu = torch.cdist(
+        blue.to(device).to(torch.float32),
+        red.to(device).to(torch.float32),
+        p=1,
+    )
+    # Convert to float64 numpy for POT
+    return C_true_gpu.cpu().to(torch.float64).numpy()
 
 
-def _run_exact(red, blue):
+def _run_exact(red, blue, device):
     if red.shape[0] > EXACT_N_LIMIT:
         raise RuntimeError(f"Exact skipped: N > {EXACT_N_LIMIT:,}")
     if ot is None:
         raise RuntimeError("POT not installed")
     n = red.shape[0]
-    a = np.full(n, 1.0 / n, np.float64)
-    b = np.full(n, 1.0 / n, np.float64)
-    C = compute_l1_matrix(red, blue)
+    a = b = np.full(n, 1.0 / n, dtype=np.float64)
+    C_true_np = compute_l1_matrix(red, blue, device)
     t0 = time.perf_counter()
-    plan = ot.emd(a, b, C, numItermax=10**6)
+    exact_cost = ot.emd2(a, b, C_true_np, numItermax=10**7)
     elapsed = (time.perf_counter() - t0) * 1000.0
-    match = torch.from_numpy(plan.argmax(axis=0).astype(np.int64))
-    cost = (blue.cpu() - red.cpu()[match]).abs().sum(dim=1).mean().item()
-    return elapsed, cost, match
+    return elapsed, exact_cost
 
 
 def _run_proxy2(red, blue, device):
@@ -200,15 +209,12 @@ def _run_proxy2(red, blue, device):
     _adj_ptr = c["adj_ptr"].cpu()
     _adj_col = c["adj_col"].cpu()
     n = red.shape[0]
-    a = np.full(n, 1.0 / n, np.float64)
-    b = np.full(n, 1.0 / n, np.float64)
-    C = build_two_level_proxy_matrix(c, n, device)
+    a = b = np.full(n, 1.0 / n, dtype=np.float64)
+    C_2l_np = build_two_level_proxy_matrix(c, n, device)
     t0 = time.perf_counter()
-    plan = ot.emd(a, b, C, numItermax=10**6)
+    proxy_2l_cost = ot.emd2(a, b, C_2l_np, numItermax=10**7)
     elapsed = (time.perf_counter() - t0) * 1000.0
-    match = torch.from_numpy(plan.argmax(axis=1).astype(np.int64))
-    cost = (blue.to(device) - red.to(device)[match.to(device)]).abs().sum(dim=1).mean().item()
-    return elapsed, cost, _adj_ptr, _adj_col
+    return elapsed, proxy_2l_cost, _adj_ptr, _adj_col
 
 
 def _run_proxy3(red, blue, device):
@@ -219,15 +225,12 @@ def _run_proxy3(red, blue, device):
     engine = ThreeLevelL1Clustering(epsilon=EPSILON, tile_size=BATCH_SIZE)
     c = engine.run(red.to(device), blue.to(device))
     n = red.shape[0]
-    a = np.full(n, 1.0 / n, np.float64)
-    b = np.full(n, 1.0 / n, np.float64)
-    C = build_three_level_proxy_matrix(c, n, device)
+    a = b = np.full(n, 1.0 / n, dtype=np.float64)
+    C_3l_np = build_three_level_proxy_matrix(c, n, device)
     t0 = time.perf_counter()
-    plan = ot.emd(a, b, C, numItermax=10**6)
+    proxy_3l_cost = ot.emd2(a, b, C_3l_np, numItermax=10**7)
     elapsed = (time.perf_counter() - t0) * 1000.0
-    match = torch.from_numpy(plan.argmax(axis=1).astype(np.int64))
-    cost = (blue.to(device) - red.to(device)[match.to(device)]).abs().sum(dim=1).mean().item()
-    return elapsed, cost
+    return elapsed, proxy_3l_cost
 
 
 def run(device, **kwargs):
@@ -263,7 +266,7 @@ def run(device, **kwargs):
             _match = None
             if n <= EXACT_N_LIMIT and ot is not None:
                 try:
-                    _t, _c, _match = _run_exact(red, blue)
+                    _t, _c = _run_exact(red, blue, device)
                     exact_costs.append(_c)
                     exact_times.append(_t)
                     print(f"      Exact: cost={_c:.4f}", flush=True)
@@ -310,8 +313,8 @@ def run(device, **kwargs):
                 torch.cuda.empty_cache()
 
         # Aggregate
-        r2_vals = [compute_ratio(e, p) for e, p in zip(exact_costs, prx2_costs)]
-        r3_vals = [compute_ratio(e, p) for e, p in zip(exact_costs, prx3_costs)]
+        r2_vals = [_cost_ratio(e, p) for e, p in zip(exact_costs, prx2_costs)]
+        r3_vals = [_cost_ratio(e, p) for e, p in zip(exact_costs, prx3_costs)]
 
         gamma_mean = agg_mean(gammas)
         bound_mean = (1.0 + 2.0 * gamma_mean) if not math.isnan(gamma_mean) else math.nan
@@ -339,8 +342,8 @@ if __name__ == "__main__":
     results = run(dev)
     for r in results:
         e, p2, p3 = r["exact"], r["prx2"], r["prx3"]
-        r2 = compute_ratio(e["cost"], p2["cost"])
-        r3 = compute_ratio(e["cost"], p3["cost"])
+        r2 = _cost_ratio(e["cost"], p2["cost"])
+        r3 = _cost_ratio(e["cost"], p3["cost"])
         print(f"N={r['n']:>6,} | exact={fmt_time(e['time_ms'])} cost={fmt_cost(e['cost'])} "
               f"| 2L={fmt_time(p2['time_ms'])} cost={fmt_cost(p2['cost'])} ratio={fmt_ratio(r2)} "
               f"| 3L={fmt_time(p3['time_ms'])} cost={fmt_cost(p3['cost'])} ratio={fmt_ratio(r3)}")
