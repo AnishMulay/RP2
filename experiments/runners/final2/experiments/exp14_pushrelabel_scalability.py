@@ -100,32 +100,18 @@ def load_emnist_equal(n_samples, seed, split=EMNIST_SPLIT):
     train = torchvision.datasets.EMNIST(root=str(DATA_DIR), split=split, train=True, download=False)
     test = torchvision.datasets.EMNIST(root=str(DATA_DIR), split=split, train=False, download=False)
     images = torch.cat([train.data, test.data], dim=0).numpy()
-    labels = torch.cat([train.targets, test.targets], dim=0).numpy()
     images = images.reshape(-1, 28, 28).transpose(0, 2, 1).reshape(-1, 784)
 
-    classes = np.unique(labels)
-    base = n_samples // len(classes)
-    remainder = n_samples % len(classes)
-    if base == 0:
-        raise ValueError(f"n_samples={n_samples} too small for {len(classes)} EMNIST classes")
+    needed = 2 * n_samples
+    if images.shape[0] < needed:
+        raise ValueError(
+            f"EMNIST has {images.shape[0]:,} total samples, need {needed:,} for N={n_samples:,}"
+        )
 
     rng = np.random.RandomState(seed)
-    red_parts, blue_parts = [], []
-    for class_pos, cls in enumerate(classes):
-        count = base + (1 if class_pos < remainder else 0)
-        idx = np.flatnonzero(labels == cls).copy()
-        needed = 2 * count
-        if idx.size < needed:
-            raise ValueError(
-                f"class {cls} has {idx.size:,} samples, need {needed:,} for N={n_samples:,}"
-            )
-        rng.shuffle(idx)
-        chosen = idx[:needed]
-        red_parts.append(images[chosen[:count]])
-        blue_parts.append(images[chosen[count:needed]])
-
-    red = np.concatenate(red_parts).astype(np.float32) / 255.0
-    blue = np.concatenate(blue_parts).astype(np.float32) / 255.0
+    chosen = rng.permutation(images.shape[0])[:needed]
+    red = images[chosen[:n_samples]].astype(np.float32) / 255.0
+    blue = images[chosen[n_samples:needed]].astype(np.float32) / 255.0
     for arr in (red, blue):
         s = arr.sum(axis=1, keepdims=True)
         np.maximum(s, 1e-8, out=s)
