@@ -64,11 +64,12 @@ EPSILON = 0.01
 BATCH_SIZE = 512
 OLD_RADIUS_SCHEME = "geometric"
 OLD_PAIR_CHUNK = 128
+BATCH_SIZE_OLD = 32
 MAX_WORDS = 300
 
 IMAGE_N_VALUES = [5_000, 10_000, 15_000, 20_000, 25_000]
 CHAMFER_N_VALUES = [1_000, 2_000, 3_000, 5_000, 7_000, 10_000]
-IMAGE_SEEDS = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
+IMAGE_SEEDS = [42]
 SINGLE_SEED = [42]
 
 BLUE_DIGITS = list(range(5))
@@ -162,25 +163,29 @@ def _geometric_ceil(values: torch.Tensor, epsilon: float) -> torch.Tensor:
 
 def _update_old_proxy_from_center(
     C_old: torch.Tensor,
-    blue_d: torch.Tensor,
-    red_d: torch.Tensor,
-    blue_mask: torch.Tensor,
-    red_mask: torch.Tensor,
+    b_blue_d: torch.Tensor,
+    b_red_d: torch.Tensor,
+    b_blue_m: torch.Tensor,
+    b_red_m: torch.Tensor,
     epsilon: float,
-    pair_chunk: int,
-) -> None:
-    blue_idx = blue_mask.nonzero(as_tuple=True)[0]
-    red_idx = red_mask.nonzero(as_tuple=True)[0]
-    if blue_idx.numel() == 0 or red_idx.numel() == 0:
-        return
-    red_vals = red_d[red_idx]
-    for start in range(0, blue_idx.numel(), pair_chunk):
-        end = min(start + pair_chunk, blue_idx.numel())
-        b_idx = blue_idx[start:end]
-        radii = torch.maximum(blue_d[b_idx].unsqueeze(1), red_vals.unsqueeze(0))
-        candidate = 2.0 * _geometric_ceil(radii, epsilon)
-        current = C_old[b_idx.unsqueeze(1), red_idx.unsqueeze(0)]
-        C_old[b_idx.unsqueeze(1), red_idx.unsqueeze(0)] = torch.minimum(current, candidate)
+    start: int,
+    end: int,
+    p_total: int,
+) -> torch.Tensor:
+    prev_start = max(0, start - BATCH_SIZE_OLD)
+    if start == 0 or start // 200 != prev_start // 200:
+        print(f"  [old proxy] processing centers {start}-{end-1}/{p_total}", flush=True)
+    radii = torch.maximum(
+        b_blue_d.unsqueeze(2),
+        b_red_d.unsqueeze(1),
+    )
+    candidates = 2.0 * _geometric_ceil(radii, epsilon)
+    active = b_blue_m.unsqueeze(2) & b_red_m.unsqueeze(1)
+    candidates[~active] = float("inf")
+    batch_min = candidates.min(dim=0).values
+    C_old = torch.minimum(C_old, batch_min)
+    del radii, candidates, active, batch_min
+    return C_old
 
 
 def _center_distances(
@@ -244,21 +249,51 @@ def build_old_paper_proxy_matrix(
     p_total = 2 * n
     sampled_mask = _sample_mask(p_total, p_total ** -0.5, device, seed)
     d1_red, d1_blue = _nearest_sampled_distances(D_br, D_rr, D_bb, sampled_mask)
-    C_old = torch.full((n, n), float("inf"), dtype=D_br.dtype, device=device)
 
-    all_red = torch.ones(n, dtype=torch.bool, device=device)
-    all_blue = torch.ones(n, dtype=torch.bool, device=device)
-    for q in range(p_total):
-        red_d, blue_d = _center_distances(q, n, D_br, D_rr, D_bb)
-        if bool(sampled_mask[q].item()):
-            red_mask = all_red
-            blue_mask = all_blue
-        else:
-            red_mask = red_d < d1_red
-            blue_mask = blue_d < d1_blue
-        _update_old_proxy_from_center(
-            C_old, blue_d, red_d, blue_mask, red_mask, epsilon, pair_chunk
+    store_on_cpu = p_total * n * 4 > 2 * 1024**3
+    storage_device = torch.device("cpu") if store_on_cpu else device
+    update_device = torch.device("cuda") if store_on_cpu and torch.cuda.is_available() else storage_device
+
+    all_red_d = torch.cat([D_rr.to(storage_device), D_br.to(storage_device)], dim=0)
+    all_blue_d = torch.cat([D_br.T.to(storage_device), D_bb.to(storage_device)], dim=0)
+    if all_red_d.shape != (p_total, n) or all_blue_d.shape != (p_total, n):
+        raise RuntimeError(
+            f"old proxy distance stack shape mismatch: "
+            f"all_red_d={tuple(all_red_d.shape)}, all_blue_d={tuple(all_blue_d.shape)}"
         )
+
+    sampled_mask_store = sampled_mask.to(storage_device)
+    d1_red_store = d1_red.to(storage_device)
+    d1_blue_store = d1_blue.to(storage_device)
+    red_mask_all = all_red_d < d1_red_store.unsqueeze(0)
+    blue_mask_all = all_blue_d < d1_blue_store.unsqueeze(0)
+    red_mask_all[sampled_mask_store] = True
+    blue_mask_all[sampled_mask_store] = True
+
+    C_old = torch.full((n, n), float("inf"), dtype=D_br.dtype, device=update_device)
+
+    # Each batch allocates (batch, n, n) float32.
+    # Target ~256MB per batch to stay safe on 8GB GPU.
+    target_bytes = 256 * 1024 * 1024
+    dyn_batch = max(1, int(target_bytes / (n * n * 4)))
+    dyn_batch = min(dyn_batch, BATCH_SIZE_OLD)
+    print(
+        f"  [old proxy] n={n}, dynamic batch size={dyn_batch} "
+        f"({dyn_batch*n*n*4/1e6:.0f}MB per batch, "
+        f"{math.ceil(p_total/dyn_batch)} batches)",
+        flush=True,
+    )
+
+    for start in range(0, p_total, dyn_batch):
+        end = min(start + dyn_batch, p_total)
+        b_blue_d = all_blue_d[start:end].to(update_device)
+        b_red_d = all_red_d[start:end].to(update_device)
+        b_blue_m = blue_mask_all[start:end].to(update_device)
+        b_red_m = red_mask_all[start:end].to(update_device)
+        C_old = _update_old_proxy_from_center(
+            C_old, b_blue_d, b_red_d, b_blue_m, b_red_m, epsilon, start, end, p_total
+        )
+        del b_blue_d, b_red_d, b_blue_m, b_red_m
 
     meta = {
         "old_radius_scheme": OLD_RADIUS_SCHEME,
