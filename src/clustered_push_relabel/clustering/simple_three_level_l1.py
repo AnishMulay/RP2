@@ -4,13 +4,7 @@ import torch
 
 
 def _gpu_mem(label: str) -> None:
-    if torch.cuda.is_available():
-        alloc = torch.cuda.memory_allocated() / 1024 ** 3
-        res = torch.cuda.memory_reserved() / 1024 ** 3
-        print(
-            f"  [MEM-3lvl-l1] {label}: alloc={alloc:.2f}GB res={res:.2f}GB",
-            flush=True,
-        )
+    return
 
 
 class ThreeLevelL1Clustering:

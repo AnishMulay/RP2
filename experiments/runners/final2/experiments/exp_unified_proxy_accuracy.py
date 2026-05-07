@@ -62,9 +62,6 @@ EMBEDDINGS_PATH = NEWSGROUPS_DATA_DIR / "newsgroups_embeddings.pkl.gz"
 
 EPSILON = 0.01
 BATCH_SIZE = 512
-OLD_RADIUS_SCHEME = "geometric"
-OLD_PAIR_CHUNK = 128
-BATCH_SIZE_OLD = 32
 MAX_WORDS = 300
 
 IMAGE_N_VALUES = [5_000, 10_000, 15_000, 20_000, 25_000]
@@ -87,11 +84,8 @@ CSV_COLUMNS = [
     "ratio_2L",
     "proxy_3L_cost",
     "ratio_3L",
-    "old_proxy_cost",
-    "ratio_old",
     "gap_2L_pct",
     "gap_3L_pct",
-    "gap_old_pct",
 ]
 
 
@@ -118,7 +112,6 @@ class LoadedData:
 class DistanceBundle:
     D_br: torch.Tensor
     D_rr: torch.Tensor
-    D_bb: torch.Tensor
     scale: float = 1.0
 
 
@@ -130,178 +123,6 @@ def _sync(device: torch.device) -> None:
 def _clear(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
-
-
-def _torch_generator(device: torch.device, seed: int) -> torch.Generator:
-    gen = torch.Generator(device=device.type if device.type == "cuda" else "cpu")
-    gen.manual_seed(seed)
-    return gen
-
-
-def _sample_mask(n: int, prob: float, device: torch.device, seed: int) -> torch.Tensor:
-    gen = _torch_generator(device, seed)
-    mask = torch.rand(n, device=device, generator=gen) < prob
-    if not mask.any():
-        idx = torch.randint(n, (1,), device=device, generator=gen)
-        mask[idx] = True
-    return mask
-
-
-def _geometric_ceil(values: torch.Tensor, epsilon: float) -> torch.Tensor:
-    """Return the smallest (1+epsilon)^i radius >= each nonnegative value."""
-    if epsilon <= 0:
-        raise ValueError("epsilon must be positive")
-    out = torch.zeros_like(values)
-    mask = values > 0
-    if mask.any():
-        log_base = math.log1p(epsilon)
-        levels = torch.ceil(torch.log(values[mask]) / log_base)
-        rounded = torch.exp(levels * log_base)
-        out[mask] = torch.maximum(rounded, values[mask])
-    return out
-
-
-def _update_old_proxy_from_center(
-    C_old: torch.Tensor,
-    b_blue_d: torch.Tensor,
-    b_red_d: torch.Tensor,
-    b_blue_m: torch.Tensor,
-    b_red_m: torch.Tensor,
-    epsilon: float,
-    start: int,
-    end: int,
-    p_total: int,
-) -> torch.Tensor:
-    prev_start = max(0, start - BATCH_SIZE_OLD)
-    if start == 0 or start // 200 != prev_start // 200:
-        print(f"  [old proxy] processing centers {start}-{end-1}/{p_total}", flush=True)
-    radii = torch.maximum(
-        b_blue_d.unsqueeze(2),
-        b_red_d.unsqueeze(1),
-    )
-    candidates = 2.0 * _geometric_ceil(radii, epsilon)
-    active = b_blue_m.unsqueeze(2) & b_red_m.unsqueeze(1)
-    candidates[~active] = float("inf")
-    batch_min = candidates.min(dim=0).values
-    C_old = torch.minimum(C_old, batch_min)
-    del radii, candidates, active, batch_min
-    return C_old
-
-
-def _center_distances(
-    q: int,
-    n: int,
-    D_br: torch.Tensor,
-    D_rr: torch.Tensor,
-    D_bb: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if q < n:
-        red_d = D_rr[q, :]
-        blue_d = D_br[:, q]
-    else:
-        b = q - n
-        red_d = D_br[b, :]
-        blue_d = D_bb[b, :]
-    return red_d, blue_d
-
-
-def _nearest_sampled_distances(
-    D_br: torch.Tensor,
-    D_rr: torch.Tensor,
-    D_bb: torch.Tensor,
-    sampled_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    n = D_br.shape[0]
-    device = D_br.device
-    d1_red = torch.full((n,), float("inf"), dtype=D_br.dtype, device=device)
-    d1_blue = torch.full((n,), float("inf"), dtype=D_br.dtype, device=device)
-    sampled_red = sampled_mask[:n].nonzero(as_tuple=True)[0]
-    sampled_blue = sampled_mask[n:].nonzero(as_tuple=True)[0]
-    if sampled_red.numel() > 0:
-        d1_red = torch.minimum(d1_red, D_rr[:, sampled_red].min(dim=1).values)
-        d1_blue = torch.minimum(d1_blue, D_br[:, sampled_red].min(dim=1).values)
-    if sampled_blue.numel() > 0:
-        d1_red = torch.minimum(d1_red, D_br[sampled_blue, :].min(dim=0).values)
-        d1_blue = torch.minimum(d1_blue, D_bb[:, sampled_blue].min(dim=1).values)
-    return d1_red, d1_blue
-
-
-def build_old_paper_proxy_matrix(
-    D_br: torch.Tensor,
-    D_rr: torch.Tensor,
-    D_bb: torch.Tensor,
-    epsilon: float,
-    seed: int,
-    pair_chunk: int = OLD_PAIR_CHUNK,
-) -> tuple[torch.Tensor, dict]:
-    """
-    Build the old paper cluster-induced proxy C_old[b,a].
-
-    P = A union B is sampled at probability |P|^-1/2.  Sampled centers make
-    ordinary balls.  Non-sampled centers make balls restricted to points closer
-    to that center than to any sampled landmark.  The pair cost is the minimum
-    shared cluster radius times two, with geometric ceil radii.
-    """
-    if D_br.shape != D_rr.shape or D_br.shape != D_bb.shape:
-        raise ValueError("D_br, D_rr, and D_bb must all have shape (N, N)")
-    n = D_br.shape[0]
-    device = D_br.device
-    p_total = 2 * n
-    sampled_mask = _sample_mask(p_total, p_total ** -0.5, device, seed)
-    d1_red, d1_blue = _nearest_sampled_distances(D_br, D_rr, D_bb, sampled_mask)
-
-    store_on_cpu = p_total * n * 4 > 2 * 1024**3
-    storage_device = torch.device("cpu") if store_on_cpu else device
-    update_device = torch.device("cuda") if store_on_cpu and torch.cuda.is_available() else storage_device
-
-    all_red_d = torch.cat([D_rr.to(storage_device), D_br.to(storage_device)], dim=0)
-    all_blue_d = torch.cat([D_br.T.to(storage_device), D_bb.to(storage_device)], dim=0)
-    if all_red_d.shape != (p_total, n) or all_blue_d.shape != (p_total, n):
-        raise RuntimeError(
-            f"old proxy distance stack shape mismatch: "
-            f"all_red_d={tuple(all_red_d.shape)}, all_blue_d={tuple(all_blue_d.shape)}"
-        )
-
-    sampled_mask_store = sampled_mask.to(storage_device)
-    d1_red_store = d1_red.to(storage_device)
-    d1_blue_store = d1_blue.to(storage_device)
-    red_mask_all = all_red_d < d1_red_store.unsqueeze(0)
-    blue_mask_all = all_blue_d < d1_blue_store.unsqueeze(0)
-    red_mask_all[sampled_mask_store] = True
-    blue_mask_all[sampled_mask_store] = True
-
-    C_old = torch.full((n, n), float("inf"), dtype=D_br.dtype, device=update_device)
-
-    # Each batch allocates (batch, n, n) float32.
-    # Target ~256MB per batch to stay safe on 8GB GPU.
-    target_bytes = 256 * 1024 * 1024
-    dyn_batch = max(1, int(target_bytes / (n * n * 4)))
-    dyn_batch = min(dyn_batch, BATCH_SIZE_OLD)
-    print(
-        f"  [old proxy] n={n}, dynamic batch size={dyn_batch} "
-        f"({dyn_batch*n*n*4/1e6:.0f}MB per batch, "
-        f"{math.ceil(p_total/dyn_batch)} batches)",
-        flush=True,
-    )
-
-    for start in range(0, p_total, dyn_batch):
-        end = min(start + dyn_batch, p_total)
-        b_blue_d = all_blue_d[start:end].to(update_device)
-        b_red_d = all_red_d[start:end].to(update_device)
-        b_blue_m = blue_mask_all[start:end].to(update_device)
-        b_red_m = red_mask_all[start:end].to(update_device)
-        C_old = _update_old_proxy_from_center(
-            C_old, b_blue_d, b_red_d, b_blue_m, b_red_m, epsilon, start, end, p_total
-        )
-        del b_blue_d, b_red_d, b_blue_m, b_red_m
-
-    meta = {
-        "old_radius_scheme": OLD_RADIUS_SCHEME,
-        "sampled_count": int(sampled_mask.sum().item()),
-        "sampled_red_count": int(sampled_mask[:n].sum().item()),
-        "sampled_blue_count": int(sampled_mask[n:].sum().item()),
-    }
-    return C_old, meta
 
 
 def _sample_from_digits(images, labels, digit_set, n_total, rng):
@@ -534,43 +355,6 @@ def chamfer_matrix(
     return D
 
 
-def chamfer_symmetric(descs: list, device: torch.device, tile: int = 50) -> torch.Tensor:
-    n = len(descs)
-    p, lengths = _pad_descriptor_sets(descs, device)
-    k = p.shape[1]
-    valid = torch.arange(k, device=device).unsqueeze(0) < lengths.unsqueeze(1)
-    D = torch.zeros((n, n), dtype=torch.float32, device=device)
-    for i0 in range(0, n, tile):
-        ie = min(i0 + tile, n)
-        ti = ie - i0
-        It = p[i0:ie].reshape(ti * k, p.shape[2])
-        vI = valid[i0:ie]
-        lI = lengths[i0:ie]
-        for j0 in range(i0, n, tile):
-            je = min(j0 + tile, n)
-            tj = je - j0
-            Jt = p[j0:je].reshape(tj * k, p.shape[2])
-            vJ = valid[j0:je]
-            lJ = lengths[j0:je]
-            dists = torch.cdist(It, Jt, p=2, compute_mode="use_mm_for_euclid_dist_if_necessary")
-            dists = dists.reshape(ti, k, tj, k)
-            dists.masked_fill_(~vJ.view(1, 1, tj, k), float("inf"))
-            fwd = dists.min(3).values.masked_fill(~vI.unsqueeze(2), 0.0)
-            fwd = fwd.sum(1) / lI.float().unsqueeze(1).clamp(min=1.0)
-            dists.masked_fill_(~vI.view(ti, k, 1, 1), float("inf"))
-            bwd = dists.min(1).values.masked_fill(~vJ.unsqueeze(0), 0.0)
-            bwd = bwd.sum(2) / lJ.float().unsqueeze(0).clamp(min=1.0)
-            block = fwd + bwd
-            if i0 == j0:
-                block = block.clone()
-                block[torch.arange(ti, device=device), torch.arange(ti, device=device)] = 0.0
-            D[i0:ie, j0:je] = block
-            if i0 != j0:
-                D[j0:je, i0:ie] = block.T
-    _sync(device)
-    return D
-
-
 def build_l1_bundle(red: torch.Tensor, blue: torch.Tensor, n: int, device: torch.device) -> DistanceBundle:
     if n > 15_000:
         print(
@@ -585,20 +369,17 @@ def build_l1_bundle(red: torch.Tensor, blue: torch.Tensor, n: int, device: torch
 
     D_br = torch.cdist(blue64, red64, p=1).to(torch.float32)
     D_rr = torch.cdist(red64, red64, p=1).to(torch.float32)
-    D_bb = torch.cdist(blue64, blue64, p=1).to(torch.float32)
-    return DistanceBundle(D_br=D_br, D_rr=D_rr, D_bb=D_bb)
+    return DistanceBundle(D_br=D_br, D_rr=D_rr)
 
 
 def build_chamfer_bundle(data: LoadedData, device: torch.device) -> DistanceBundle:
     assert data.red_descs is not None and data.blue_descs is not None
     D_br = chamfer_matrix(data.blue_descs, data.red_descs, device)
-    D_rr = chamfer_symmetric(data.red_descs, device)
-    D_bb = chamfer_symmetric(data.blue_descs, device)
-    scale = max(float(D_br.max().item()), float(D_rr.max().item()), float(D_bb.max().item()), 1e-8)
+    D_rr = chamfer_matrix(data.red_descs, data.red_descs, device)
+    scale = max(float(D_br.max().item()), float(D_rr.max().item()), 1e-8)
     return DistanceBundle(
         D_br=D_br / scale,
         D_rr=D_rr / scale,
-        D_bb=D_bb / scale,
         scale=scale,
     )
 
@@ -674,11 +455,8 @@ def run_one_seed(config: DatasetConfig, n: int, seed: int, device: torch.device)
         "ratio_2L": math.nan,
         "proxy_3L_cost": math.nan,
         "ratio_3L": math.nan,
-        "old_proxy_cost": math.nan,
-        "ratio_old": math.nan,
         "gap_2L_pct": math.nan,
         "gap_3L_pct": math.nan,
-        "gap_old_pct": math.nan,
     }
 
     try:
@@ -727,20 +505,6 @@ def run_one_seed(config: DatasetConfig, n: int, seed: int, device: torch.device)
                 flush=True,
             )
 
-        try:
-            C_old, _old_meta = build_old_paper_proxy_matrix(
-                bundle.D_br, bundle.D_rr, bundle.D_bb, EPSILON, seed, OLD_PAIR_CHUNK
-            )
-            old_proxy_cost = emd2_cost(C_old)
-            row["old_proxy_cost"] = old_proxy_cost
-            row["ratio_old"] = old_proxy_cost / exact_cost
-            row["gap_old_pct"] = (old_proxy_cost - exact_cost) / exact_cost * 100.0
-        except (MemoryError, RuntimeError, Exception) as exc:
-            print(
-                f"WARNING: old proxy failed for {config.dataset} {config.sampling} "
-                f"n={n} seed={seed}: {exc}",
-                flush=True,
-            )
     except (MemoryError, RuntimeError, Exception) as exc:
         print(
             f"WARNING: failed {config.dataset} {config.sampling} n={n} seed={seed}: {exc}",
@@ -759,14 +523,13 @@ def mean_of(rows: list[dict], key: str) -> float:
 
 def print_incremental_summary(config: DatasetConfig, n: int, rows: list[dict]) -> None:
     print()
-    print("dataset | n | mean_ratio_2L | mean_ratio_3L | mean_gap_2L_pct | mean_gap_old_pct")
-    print("--- | ---: | ---: | ---: | ---: | ---:")
+    print("dataset | n | mean_ratio_2L | mean_ratio_3L | mean_gap_2L_pct")
+    print("--- | ---: | ---: | ---: | ---:")
     print(
         f"{config.dataset} {config.sampling} | {n:,} | "
         f"{fmt_float(mean_of(rows, 'ratio_2L'))} | "
         f"{fmt_float(mean_of(rows, 'ratio_3L'))} | "
-        f"{fmt_float(mean_of(rows, 'gap_2L_pct'))} | "
-        f"{fmt_float(mean_of(rows, 'gap_old_pct'))}",
+        f"{fmt_float(mean_of(rows, 'gap_2L_pct'))}",
         flush=True,
     )
     print()
@@ -832,8 +595,7 @@ def run(device: torch.device, output_dir: Path, dataset_keys: list[str]) -> Path
                     print(
                         f"Seed {seed}: exact={fmt_float(row['exact_cost'])} "
                         f"ratio_2L={fmt_float(row['ratio_2L'])} "
-                        f"ratio_3L={fmt_float(row['ratio_3L'])} "
-                        f"ratio_old={fmt_float(row['ratio_old'])}",
+                        f"ratio_3L={fmt_float(row['ratio_3L'])}",
                         flush=True,
                     )
                 print_incremental_summary(config, n, completed_rows)

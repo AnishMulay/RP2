@@ -1,0 +1,33 @@
+dataset,sampling,n,seed,exact_cost,proxy_2L_cost,ratio_2L,proxy_3L_cost,ratio_3L,gap_2L_pct,gap_3L_pct
+MNIST,Equal,5000,42,nan,nan,nan,nan,nan,nan,nan
+MNIST,Equal,10000,42,nan,nan,nan,nan,nan,nan,nan
+MNIST,Equal,15000,42,nan,nan,nan,nan,nan,nan,nan
+MNIST,Equal,20000,42,nan,nan,nan,nan,nan,nan,nan
+MNIST,Equal,25000,42,nan,nan,nan,nan,nan,nan,nan
+MNIST,Biased,5000,42,nan,nan,nan,nan,nan,nan,nan
+MNIST,Biased,10000,42,nan,nan,nan,nan,nan,nan,nan
+MNIST,Biased,15000,42,nan,nan,nan,nan,nan,nan,nan
+MNIST,Biased,20000,42,nan,nan,nan,nan,nan,nan,nan
+MNIST,Biased,25000,42,nan,nan,nan,nan,nan,nan,nan
+EMNIST,Equal,5000,42,nan,nan,nan,nan,nan,nan,nan
+EMNIST,Equal,10000,42,nan,nan,nan,nan,nan,nan,nan
+EMNIST,Equal,15000,42,nan,nan,nan,nan,nan,nan,nan
+EMNIST,Equal,20000,42,nan,nan,nan,nan,nan,nan,nan
+EMNIST,Equal,25000,42,nan,nan,nan,nan,nan,nan,nan
+EMNIST,Biased,5000,42,nan,nan,nan,nan,nan,nan,nan
+EMNIST,Biased,10000,42,nan,nan,nan,nan,nan,nan,nan
+EMNIST,Biased,15000,42,nan,nan,nan,nan,nan,nan,nan
+EMNIST,Biased,20000,42,nan,nan,nan,nan,nan,nan,nan
+EMNIST,Biased,25000,42,nan,nan,nan,nan,nan,nan,nan
+20 Newsgroups,Default,1000,42,nan,nan,nan,nan,nan,nan,nan
+20 Newsgroups,Default,2000,42,nan,nan,nan,nan,nan,nan,nan
+20 Newsgroups,Default,3000,42,nan,nan,nan,nan,nan,nan,nan
+20 Newsgroups,Default,5000,42,nan,nan,nan,nan,nan,nan,nan
+20 Newsgroups,Default,7000,42,nan,nan,nan,nan,nan,nan,nan
+20 Newsgroups,Default,10000,42,nan,nan,nan,nan,nan,nan,nan
+CIFAR-10 SIFT,Default,1000,42,nan,nan,nan,nan,nan,nan,nan
+CIFAR-10 SIFT,Default,2000,42,nan,nan,nan,nan,nan,nan,nan
+CIFAR-10 SIFT,Default,3000,42,nan,nan,nan,nan,nan,nan,nan
+CIFAR-10 SIFT,Default,5000,42,nan,nan,nan,nan,nan,nan,nan
+CIFAR-10 SIFT,Default,7000,42,nan,nan,nan,nan,nan,nan,nan
+CIFAR-10 SIFT,Default,10000,42,nan,nan,nan,nan,nan,nan,nan
