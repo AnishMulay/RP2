@@ -349,7 +349,8 @@ def build_three_level_proxy_matrix(clustering, N, device):
         )
         C[b_idx, adj_B_col] = adj_B_dist_float
 
-    return C.cpu().to(torch.float64).numpy()
+    proxy_max = float(clustering.get("proxy_max", 1.0))
+    return (C * proxy_max).cpu().to(torch.float64).numpy()
 
 
 # ── Two-level proxy cost-matrix builder (from SimplePrecomputedClustering) ───
