@@ -843,12 +843,18 @@ class SimpleGPUSolver:
             self, "_keep_free_mask", B_free.numel(), self.device
         )
         keep_free.fill_(True)
-        keep_free[torch.searchsorted(B_free, b_new)] = False
+        if b_new.numel() != 0:
+            accepted_mask = _ensure_bool_buffer(
+                self, "_accepted_b_mask", self.N, self.device
+            )
+            accepted_mask.fill_(False)
+            accepted_mask[b_new] = True
+            keep_free &= ~accepted_mask[B_free]
         still_free = B_free[keep_free]
 
         if evicted_b.numel() == 0:
             return still_free
-        F_B_new, _ = torch.sort(torch.cat([still_free, evicted_b]))
+        F_B_new = torch.unique(torch.cat([still_free, evicted_b]), sorted=True)
         return F_B_new
 
     def _clone_debug_indices(self, values):
