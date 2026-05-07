@@ -129,8 +129,10 @@ def load_emnist_equal(n_samples, seed, split=EMNIST_SPLIT):
     for arr in (red, blue):
         s = arr.sum(axis=1, keepdims=True)
         np.maximum(s, 1e-8, out=s)
-        # Keep the same probability-histogram normalization as the EMNIST proxy experiments.
         arr /= s
+        # The GPU solvers expect costs in [0, 1]. Probability histograms have
+        # L1 distances in [0, 2], so scale coordinates by 1/2 for this solver run.
+        arr *= 0.5
 
     if red.shape[0] != n_samples or blue.shape[0] != n_samples:
         raise RuntimeError(f"internal sampling error: got red={red.shape[0]}, blue={blue.shape[0]}")
