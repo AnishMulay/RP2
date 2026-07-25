@@ -5,15 +5,28 @@ class FastGPUClustering:
     """
     Optimized Clustering using Voronoi constraints and minimal shells.
     """
-    def __init__(self, epsilon, batch_size=1024, micro_batch_size=32, metric="L2"):
+    def __init__(self, epsilon, batch_size=1024, micro_batch_size=32, metric="L2", profile_memory=False):
         self.epsilon = epsilon
         self.batch_size = batch_size
         self.micro_batch_size = micro_batch_size
         self.metric = metric
+        self.profile_memory = bool(profile_memory)
+        self.memory_profile = {}
         if metric == "L1":
             self.kernel = TiledManhattanKernel(chunk_size=batch_size)
         else:
             self.kernel = TiledEuclideanKernel(chunk_size=batch_size)
+
+    # ── Opt-in stage-level peak-memory profiling (default OFF, zero overhead
+    # when disabled). No-op on CPU. ─────────────────────────────────────────
+    def _prof_reset(self):
+        if self.profile_memory and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def _prof_record(self, label):
+        if self.profile_memory and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            self.memory_profile[label] = torch.cuda.max_memory_allocated() / 1024 ** 3
 
     def _sample_landmarks(self, n, device):
         prob = n ** (-0.5)
@@ -91,16 +104,25 @@ class FastGPUClustering:
                 torch.cat(chunk_point_ids))
 
     def run(self, P_red, P_blue):
+        if self.profile_memory:
+            self.memory_profile = {}
+
         P_all = torch.cat([P_red, P_blue], dim=0)
         workspace = self.kernel.prepare_workspace(P_all)
-        
+
+        self._prof_reset()
         red_idx, red_mask = self._sample_landmarks(P_red.shape[0], P_red.device)
         blue_idx, blue_mask = self._sample_landmarks(P_blue.shape[0], P_blue.device)
-        
+        self._prof_record("landmark_sampling")
+
+        self._prof_reset()
         D_red = self._compute_voronoi_bounds(P_all, P_red[red_idx], workspace)
         D_blue = self._compute_voronoi_bounds(P_all, P_blue[blue_idx], workspace)
-        
+        self._prof_record("voronoi_bounds")
+
+        self._prof_reset()
         b_c, b_l, b_p = self._build_cover_bulk(P_blue, blue_mask, workspace, D_blue)
         r_c, r_l, r_p = self._build_cover_bulk(P_red, red_mask, workspace, D_red)
-        
+        self._prof_record("build_cover")
+
         return (b_c, b_l, b_p), (r_c, r_l, r_p), red_mask.cpu(), blue_mask.cpu()

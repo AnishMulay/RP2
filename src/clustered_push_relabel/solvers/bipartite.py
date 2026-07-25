@@ -54,7 +54,7 @@ class TwoLevelBipartiteSolver:
         batch_size (int, optional): Processing chunk size. Defaults to 1024.
         metric (str, optional): Distance metric ("L2" or "L1"). Defaults to "L2".
     """
-    def __init__(self, P_red, P_blue, epsilon, batch_size=None, metric="L2", verbose=False):
+    def __init__(self, P_red, P_blue, epsilon, batch_size=None, metric="L2", verbose=False, profile_memory=False):
         self.device = P_red.device
         self.N = P_red.shape[0]
         self.epsilon = epsilon
@@ -63,19 +63,26 @@ class TwoLevelBipartiteSolver:
         self.batch_size = 1024 if batch_size is None else batch_size
         self.metric = metric
         self.verbose = verbose
-        
+        self.profile_memory = bool(profile_memory)
+        self.memory_profile = {}
+
         if self.verbose:
             print("="*60)
             print(f"[Init] Configuration: N={self.N}, Eps={epsilon}, Batch={self.batch_size}, Metric={metric}, Device={self.device}")
-        
+
         # 1. Clustering
         if self.verbose:
             print("[Step 1] Running Geometric Clustering...")
         t0 = time.time()
         cluster_engine = FastGPUClustering(
-            epsilon, batch_size=self.batch_size, micro_batch_size=32, metric=metric
+            epsilon, batch_size=self.batch_size, micro_batch_size=32, metric=metric,
+            profile_memory=self.profile_memory,
         )
         blue_coo, red_coo, r_mask, b_mask = cluster_engine.run(P_red, P_blue)
+        if self.profile_memory:
+            self.memory_profile.update(
+                {f"clustering.{k}": v for k, v in cluster_engine.memory_profile.items()}
+            )
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         if self.verbose:
@@ -747,7 +754,7 @@ class KLevelBipartiteSolver:
         batch_size (int, optional): Processing chunk size. Defaults to 2048.
         metric (str, optional): Distance metric ("L2" or "L1"). Defaults to "L2".
     """
-    def __init__(self, P_red, P_blue, epsilon, k=4, batch_size=None, metric="L2", verbose=False):
+    def __init__(self, P_red, P_blue, epsilon, k=4, batch_size=None, metric="L2", verbose=False, profile_memory=False):
         self.device = P_red.device
         self.N = P_red.shape[0]
         self.epsilon = epsilon
@@ -757,19 +764,26 @@ class KLevelBipartiteSolver:
         self.batch_size = 2048 if batch_size is None else batch_size
         self.metric = metric
         self.verbose = verbose
-        
+        self.profile_memory = bool(profile_memory)
+        self.memory_profile = {}
+
         if self.verbose:
             print("="*60)
             print(f"[Init] Config: N={self.N}, Eps={epsilon}, Levels={k}, Batch={self.batch_size}, Metric={metric}, Device={self.device}")
-        
+
         # 1. Multi-Level Clustering
         if self.verbose:
             print("[Step 1] Running Multi-Level Hierarchical Clustering...")
         t0 = time.time()
         cluster_engine = FastGPUMultiLevelClustering(
-            epsilon, k=k, batch_size=self.batch_size, metric=metric
+            epsilon, k=k, batch_size=self.batch_size, metric=metric,
+            profile_memory=self.profile_memory,
         )
         blue_coo, red_coo, levels_red, levels_blue = cluster_engine.run(P_red, P_blue)
+        if self.profile_memory:
+            self.memory_profile.update(
+                {f"clustering.{k_}": v for k_, v in cluster_engine.memory_profile.items()}
+            )
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         if self.verbose:
@@ -1001,6 +1015,20 @@ class KLevelBipartiteSolver:
         print(f"Avg {label} Cost: {avg_cost.item():.4f}")
 
     def solve(self):
+        """Public entry point. Wraps _solve_impl() with opt-in, zero-overhead-
+        when-disabled peak-memory profiling (see Task 3 / NOTES_FOR_REBUTTAL.md).
+        """
+        if self.profile_memory and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        result = self._solve_impl()
+        if self.profile_memory and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            self.memory_profile["solve_overall"] = (
+                torch.cuda.max_memory_allocated() / 1024 ** 3
+            )
+        return result
+
+    def _solve_impl(self):
         if self.verbose:
             print("[Debug] Entering solve() method...")
         # print(f"\n[Step 3] Starting Push-Relabel Loop...")

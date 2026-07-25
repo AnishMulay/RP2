@@ -14,15 +14,28 @@ class FastGPUMultiLevelClustering:
         batch_size (int, optional): GPU batch size for processing centers. Defaults to 2048.
         metric (str, optional): Distance metric to use ("L2" or "L1"). Defaults to "L2".
     """
-    def __init__(self, epsilon, k=4, batch_size=2048, metric="L2"):
+    def __init__(self, epsilon, k=4, batch_size=2048, metric="L2", profile_memory=False):
         self.epsilon = epsilon
         self.k = k
         self.batch_size = batch_size
         self.metric = metric
+        self.profile_memory = bool(profile_memory)
+        self.memory_profile = {}
         if metric == "L1":
             self.kernel = TiledManhattanKernel(chunk_size=batch_size)
         else:
             self.kernel = TiledEuclideanKernel(chunk_size=batch_size)
+
+    # ── Opt-in stage-level peak-memory profiling (default OFF, zero overhead
+    # when disabled). No-op on CPU. ─────────────────────────────────────────
+    def _prof_reset(self):
+        if self.profile_memory and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def _prof_record(self, label):
+        if self.profile_memory and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            self.memory_profile[label] = torch.cuda.max_memory_allocated() / 1024 ** 3
 
     def _sample_disjoint_hierarchy(self, n, device):
         prob = n ** (-1.0 / self.k)
@@ -86,13 +99,18 @@ class FastGPUMultiLevelClustering:
         return edges, new_bounds
 
     def run(self, P_red, P_blue):
+        if self.profile_memory:
+            self.memory_profile = {}
+
         P_all = torch.cat([P_red, P_blue], dim=0)
         n = P_all.shape[0]
         workspace = self.kernel.prepare_workspace(P_all)
-        
+
+        self._prof_reset()
         levels_red = self._sample_disjoint_hierarchy(P_red.shape[0], P_red.device)
         levels_blue = self._sample_disjoint_hierarchy(P_blue.shape[0], P_blue.device)
-        
+        self._prof_record("landmark_sampling")
+
         def build_cover(centers_source, levels_source):
             all_c, all_l, all_p = [], [], []
             bounds = torch.full((n,), float('inf'), device=P_all.device)
@@ -117,8 +135,10 @@ class FastGPUMultiLevelClustering:
                 return (torch.empty(0, dtype=torch.long),)*3
             return (torch.cat(all_c), torch.cat(all_l), torch.cat(all_p))
 
+        self._prof_reset()
         red_coo = build_cover(P_red, levels_red)
         blue_coo = build_cover(P_blue, levels_blue)
+        self._prof_record("build_cover")
         return blue_coo, red_coo, levels_red, levels_blue
 
 def k_level_cluster(x, y, epsilon, k=4, batch_size=2048, metric="L2"):
