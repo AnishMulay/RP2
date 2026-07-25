@@ -270,8 +270,8 @@ def get_adj_A1(a1: int, result: Dict) -> torch.Tensor:
 def _validate(A: torch.Tensor, B: torch.Tensor) -> None:
     if A.device != B.device:
         raise ValueError("A and B must be on the same device")
-    if A.device.type != "cuda":
-        raise ValueError("ThreeLevelL1Clustering requires CUDA tensors")
+    if A.device.type not in ("cuda", "cpu"):
+        raise ValueError("ThreeLevelL1Clustering requires CUDA or CPU tensors")
     if A.ndim != 2 or B.ndim != 2:
         raise ValueError("A and B must be rank-2 tensors")
     if A.shape != B.shape:

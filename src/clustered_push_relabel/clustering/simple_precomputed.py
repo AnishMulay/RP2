@@ -148,8 +148,8 @@ def get_adj(b: int, result: Dict) -> torch.Tensor:
 def _validate(D_red_to_red: torch.Tensor, D_blue_to_red: torch.Tensor) -> None:
     if D_red_to_red.device != D_blue_to_red.device:
         raise ValueError("distance tensors must be on the same device")
-    if D_red_to_red.device.type != "cuda":
-        raise ValueError("SimplePrecomputedClustering requires CUDA tensors")
+    if D_red_to_red.device.type not in ("cuda", "cpu"):
+        raise ValueError("SimplePrecomputedClustering requires CUDA or CPU tensors")
     if D_red_to_red.dtype != torch.float32 or D_blue_to_red.dtype != torch.float32:
         raise TypeError("distance tensors must be float32")
     if D_red_to_red.ndim != 2 or D_blue_to_red.ndim != 2:
