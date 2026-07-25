@@ -52,6 +52,7 @@ class SimpleClustering:
         epsilon: float,
         tile_size: int = 2048,
         sample_factor: float = 1.0,
+        profile_memory: bool = False,
     ):
         if tile_size <= 0:
             raise ValueError("tile_size must be positive")
@@ -62,6 +63,19 @@ class SimpleClustering:
         self.epsilon = float(epsilon)
         self.tile_size = int(tile_size)
         self.sample_factor = float(sample_factor)
+        self.profile_memory = bool(profile_memory)
+        self.memory_profile = {}
+
+    # ── Opt-in stage-level peak-memory profiling (default OFF, zero overhead
+    # when disabled; see NOTES_FOR_REBUTTAL.md). No-op on CPU. ────────────────
+    def _prof_reset(self):
+        if self.profile_memory and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def _prof_record(self, label):
+        if self.profile_memory and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            self.memory_profile[label] = torch.cuda.max_memory_allocated() / 1024 ** 3
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -92,15 +106,23 @@ class SimpleClustering:
         N      = A.shape[0]
         T      = self.tile_size
         eps    = self.epsilon
+        if self.profile_memory:
+            self.memory_profile = {}
 
         # ── 1. Sample red centers  w.p. 1/√N ─────────────────────────────────
+        self._prof_reset()
         sample_mask = torch.rand(N, device=device) < (1.0 / (self.sample_factor * math.sqrt(N)))
         if not sample_mask.any():
             sample_mask[torch.randint(N, (1,), device=device)] = True
         sampled_idx = sample_mask.nonzero(as_tuple=True)[0]    # (S,)
         A_s         = A[sampled_idx]                            # (S, d)
+        self._prof_record("landmark_sampling")
 
         # ── 2. DR and DB  (real L2, kept for slack computations) ──────────────
+        # DR/DR_int and DB/d_min_b are interleaved here (DB is freed before DR_int
+        # is materialized) to bound peak memory, so they are profiled as one
+        # combined stage rather than reordered into two independent ones.
+        self._prof_reset()
         _gpu_mem("before DR cdist")
         DR = torch.cdist(A_s, A,
                          compute_mode="use_mm_for_euclid_dist_if_necessary")  # (S, N)
@@ -113,6 +135,7 @@ class SimpleClustering:
         del DR
         _gpu_mem("after DR deleted")
         d_min_b_int = (d_min_b / eps).ceil_().to(torch.int32)  # (N,)
+        self._prof_record("DR_DB_construction")
 
         # ── 3. Pre-computed norms and threshold ───────────────────────────────
         d_min_b_sq = d_min_b.pow(2)            # (N,)  threshold per blue
@@ -130,6 +153,7 @@ class SimpleClustering:
         _gpu_mem("after tile buffers")
 
         # ── 5. Pass 1: count admissible pairs per blue ────────────────────────
+        self._prof_reset()
         counts = torch.zeros(N, dtype=torch.long, device=device)
 
         for start in range(0, N, T):
@@ -140,6 +164,7 @@ class SimpleClustering:
             torch.lt(float_buf[:, :t], d_min_b_sq.unsqueeze(1),
                      out=bool_buf[:, :t])
             counts.add_(bool_buf[:, :t].sum(dim=1))
+        self._prof_record("csr_pass1_counting")
         _gpu_mem("after pass 1")
 
         # ── 6. Build CSR pointers; allocate column buffer ─────────────────────
@@ -161,6 +186,7 @@ class SimpleClustering:
         # cursor[b] = next write position for blue point b.
         # Starts at adj_ptr[b] and advances as pairs are placed.
         # At the end of pass 2, cursor[b] == adj_ptr[b+1] for every b.
+        self._prof_reset()
         cursor = adj_ptr[:-1].clone()   # (N,) int64
 
         for start in range(0, N, T):
@@ -185,6 +211,7 @@ class SimpleClustering:
 
             # Advance cursor for every blue point that received pairs this tile
             cursor.scatter_add_(0, b_idx, torch.ones_like(b_idx))
+        self._prof_record("csr_pass2_fill")
         _gpu_mem("after pass 2")
 
         del float_buf, bool_buf, cursor
@@ -210,8 +237,8 @@ def get_adj(b: int, result: Dict) -> torch.Tensor:
 def _validate(A: torch.Tensor, B: torch.Tensor) -> None:
     if A.device != B.device:
         raise ValueError("A and B must be on the same device")
-    if A.device.type != "cuda":
-        raise ValueError("SimpleClustering requires CUDA tensors")
+    if A.device.type not in ("cuda", "cpu"):
+        raise ValueError("SimpleClustering requires CUDA or CPU tensors")
     if A.ndim != 2 or B.ndim != 2:
         raise ValueError("A and B must be rank-2 tensors")
     if A.shape != B.shape:

@@ -45,6 +45,7 @@ class SimpleGPUSolver:
         adj_chunk_size: int = 4096,
         clustering_class=None,
         precomputed_clustering=None,
+        profile_memory: bool = False,
     ):
         if clustering_class is None:
             from ..clustering.simple import SimpleClustering as clustering_class
@@ -54,6 +55,8 @@ class SimpleGPUSolver:
             raise ValueError("epsilon must be positive")
 
         self.adj_chunk_size = int(adj_chunk_size)
+        self.profile_memory = bool(profile_memory)
+        self.memory_profile = {}
 
         if precomputed_clustering is not None:
             self.N = int(precomputed_clustering["adj_ptr"].shape[0]) - 1
@@ -105,8 +108,8 @@ class SimpleGPUSolver:
         else:
             if A.device != B.device:
                 raise ValueError("A and B must be on the same device")
-            if A.device.type != "cuda":
-                raise ValueError("SimpleGPUSolver requires CUDA tensors")
+            if A.device.type not in ("cuda", "cpu"):
+                raise ValueError("SimpleGPUSolver requires CUDA or CPU tensors")
             if A.ndim != 2 or B.ndim != 2:
                 raise ValueError("A and B must be rank-2 tensors")
             if A.shape != B.shape:
@@ -143,12 +146,19 @@ class SimpleGPUSolver:
                 )
 
             t0 = time.time()
-            cluster_engine = self._clustering_class(
+            cluster_kwargs = dict(
                 epsilon=self.epsilon,
                 tile_size=self.batch_size,
                 sample_factor=sample_factor,
             )
+            if self.profile_memory:
+                cluster_kwargs["profile_memory"] = True
+            cluster_engine = self._clustering_class(**cluster_kwargs)
             clustering = cluster_engine.run(A, B)
+            if self.profile_memory:
+                self.memory_profile.update(
+                    {f"clustering.{k}": v for k, v in getattr(cluster_engine, "memory_profile", {}).items()}
+                )
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
             if self.verbose:
@@ -212,6 +222,20 @@ class SimpleGPUSolver:
         self._debug_last_V_at_proposal = None
 
     def solve(self):
+        """Public entry point. Wraps _solve_impl() with opt-in, zero-overhead-
+        when-disabled peak-memory profiling (see Task 3 / NOTES_FOR_REBUTTAL.md).
+        """
+        if self.profile_memory and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        result = self._solve_impl()
+        if self.profile_memory and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            self.memory_profile["solve_overall"] = (
+                torch.cuda.max_memory_allocated() / 1024 ** 3
+            )
+        return result
+
+    def _solve_impl(self):
         self._oom_phase = "start"
         N = self.N
         device = self.device

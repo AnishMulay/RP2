@@ -54,6 +54,7 @@ class ThreeLevelClustering:
         epsilon: float,
         tile_size: int = 2048,
         sample_factor: float = 1.0,
+        profile_memory: bool = False,
     ):
         if tile_size <= 0:
             raise ValueError("tile_size must be positive")
@@ -64,6 +65,19 @@ class ThreeLevelClustering:
         self.epsilon       = float(epsilon)
         self.tile_size     = int(tile_size)
         self.sample_factor = float(sample_factor)
+        self.profile_memory = bool(profile_memory)
+        self.memory_profile = {}
+
+    # ── Opt-in stage-level peak-memory profiling (default OFF, zero overhead
+    # when disabled; see NOTES_FOR_REBUTTAL.md). No-op on CPU. ────────────────
+    def _prof_reset(self):
+        if self.profile_memory and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def _prof_record(self, label):
+        if self.profile_memory and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            self.memory_profile[label] = torch.cuda.max_memory_allocated() / 1024 ** 3
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -106,8 +120,11 @@ class ThreeLevelClustering:
         N      = A.shape[0]
         T      = self.tile_size
         eps    = self.epsilon
+        if self.profile_memory:
+            self.memory_profile = {}
 
         # ── 1. Sample A1 ⊆ A at rate N^(-1/3)  →  E[|A1|] = N^(2/3) ─────────
+        self._prof_reset()
         rate1   = 1.0 / (self.sample_factor * (float(N) ** (1.0 / 3.0)))
         mask_A1 = torch.rand(N, device=device) < rate1
         if not mask_A1.any():
@@ -126,6 +143,7 @@ class ThreeLevelClustering:
         sampled_idx_A2 = sampled_idx_A1[local_idx_A2]        # indices into A
         A2             = A[sampled_idx_A2]                    # (S2, d)
         S2             = sampled_idx_A2.shape[0]
+        self._prof_record("landmark_sampling_A1_A2")
 
         _gpu_mem(f"sampled A1={S1}, A2={S2}")
 
@@ -136,12 +154,18 @@ class ThreeLevelClustering:
 
         # ── 4. DR: A2 × A  (S2 ≈ N^(1/3) is tiny; one cdist call is fine) ─────
         #     Kept as float32; needed by proxy cost builder and push-relabel slack.
+        self._prof_reset()
         DR     = torch.cdist(A2, A,
                              compute_mode="use_mm_for_euclid_dist_if_necessary")  # (S2, N)
         DR_int = (DR / eps).ceil_().to(torch.int32)                               # (S2, N)
+        self._prof_record("DR_construction")
         _gpu_mem("after DR")
 
         # ── 5. DB_A2: nearest A2 center for each b  (N × S2 ≈ N^(4/3), tiny) ──
+        # ── 6. DA1_A2: nearest A2 center for each a1  (S1 × S2, tiny) ──────────
+        # Profiled together as the "landmark-assignment" stage (DB / d_min_b
+        # equivalent for the 3-level pipeline).
+        self._prof_reset()
         DB_A2              = torch.cdist(B, A2,
                                          compute_mode="use_mm_for_euclid_dist_if_necessary")
         d_min_b_A2, nearest_s2 = DB_A2.min(dim=1)    # (N,) each
@@ -149,12 +173,12 @@ class ThreeLevelClustering:
         d_min_b_A2_int = (d_min_b_A2 / eps).ceil_().to(torch.int32)
         _gpu_mem("after DB_A2")
 
-        # ── 6. DA1_A2: nearest A2 center for each a1  (S1 × S2, tiny) ──────────
         DA1_A2                  = torch.cdist(A1, A2,
                                               compute_mode="use_mm_for_euclid_dist_if_necessary")
         d_min_A1_A2, nearest_s2_A1 = DA1_A2.min(dim=1)   # (S1,) each
         del DA1_A2
         d_min_A1_A2_int = (d_min_A1_A2 / eps).ceil_().to(torch.int32)
+        self._prof_record("landmark_assignment_A2")
         _gpu_mem("after DA1_A2")
 
         # ── 7. DB_A1: nearest A1 center for each b  (tiled over A1) ────────────
@@ -162,6 +186,7 @@ class ThreeLevelClustering:
         #     We tile over A1 using the same float_buf + _sq_dist_inplace pattern
         #     as simple.py, tracking a running squared-minimum so that sqrt is
         #     taken only once after the loop.
+        self._prof_reset()
         float_buf     = torch.empty(N, T, dtype=A.dtype, device=device)
         d_min_b_A1_sq = torch.full((N,), float("inf"), dtype=A.dtype, device=device)
         nearest_s1    = torch.zeros(N, dtype=torch.long, device=device)
@@ -179,6 +204,7 @@ class ThreeLevelClustering:
         d_min_b_A1     = d_min_b_A1_sq.sqrt()
         d_min_b_A1_int = (d_min_b_A1 / eps).ceil_().to(torch.int32)
         del d_min_b_A1_sq
+        self._prof_record("landmark_assignment_A1_tiled")
         _gpu_mem("after DB_A1 tiled min")
 
         # ── 8. Adj_B: two-pass CSR, threshold = d_min_b_A1 ─────────────────────
@@ -188,6 +214,7 @@ class ThreeLevelClustering:
         d_min_b_A1_sq_thr  = d_min_b_A1.pow(2)   # (N,) — threshold in squared space
 
         # Pass 1 — count admissible (b, a) pairs per blue
+        self._prof_reset()
         counts_B = torch.zeros(N, dtype=torch.long, device=device)
         for start in range(0, N, T):
             end = min(start + T, N)
@@ -197,6 +224,7 @@ class ThreeLevelClustering:
             torch.lt(float_buf[:, :t], d_min_b_A1_sq_thr.unsqueeze(1),
                      out=bool_buf[:, :t])
             counts_B.add_(bool_buf[:, :t].sum(dim=1))
+        self._prof_record("adj_B_csr_pass1_counting")
         _gpu_mem("Adj_B pass 1 done")
 
         adj_B_ptr = torch.zeros(N + 1, dtype=torch.long, device=device)
@@ -209,6 +237,7 @@ class ThreeLevelClustering:
         _gpu_mem(f"Adj_B allocated MB={MB}")
 
         # Pass 2 — fill adj_B_col and adj_B_dist_*
+        self._prof_reset()
         cursor_B = adj_B_ptr[:-1].clone()   # (N,) write cursors, start at row offset
         for start in range(0, N, T):
             end = min(start + T, N)
@@ -227,6 +256,7 @@ class ThreeLevelClustering:
             adj_B_dist_int[write_pos]   = (actual_dists / eps).ceil_().to(torch.int32)
             cursor_B.scatter_add_(0, b_idx, torch.ones_like(b_idx))
         del cursor_B, d_min_b_A1_sq_thr
+        self._prof_record("adj_B_csr_pass2_fill")
         _gpu_mem("Adj_B pass 2 done")
 
         # ── 9. Adj_A1: two-pass CSR, threshold = d_min_A1_A2 ───────────────────
@@ -241,6 +271,7 @@ class ThreeLevelClustering:
         d_min_A1_A2_sq_thr = d_min_A1_A2.pow(2)   # (S1,)
 
         # Pass 1 — count admissible (a1, a) pairs per A1 center
+        self._prof_reset()
         counts_A1 = torch.zeros(S1, dtype=torch.long, device=device)
         for start in range(0, N, T):
             end = min(start + T, N)
@@ -250,6 +281,7 @@ class ThreeLevelClustering:
             torch.lt(float_buf_A1[:, :t], d_min_A1_A2_sq_thr.unsqueeze(1),
                      out=bool_buf_A1[:, :t])
             counts_A1.add_(bool_buf_A1[:, :t].sum(dim=1))
+        self._prof_record("adj_A1_csr_pass1_counting")
         _gpu_mem("Adj_A1 pass 1 done")
 
         adj_A1_ptr = torch.zeros(S1 + 1, dtype=torch.long, device=device)
@@ -262,6 +294,7 @@ class ThreeLevelClustering:
         _gpu_mem(f"Adj_A1 allocated MA1={MA1}")
 
         # Pass 2 — fill adj_A1_col and adj_A1_dist_*
+        self._prof_reset()
         cursor_A1 = adj_A1_ptr[:-1].clone()   # (S1,) write cursors
         for start in range(0, N, T):
             end = min(start + T, N)
@@ -280,6 +313,7 @@ class ThreeLevelClustering:
             adj_A1_dist_int[write_pos]   = (actual_dists / eps).ceil_().to(torch.int32)
             cursor_A1.scatter_add_(0, a1_idx, torch.ones_like(a1_idx))
         del cursor_A1, float_buf_A1, bool_buf_A1, d_min_A1_A2_sq_thr
+        self._prof_record("adj_A1_csr_pass2_fill")
         _gpu_mem("Adj_A1 pass 2 done")
 
         _gpu_mem("before return")
@@ -321,8 +355,8 @@ def get_adj_A1(a1: int, result: Dict) -> torch.Tensor:
 def _validate(A: torch.Tensor, B: torch.Tensor) -> None:
     if A.device != B.device:
         raise ValueError("A and B must be on the same device")
-    if A.device.type != "cuda":
-        raise ValueError("ThreeLevelClustering requires CUDA tensors")
+    if A.device.type not in ("cuda", "cpu"):
+        raise ValueError("ThreeLevelClustering requires CUDA or CPU tensors")
     if A.ndim != 2 or B.ndim != 2:
         raise ValueError("A and B must be rank-2 tensors")
     if A.shape != B.shape:
